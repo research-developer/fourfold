@@ -1,14 +1,27 @@
 "use client";
 
 import { memo, useCallback, useMemo } from "react";
-import { AXES, H, type Axis, type Cell, type Figure } from "@/lib/figure";
-import { AXIS_COLOR, COSET_FILL, FILL, PLAYER_COLOR } from "@/lib/palette";
+import {
+  AXES,
+  H,
+  inPhase,
+  type Axis,
+  type Cell,
+  type Figure,
+} from "@/lib/figure";
+import {
+  AXIS_COLOR,
+  COSET_FILL,
+  FILL,
+  PHASE_FILL,
+  PLAYER_COLOR,
+} from "@/lib/palette";
 import type { PlayerId } from "@/lib/game";
 
 /** Load-reveal order: the three rotation orbits, then the hub. */
 const WAVE: Record<string, number> = { A: 0, B: 1, C: 2, "": 3 };
 
-export type ColorMode = "charge" | "coset";
+export type ColorMode = "charge" | "coset" | "phase";
 
 interface BoardProps {
   figure: Figure;
@@ -17,6 +30,8 @@ interface BoardProps {
   scoringCells: ReadonlySet<number>;
   showMedians: boolean;
   colorMode: ColorMode;
+  /** Prefix length whose mirror phase is shown in "phase" mode. */
+  phaseLevel: number;
   onToggle: (i: number) => void;
   /**
    * One cursor shared by pointer and keyboard. Whatever it points at is
@@ -37,8 +52,19 @@ interface BoardProps {
  * brightness is already spent encoding orientation. So the coset gets a
  * second, non-chromatic channel: cells outside H are hatched, always.
  */
-function fillFor(cell: Cell, mode: ColorMode): { base: string; hatch: boolean } {
+function fillFor(
+  cell: Cell,
+  mode: ColorMode,
+  phaseLevel: number
+): { base: string; hatch: boolean } {
   const inH = H.has(cell.charge);
+  if (mode === "phase") {
+    // Colour by the mirror phase of the sub-triangle this cell sits in,
+    // not by the cell's own charge. Hatching still tracks the coset, so
+    // the two fields can be read against each other.
+    const ph = inPhase(cell.addr, phaseLevel);
+    return { base: PHASE_FILL[ph ? "in" : "out"][cell.eps], hatch: !inH };
+  }
   const base =
     mode === "coset"
       ? COSET_FILL[inH ? "H" : "notH"][cell.eps]
@@ -49,7 +75,12 @@ function fillFor(cell: Cell, mode: ColorMode): { base: string; hatch: boolean } 
 /** Every base colour that can appear hatched, so we can pre-declare patterns. */
 function hatchedColours(mode: ColorMode): string[] {
   const out = new Set<string>();
-  if (mode === "coset") {
+  if (mode === "phase") {
+    for (const k of ["in", "out"] as const) {
+      out.add(PHASE_FILL[k][0]);
+      out.add(PHASE_FILL[k][1]);
+    }
+  } else if (mode === "coset") {
     out.add(COSET_FILL.notH[0]);
     out.add(COSET_FILL.notH[1]);
   } else {
@@ -74,12 +105,14 @@ const CellLayer = memo(function CellLayer({
   owner,
   scoringCells,
   colorMode,
+  phaseLevel,
 }: {
   figure: Figure;
   selection: ReadonlySet<number>;
   owner: (PlayerId | null)[];
   scoringCells: ReadonlySet<number>;
   colorMode: ColorMode;
+  phaseLevel: number;
 }) {
   const waves = useMemo(() => {
     const g: Cell[][] = [[], [], [], []];
@@ -95,7 +128,7 @@ const CellLayer = memo(function CellLayer({
             const own = owner[c.i];
             const sel = selection.has(c.i);
             const scoring = scoringCells.has(c.i);
-            const { base, hatch } = fillFor(c, colorMode);
+            const { base, hatch } = fillFor(c, colorMode, phaseLevel);
 
             let stroke = "#0a0908";
             let strokeWidth = 0.5;
@@ -219,6 +252,7 @@ export default function Board({
   scoringCells,
   showMedians,
   colorMode,
+  phaseLevel,
   onToggle,
   cursor,
   onCursor,
@@ -373,6 +407,7 @@ export default function Board({
           owner={owner}
           scoringCells={scoringCells}
           colorMode={colorMode}
+          phaseLevel={phaseLevel}
         />
       </g>
 

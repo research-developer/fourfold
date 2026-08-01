@@ -4,6 +4,9 @@ import {
   buildFigure,
   coherent,
   firstNonX,
+  H,
+  inPhase,
+  prefixCharge,
   type Axis,
 } from "../src/lib/figure";
 import {
@@ -345,5 +348,59 @@ describe("claim scoring", () => {
     const after = submitClaim(g);
     expect(after).toBe(g); // unchanged
     expect(after.turn).toBe(0);
+  });
+});
+
+/**
+ * Every sub-triangle carries an exact mirror, but the recolouring that
+ * realises it depends on the prefix charge: twist t(u) = c(u) XOR phi(c(u)),
+ * which is trivial exactly when c(u) lies in H. The Python survey found the
+ * split to be exactly even -- 682 in phase, 682 out, at depth 6.
+ */
+describe("mirror phase", () => {
+  const PHI: Record<number, number> = { 0: 0, 1: 2, 2: 1, 3: 3 };
+
+  it("is the H-membership of the prefix charge", () => {
+    const fig = buildFigure(5);
+    for (const c of fig.cells) {
+      for (let k = 0; k <= fig.depth; k++) {
+        expect(inPhase(c.addr, k)).toBe(H.has(prefixCharge(c.addr, k)));
+      }
+    }
+  });
+
+  it("is exactly the twist c(u) XOR phi(c(u)) being trivial", () => {
+    const fig = buildFigure(4);
+    for (const c of fig.cells) {
+      for (let k = 0; k <= fig.depth; k++) {
+        const cu = prefixCharge(c.addr, k);
+        const twist = cu ^ PHI[cu];
+        expect(inPhase(c.addr, k)).toBe(twist === 0);
+      }
+    }
+  });
+
+  it("splits the sub-triangles evenly at every depth", () => {
+    for (const depth of [3, 4, 5, 6]) {
+      const fig = buildFigure(depth);
+      const seen = new Map<string, boolean>();
+      for (const c of fig.cells) {
+        for (let k = 1; k < depth; k++) {
+          seen.set(c.addr.slice(0, k), inPhase(c.addr, k));
+        }
+      }
+      const inN = [...seen.values()].filter(Boolean).length;
+      const outN = seen.size - inN;
+      // (4 + 16 + ... + 4^(d-1)) sub-triangles, split exactly down the middle.
+      expect(inN).toBe(outN);
+      expect(seen.size).toBe((4 ** depth - 4) / 3);
+    }
+  });
+
+  it("collapses to the cell's own coset at full depth", () => {
+    const fig = buildFigure(4);
+    for (const c of fig.cells) {
+      expect(inPhase(c.addr, fig.depth)).toBe(H.has(c.charge));
+    }
   });
 });

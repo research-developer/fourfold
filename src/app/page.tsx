@@ -37,6 +37,7 @@ export default function Page() {
   const [cursor, setCursor] = useState<number | null>(null);
   const [showMedians, setShowMedians] = useState(true);
   const [colorMode, setColorMode] = useState<ColorMode>("charge");
+  const [phaseLevel, setPhaseLevel] = useState(2);
   // Two polite regions: one for where the cursor is, one for what happened.
   const [srCursor, setSrCursor] = useState("");
   const [srEvent, setSrEvent] = useState("");
@@ -54,6 +55,7 @@ export default function Page() {
   const reset = useCallback((d: number) => {
     setDepth(d);
     setState(newGame(d));
+    setPhaseLevel((k) => Math.min(k, d));
     setCursor(null);
     setSrCursor("");
     setSrEvent(`New game at depth ${d}. ${PLAYER_NAME[0]} to play.`);
@@ -154,7 +156,7 @@ export default function Page() {
                 </button>
                 <button
                   aria-pressed={colorMode === "coset"}
-                  aria-label="Coset mode: recolour the board by pairing group only"
+                  aria-label="Coset view: recolour the board by pairing group only"
                   title="Recolour by pairing group only — the most colour-blind-legible view"
                   onClick={() =>
                     setColorMode((m) => (m === "coset" ? "charge" : "coset"))
@@ -162,9 +164,52 @@ export default function Page() {
                 >
                   coset
                 </button>
+                <button
+                  aria-pressed={colorMode === "phase"}
+                  aria-label="Phase view: colour each region by which recolouring realises its mirror"
+                  title="Colour each sub-triangle by its mirror phase"
+                  onClick={() =>
+                    setColorMode((m) => (m === "phase" ? "charge" : "phase"))
+                  }
+                >
+                  phase
+                </button>
               </span>
             </span>
           </div>
+
+          {colorMode === "phase" && (
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                fontSize: 10,
+                letterSpacing: "0.14em",
+                textTransform: "uppercase",
+                color: "var(--bone-faint)",
+                marginBottom: 8,
+              }}
+            >
+              <label htmlFor="phaseLevel">scale</label>
+              <input
+                id="phaseLevel"
+                type="range"
+                min={1}
+                max={depth}
+                step={1}
+                value={phaseLevel}
+                onChange={(e) => setPhaseLevel(Number(e.target.value))}
+                style={{ flex: 1, maxWidth: 240, accentColor: "var(--lime)" }}
+              />
+              <span style={{ color: "var(--bone)" }}>
+                {4 ** phaseLevel} regions
+              </span>
+              <span>
+                gold = mirrors in phase · purple = cosets swapped
+              </span>
+            </div>
+          )}
 
           <Board
             figure={state.figure}
@@ -173,6 +218,7 @@ export default function Page() {
             scoringCells={scoringCells}
             showMedians={showMedians}
             colorMode={colorMode}
+            phaseLevel={phaseLevel}
             cursor={cursor}
             onCursor={handleCursor}
             onToggle={(i) => setState((s) => toggleCell(s, i))}
