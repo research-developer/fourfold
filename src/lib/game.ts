@@ -1,0 +1,240 @@
+/**
+ * FOURFOLD -- game rules.
+ *
+ * A claim is a set of cells. A cell in the claim scores only if its mirror
+ * partner across some median is ALSO in the claim, and the two charges are
+ * coherent (both in {gold, purple}, or both in {blue, red} -- i.e. the same
+ * coset of the subgroup H fixing sqrt6).
+ *
+ * The whole game turns on one asymmetry, verified exhaustively at depths
+ * 2..6 against the reference implementation:
+ *
+ *   across m_A  every cell is coherent            (Theorem 3: the mirror
+ *                                                  lifts to an automorphism)
+ *   across m_B  exactly the cells whose first
+ *               non-X digit is B, plus the hub    ((4^d - 1)/3 + 1 cells)
+ *   across m_C  exactly the cells whose first
+ *               non-X digit is C, plus the hub
+ *
+ * So the vertical axis is free and the two diagonals are earned. A player
+ * who works out that only the FIRST NON-CENTRE DIGIT of an address decides
+ * the diagonal axes has found the same obstruction that stops the figure
+ * from having 120-degree symmetry.
+ */
+
+import {
+  AXES,
+  buildFigure,
+  coherent,
+  type Axis,
+  type Cell,
+  type Figure,
+} from "./figure";
+
+/**
+ * Points per cell per satisfied axis. The vertical median is worth least
+ * because it always works; the diagonals are worth more because only a
+ * third of the board can use them.
+ */
+export const AXIS_VALUE: Record<Axis, number> = { A: 1, B: 3, C: 3 };
+
+/** A claim needs at least this many scoring cells to stand. */
+export const MIN_CLAIM = 3;
+
+export type PlayerId = 0 | 1;
+
+export interface CellVerdict {
+  /** Axes on which this cell's partner is present in the claim AND coherent. */
+  axes: Axis[];
+  points: number;
+}
+
+export interface ClaimAnalysis {
+  /** Only cells that actually score. */
+  verdicts: Map<number, CellVerdict>;
+  /** Selected cells that score nothing. */
+  dead: number[];
+  points: number;
+  valid: boolean;
+  reason: string;
+}
+
+/**
+ * Score a candidate claim. Pure -- takes the selection, returns the verdict
+ * without touching game state, so the UI can show a live preview.
+ */
+export function analyseClaim(
+  figure: Figure,
+  selection: ReadonlySet<number>
+): ClaimAnalysis {
+  const verdicts = new Map<number, CellVerdict>();
+  const dead: number[] = [];
+  let points = 0;
+
+  for (const i of selection) {
+    const cell = figure.cells[i];
+    const axes: Axis[] = [];
+    for (const ax of AXES) {
+      const j = cell.mirror[ax];
+      // The partner must be in the claim. A cell straddling its own median
+      // is its own partner, which is a genuine median-aligned symmetry.
+      if (!selection.has(j)) continue;
+      if (!coherent(cell.charge, figure.cells[j].charge)) continue;
+      axes.push(ax);
+    }
+    if (axes.length === 0) {
+      dead.push(i);
+      continue;
+    }
+    const p = axes.reduce((s, ax) => s + AXIS_VALUE[ax], 0);
+    verdicts.set(i, { axes, points: p });
+    points += p;
+  }
+
+  const n = verdicts.size;
+  let reason: string;
+  let valid: boolean;
+  if (selection.size === 0) {
+    valid = false;
+    reason = "Nothing selected.";
+  } else if (n < MIN_CLAIM) {
+    valid = false;
+    reason = `A symmetry needs ${MIN_CLAIM} scoring cells — this has ${n}.`;
+  } else {
+    valid = true;
+    reason = `${n} cells in symmetry${
+      dead.length ? `, ${dead.length} unpaired (no points)` : ""
+    }.`;
+  }
+
+  return { verdicts, dead, points, valid, reason };
+}
+
+export interface LogEntry {
+  player: PlayerId;
+  kind: "claim" | "pass";
+  points: number;
+  cells: number;
+  axes: Axis[];
+}
+
+export interface GameState {
+  figure: Figure;
+  /** Owner per cell index, or null if unclaimed. */
+  owner: (PlayerId | null)[];
+  scores: [number, number];
+  turn: PlayerId;
+  selection: ReadonlySet<number>;
+  /** Consecutive passes; two in a row ends the game. */
+  passes: number;
+  over: boolean;
+  log: LogEntry[];
+}
+
+export function newGame(depth: number): GameState {
+  const figure = buildFigure(depth);
+  return {
+    figure,
+    owner: new Array(figure.cells.length).fill(null),
+    scores: [0, 0],
+    turn: 0,
+    selection: new Set(),
+    passes: 0,
+    over: false,
+    log: [],
+  };
+}
+
+export function toggleCell(state: GameState, i: number): GameState {
+  if (state.over || state.owner[i] !== null) return state;
+  const next = new Set(state.selection);
+  if (next.has(i)) next.delete(i);
+  else next.add(i);
+  return { ...state, selection: next };
+}
+
+export function clearSelection(state: GameState): GameState {
+  return { ...state, selection: new Set() };
+}
+
+/** Commit the current selection as a claim, if it stands. */
+export function submitClaim(state: GameState): GameState {
+  if (state.over) return state;
+  const analysis = analyseClaim(state.figure, state.selection);
+  if (!analysis.valid) return state;
+
+  const owner = state.owner.slice();
+  const axesUsed = new Set<Axis>();
+  for (const [i, v] of analysis.verdicts) {
+    owner[i] = state.turn;
+    for (const ax of v.axes) axesUsed.add(ax);
+  }
+  // Cells that scored nothing are released back to the board.
+
+  const scores: [number, number] = [...state.scores];
+  scores[state.turn] += analysis.points;
+
+  const log: LogEntry[] = [
+    ...state.log,
+    {
+      player: state.turn,
+      kind: "claim",
+      points: analysis.points,
+      cells: analysis.verdicts.size,
+      axes: AXES.filter((a) => axesUsed.has(a)),
+    },
+  ];
+
+  const remaining = owner.some((o) => o === null);
+  return {
+    ...state,
+    owner,
+    scores,
+    log,
+    selection: new Set(),
+    passes: 0,
+    turn: (1 - state.turn) as PlayerId,
+    over: !remaining,
+  };
+}
+
+export function pass(state: GameState): GameState {
+  if (state.over) return state;
+  const passes = state.passes + 1;
+  return {
+    ...state,
+    selection: new Set(),
+    passes,
+    over: passes >= 2,
+    turn: (1 - state.turn) as PlayerId,
+    log: [
+      ...state.log,
+      { player: state.turn, kind: "pass", points: 0, cells: 0, axes: [] },
+    ],
+  };
+}
+
+export function winner(state: GameState): PlayerId | "draw" | null {
+  if (!state.over) return null;
+  if (state.scores[0] === state.scores[1]) return "draw";
+  return state.scores[0] > state.scores[1] ? 0 : 1;
+}
+
+/**
+ * Cells whose partner across `axis` is coherent -- the set a player can
+ * profitably use on that axis. Used by the board's axis filter.
+ */
+export function coherentOn(figure: Figure, axis: Axis): Set<number> {
+  const out = new Set<number>();
+  for (const c of figure.cells) if (c.coherentAxes.includes(axis)) out.add(c.i);
+  return out;
+}
+
+/** Convenience for the ledger: how many cells each axis can reach. */
+export function axisCapacity(figure: Figure): Record<Axis, number> {
+  const out = { A: 0, B: 0, C: 0 } as Record<Axis, number>;
+  for (const c of figure.cells) for (const ax of c.coherentAxes) out[ax] += 1;
+  return out;
+}
+
+export type { Cell, Figure };

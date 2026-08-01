@@ -1,26 +1,534 @@
 @import "tailwindcss";
 
+/* ============================================================
+   FOURFOLD — plate & ledger
+   A dark observatory console. The figure is the only saturated
+   thing on screen; everything around it is ink, bone and hairline.
+   ============================================================ */
+
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --ink: #0a0908;
+  --plate: #121010;
+  --plate-2: #171413;
+  --rule: #2b2724;
+  --rule-bright: #413b35;
+  --bone: #ece6dc;
+  --bone-dim: #9a9086;
+  --bone-faint: #5f574e;
+  --lime: #a3e635;
+  --warn: #f59e0b;
+
+  --shadow-plate: 0 24px 80px -20px rgba(0, 0, 0, 0.9), 0 0 0 1px var(--rule);
+
+  color-scheme: dark;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+* {
+  box-sizing: border-box;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--ink);
+  color: var(--bone);
+  font-family: var(--font-mono), ui-monospace, monospace;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  min-height: 100vh;
+  background-image: radial-gradient(
+      ellipse 90% 60% at 50% -10%,
+      rgba(124, 58, 237, 0.09),
+      transparent 70%
+    ),
+    radial-gradient(
+      ellipse 70% 50% at 100% 100%,
+      rgba(31, 111, 235, 0.07),
+      transparent 70%
+    );
+}
+
+/* Fine grain so the flat black has some tooth. */
+body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 100;
+  opacity: 0.035;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+.display {
+  font-family: var(--font-display), Georgia, serif;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+}
+
+/* ---------- shell ---------- */
+
+.shell {
+  max-width: 1680px;
+  margin: 0 auto;
+  padding: clamp(18px, 3vw, 40px);
+}
+
+.masthead {
+  display: flex;
+  align-items: baseline;
+  gap: 20px;
+  flex-wrap: wrap;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--rule);
+  margin-bottom: clamp(16px, 2.4vw, 28px);
+}
+
+.wordmark {
+  font-size: clamp(34px, 6.2vw, 68px);
+  line-height: 0.86;
+  letter-spacing: 0.02em;
+  margin: 0;
+  background: linear-gradient(
+    100deg,
+    var(--bone) 0%,
+    #d4a017 42%,
+    #7c3aed 78%,
+    var(--bone) 100%
+  );
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+.dek {
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--bone-dim);
+  margin: 0;
+  max-width: 46ch;
+  line-height: 1.7;
+}
+
+.layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 372px;
+  gap: clamp(16px, 2vw, 30px);
+  align-items: start;
+}
+
+@media (max-width: 1080px) {
+  .layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---------- plate ---------- */
+
+.plate {
+  position: relative;
+  background: var(--plate);
+  border-radius: 3px;
+  box-shadow: var(--shadow-plate);
+  padding: clamp(10px, 1.6vw, 22px);
+}
+
+.plate-rule {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+  padding-bottom: 10px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--rule);
+  flex-wrap: wrap;
+}
+
+.board-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  touch-action: manipulation;
+}
+
+.cell {
+  cursor: pointer;
+  transition: opacity 140ms ease;
+}
+
+.cell--owned {
+  cursor: default;
+}
+
+.cell--dim {
+  opacity: 0.16;
+}
+
+@keyframes plate-in {
+  from {
+    opacity: 0;
+    transform: scale(0.82);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* Reveal in four waves — the three ftype arms, then the hub. The load
+   animation is itself the lesson: the arms are the rotation orbits. */
+.wave {
+  transform-origin: center;
+  animation: plate-in 620ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.wave--0 {
+  animation-delay: 40ms;
+}
+.wave--1 {
+  animation-delay: 200ms;
+}
+.wave--2 {
+  animation-delay: 360ms;
+}
+.wave--3 {
+  animation-delay: 540ms;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .wave {
+    animation: none;
+  }
+}
+
+@keyframes partner-pulse {
+  0%,
+  100% {
+    opacity: 0.95;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+.partner-ring {
+  animation: partner-pulse 1.4s ease-in-out infinite;
+  pointer-events: none;
+}
+
+/* ---------- ledger ---------- */
+
+.ledger {
+  background: var(--plate);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  overflow: hidden;
+  position: sticky;
+  top: 16px;
+}
+
+.ledger-head {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--rule);
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+  background: var(--plate-2);
+}
+
+.ledger-body {
+  padding: 14px 16px 16px;
+}
+
+.scorecard {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border-bottom: 1px solid var(--rule);
+}
+
+.score {
+  padding: 14px 16px;
+  border-right: 1px solid var(--rule);
+  position: relative;
+  transition: background 200ms ease;
+}
+.score:last-child {
+  border-right: 0;
+}
+
+.score--active {
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.score--active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  background: var(--accent);
+}
+
+.score-name {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: var(--bone-faint);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.score-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: none;
+}
+
+.score-value {
+  font-size: 32px;
+  line-height: 1.1;
+  margin-top: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+.row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 0;
+  font-size: 12px;
+  border-bottom: 1px dotted var(--rule);
+}
+.row:last-child {
+  border-bottom: 0;
+}
+
+.row-key {
+  color: var(--bone-dim);
+}
+
+.row-val {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border: 1px solid var(--rule-bright);
+  border-radius: 2px;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.verdict {
+  margin-top: 12px;
+  padding: 11px 12px;
+  border-radius: 2px;
+  border: 1px solid var(--rule);
+  background: var(--plate-2);
+  font-size: 12px;
+  line-height: 1.55;
+  min-height: 62px;
+}
+
+.verdict--ok {
+  border-color: rgba(163, 230, 53, 0.45);
+}
+
+.verdict-points {
+  font-size: 26px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  margin-bottom: 3px;
+}
+
+.btn-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 7px;
+  margin-top: 12px;
+}
+
+button {
+  font: inherit;
+  font-size: 11px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  padding: 10px 12px;
+  border-radius: 2px;
+  border: 1px solid var(--rule-bright);
+  background: transparent;
+  color: var(--bone);
+  cursor: pointer;
+  transition: background 160ms ease, border-color 160ms ease, color 160ms ease,
+    transform 100ms ease;
+}
+
+button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--bone-faint);
+}
+
+button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+button:disabled {
+  opacity: 0.32;
+  cursor: not-allowed;
+}
+
+button.primary {
+  background: var(--bone);
+  color: var(--ink);
+  border-color: var(--bone);
+  font-weight: 600;
+}
+
+button.primary:hover:not(:disabled) {
+  background: #fff;
+  border-color: #fff;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: 2px;
+}
+
+/* ---------- inspector ---------- */
+
+.inspect {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--rule);
+  font-size: 11px;
+  line-height: 1.65;
+  color: var(--bone-dim);
+  min-height: 92px;
+}
+
+.addr {
+  font-size: 15px;
+  color: var(--bone);
+  letter-spacing: 0.12em;
+  word-break: break-all;
+}
+
+.swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 1px;
+  vertical-align: -1px;
+  margin-right: 5px;
+  border: 1px solid rgba(0, 0, 0, 0.55);
+}
+
+/* ---------- log ---------- */
+
+.log {
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid var(--rule);
+  max-height: 132px;
+  overflow-y: auto;
+  font-size: 11px;
+}
+
+.log-line {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 3px 0;
+  color: var(--bone-dim);
+}
+
+/* ---------- notes panel ---------- */
+
+.notes {
+  margin-top: clamp(16px, 2vw, 28px);
+  border-top: 1px solid var(--rule);
+  padding-top: 18px;
+}
+
+.notes-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(258px, 1fr));
+  gap: 20px;
+}
+
+.note h3 {
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--warn);
+  margin: 0 0 8px;
+  font-weight: 400;
+}
+
+.note p {
+  margin: 0 0 9px;
+  font-size: 12.5px;
+  line-height: 1.72;
+  color: var(--bone-dim);
+}
+
+.note strong {
+  color: var(--bone);
+  font-weight: 500;
+}
+
+.note code {
+  color: var(--bone);
+  background: var(--plate-2);
+  padding: 1px 5px;
+  border-radius: 2px;
+  border: 1px solid var(--rule);
+  font-size: 11.5px;
+}
+
+.banner {
+  margin-bottom: 14px;
+  padding: 12px 15px;
+  border: 1px solid rgba(163, 230, 53, 0.45);
+  border-radius: 2px;
+  background: rgba(163, 230, 53, 0.07);
+  font-size: 13px;
+}
+
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--rule-bright);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.seg button {
+  border: 0;
+  border-right: 1px solid var(--rule-bright);
+  padding: 6px 11px;
+  font-size: 10px;
+}
+.seg button:last-child {
+  border-right: 0;
+}
+
+.seg button[aria-pressed="true"] {
+  background: var(--bone);
+  color: var(--ink);
 }
