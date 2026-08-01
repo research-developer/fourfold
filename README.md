@@ -115,6 +115,18 @@ the axis-pricing theorem above were derived for this game and verified here.
 Next.js 16 · React 19 · TypeScript · Vitest. No runtime dependencies beyond
 React; the figure is generated in the browser.
 
+## Security note
+
+`npm audit` reports 3 high advisories against `postcss` and `sharp`. Both are
+transitive dependencies **bundled inside Next.js 16.2.12**, which is the
+current `latest`; no patched Next release exists yet. `npm audit fix --force`
+resolves them by downgrading to `next@9.3.3`, which is not a fix.
+
+Neither is reachable here: the app uses no `next/image` (so `sharp` is not in
+any code path), and `postcss` runs only at build time over CSS in this repo.
+The site is statically prerendered with no server runtime. Revisit when Next
+ships a patch.
+
 ## Licence
 
 MIT
