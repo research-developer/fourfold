@@ -88,13 +88,41 @@ export function analyseClaim(
   const dead: number[] = [];
   let points = 0;
 
+  /**
+   * Pass 1 — which axes does this claim actually *witness*?
+   *
+   * An axis is witnessed only by a GENUINE pair: two distinct cells that
+   * are each other's mirror image and whose charges are coherent. Cells
+   * that straddle their own median (mirror[ax] === self) are excluded
+   * here, because otherwise they witness an axis by doing nothing: a cell
+   * on m_B is trivially its own partner and trivially coherent with
+   * itself, so three unrelated on-axis cells would score the highest-value
+   * axis three times over while demonstrating no symmetry at all.
+   */
+  const witnessed = new Set<Axis>();
+  for (const i of selection) {
+    const cell = figure.cells[i];
+    for (const ax of AXES) {
+      const j = cell.mirror[ax];
+      if (j === i) continue;
+      if (!selection.has(j)) continue;
+      if (!coherent(cell.charge, figure.cells[j].charge)) continue;
+      witnessed.add(ax);
+    }
+  }
+
+  // Pass 2 — score. A cell on an axis may JOIN a symmetry but cannot
+  // CONSTITUTE one, so it collects an axis only once a real pair has
+  // established it.
   for (const i of selection) {
     const cell = figure.cells[i];
     const axes: Axis[] = [];
     for (const ax of AXES) {
       const j = cell.mirror[ax];
-      // The partner must be in the claim. A cell straddling its own median
-      // is its own partner, which is a genuine median-aligned symmetry.
+      if (j === i) {
+        if (witnessed.has(ax)) axes.push(ax);
+        continue;
+      }
       if (!selection.has(j)) continue;
       if (!coherent(cell.charge, figure.cells[j].charge)) continue;
       axes.push(ax);

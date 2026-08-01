@@ -21,7 +21,7 @@ import { AXIS_COLOR, AXIS_NAME, FILL, PLAYER_COLOR, PLAYER_NAME } from "@/lib/pa
 interface LedgerProps {
   state: GameState;
   analysis: ClaimAnalysis;
-  hovered: number | null;
+  cursor: number | null;
   onSubmit: () => void;
   onClear: () => void;
   onPass: () => void;
@@ -30,12 +30,12 @@ interface LedgerProps {
 
 function Inspector({
   figure,
-  hovered,
+  cursor,
 }: {
   figure: Figure;
-  hovered: number | null;
+  cursor: number | null;
 }) {
-  if (hovered === null) {
+  if (cursor === null || cursor >= figure.cells.length) {
     return (
       <div className="inspect">
         Point at a cell to see its address, its Galois charge, and where its
@@ -43,7 +43,7 @@ function Inspector({
       </div>
     );
   }
-  const c = figure.cells[hovered];
+  const c = figure.cells[cursor];
   return (
     <div className="inspect">
       <div className="addr">{c.addr}</div>
@@ -65,15 +65,30 @@ function Inspector({
         {c.coherentAxes.length === 0 ? (
           <em>no axis</em>
         ) : (
-          c.coherentAxes.map((ax) => (
-            <span
-              key={ax}
-              className="tag"
-              style={{ borderColor: AXIS_COLOR[ax], marginRight: 4 }}
-            >
-              m<sub>{ax}</sub> +{AXIS_VALUE[ax]}
-            </span>
-          ))
+          c.coherentAxes.map((ax) => {
+            // Sitting ON the median is not the same as pairing across it:
+            // such a cell needs a real pair elsewhere in the claim before
+            // it collects the axis.
+            const onAxis = c.mirror[ax] === c.i;
+            return (
+              <span
+                key={ax}
+                className="tag"
+                style={{
+                  borderColor: AXIS_COLOR[ax],
+                  marginRight: 4,
+                  opacity: onAxis ? 0.65 : 1,
+                }}
+                title={
+                  onAxis
+                    ? "sits on this median — needs a genuine pair in the claim to score"
+                    : "has a partner across this median"
+                }
+              >
+                m<sub>{ax}</sub> {onAxis ? "on axis" : `+${AXIS_VALUE[ax]}`}
+              </span>
+            );
+          })
         )}
       </div>
     </div>
@@ -83,7 +98,7 @@ function Inspector({
 export default function Ledger({
   state,
   analysis,
-  hovered,
+  cursor,
   onSubmit,
   onClear,
   onPass,
@@ -204,7 +219,7 @@ export default function Ledger({
           </div>
         </div>
 
-        <Inspector figure={figure} hovered={hovered} />
+        <Inspector figure={figure} cursor={cursor} />
 
         {state.log.length > 0 && (
           <div className="log">

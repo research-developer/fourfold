@@ -250,6 +250,66 @@ describe("claim scoring", () => {
     expect(after.scores[0]).toBe(before.points);
   });
 
+  it("refuses a claim made only of cells sitting on a median", () => {
+    // Three cells that are each their own m_B partner and have no mirror
+    // relation to one another. Before the fix this scored the highest-value
+    // axis three times over while demonstrating no symmetry at all.
+    const f4 = buildFigure(4);
+    const selfB = f4.cells.filter((c) => c.mirror.B === c.i).slice(0, 3);
+    expect(selfB.length).toBe(3);
+    const ids = new Set(selfB.map((c) => c.i));
+    // ...and they really are mutually unrelated.
+    for (const c of selfB) {
+      for (const ax of AXES) {
+        if (c.mirror[ax] !== c.i) expect(ids.has(c.mirror[ax])).toBe(false);
+      }
+    }
+    const a = analyseClaim(f4, ids);
+    expect(a.points).toBe(0);
+    expect(a.valid).toBe(false);
+  });
+
+  it("does not hand out the hub for free", () => {
+    const f4 = buildFigure(4);
+    const hub = f4.cells[f4.hub];
+    // The hub is its own partner on all three medians.
+    for (const ax of AXES) expect(hub.mirror[ax]).toBe(hub.i);
+    expect(analyseClaim(f4, new Set([hub.i])).points).toBe(0);
+  });
+
+  it("pays the hub +7 once all three axes are genuinely witnessed", () => {
+    const f4 = buildFigure(4);
+    const hub = f4.cells[f4.hub];
+    const sel = new Set<number>([hub.i]);
+    // One real pair on each axis.
+    for (const ax of AXES) {
+      const w = f4.cells.find(
+        (c) =>
+          c.i !== hub.i &&
+          c.mirror[ax] !== c.i &&
+          c.coherentAxes.includes(ax) &&
+          !sel.has(c.i) &&
+          !sel.has(c.mirror[ax])
+      )!;
+      sel.add(w.i);
+      sel.add(w.mirror[ax]);
+    }
+    const a = analyseClaim(f4, sel);
+    expect(a.verdicts.get(hub.i)!.points).toBe(7);
+    expect(a.verdicts.get(hub.i)!.axes.sort()).toEqual(["A", "B", "C"]);
+  });
+
+  it("lets an on-median cell join a symmetry that a real pair witnesses", () => {
+    const f4 = buildFigure(4);
+    const pair = f4.cells.find((c) => c.mirror.A !== c.i)!;
+    const onAxis = f4.cells.find(
+      (c) => c.mirror.A === c.i && c.i !== pair.i && c.i !== pair.mirror.A
+    )!;
+    const a = analyseClaim(f4, new Set([pair.i, pair.mirror.A, onAxis.i]));
+    expect(a.verdicts.has(onAxis.i)).toBe(true);
+    expect(a.valid).toBe(true);
+  });
+
   it("refuses a board sweep", () => {
     // m_A is an exact symmetry, so a selection of EVERY cell has every cell
     // paired. Without a cap, player one claims the whole board on turn one.

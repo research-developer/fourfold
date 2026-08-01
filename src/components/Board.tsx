@@ -1,12 +1,14 @@
 "use client";
 
-import { memo, useCallback, useMemo, useState } from "react";
-import { AXES, type Axis, type Cell, type Figure } from "@/lib/figure";
-import { AXIS_COLOR, FILL, PLAYER_COLOR } from "@/lib/palette";
+import { memo, useCallback, useMemo } from "react";
+import { AXES, H, type Axis, type Cell, type Figure } from "@/lib/figure";
+import { AXIS_COLOR, COSET_FILL, FILL, PLAYER_COLOR } from "@/lib/palette";
 import type { PlayerId } from "@/lib/game";
 
 /** Load-reveal order: the three rotation orbits, then the hub. */
 const WAVE: Record<string, number> = { A: 0, B: 1, C: 2, "": 3 };
+
+export type ColorMode = "charge" | "coset";
 
 interface BoardProps {
   figure: Figure;
@@ -14,26 +16,70 @@ interface BoardProps {
   owner: (PlayerId | null)[];
   scoringCells: ReadonlySet<number>;
   showMedians: boolean;
+  colorMode: ColorMode;
   onToggle: (i: number) => void;
-  onHover: (i: number | null) => void;
-  hovered: number | null;
+  /**
+   * One cursor shared by pointer and keyboard. Whatever it points at is
+   * what carries the white ring and what Space/Enter acts on, so the two
+   * input paths can never disagree about the target.
+   */
+  cursor: number | null;
+  onCursor: (i: number | null, viaKeyboard?: boolean) => void;
 }
 
 /**
+ * Resolve a cell to its fill, and to whether that fill should be hatched.
+ *
+ * Hatching is not decoration. The game's only rule is "gold/purple pair,
+ * blue/red pair" — the two cosets of H. Under deuteranopia #7c3aed and
+ * #1f6feb collapse to a measured ΔE of 7.9, i.e. the same colour, and they
+ * sit in OPPOSITE cosets. Hue alone therefore cannot carry the rule, and
+ * brightness is already spent encoding orientation. So the coset gets a
+ * second, non-chromatic channel: cells outside H are hatched, always.
+ */
+function fillFor(cell: Cell, mode: ColorMode): { base: string; hatch: boolean } {
+  const inH = H.has(cell.charge);
+  const base =
+    mode === "coset"
+      ? COSET_FILL[inH ? "H" : "notH"][cell.eps]
+      : FILL[cell.charge][cell.eps];
+  return { base, hatch: !inH };
+}
+
+/** Every base colour that can appear hatched, so we can pre-declare patterns. */
+function hatchedColours(mode: ColorMode): string[] {
+  const out = new Set<string>();
+  if (mode === "coset") {
+    out.add(COSET_FILL.notH[0]);
+    out.add(COSET_FILL.notH[1]);
+  } else {
+    for (const ch of [1, 2] as const) {
+      out.add(FILL[ch][0]);
+      out.add(FILL[ch][1]);
+    }
+  }
+  return [...out];
+}
+
+const patternId = (hex: string) => `hx${hex.replace("#", "")}`;
+
+/**
  * The static fill layer. Re-renders only when the selection or ownership
- * changes -- never on hover -- so pointer tracking stays cheap even at
- * depth 5 (1024 polygons).
+ * changes -- never on cursor movement -- so pointer tracking stays cheap
+ * even at depth 5 (1024 polygons).
  */
 const CellLayer = memo(function CellLayer({
   figure,
   selection,
   owner,
   scoringCells,
+  colorMode,
 }: {
   figure: Figure;
   selection: ReadonlySet<number>;
   owner: (PlayerId | null)[];
   scoringCells: ReadonlySet<number>;
+  colorMode: ColorMode;
 }) {
   const waves = useMemo(() => {
     const g: Cell[][] = [[], [], [], []];
@@ -49,19 +95,24 @@ const CellLayer = memo(function CellLayer({
             const own = owner[c.i];
             const sel = selection.has(c.i);
             const scoring = scoringCells.has(c.i);
-            const fill = FILL[c.charge][c.eps];
+            const { base, hatch } = fillFor(c, colorMode);
 
             let stroke = "#0a0908";
-            let strokeWidth = 0.6;
+            let strokeWidth = 0.5;
+            let dash: string | undefined;
             let opacity = 1;
 
             if (own !== null) {
               stroke = PLAYER_COLOR[own];
-              strokeWidth = 1.6;
+              strokeWidth = 1.5;
               opacity = 0.42;
             } else if (sel) {
-              stroke = scoring ? "#ffffff" : "#6b625a";
-              strokeWidth = scoring ? 3.2 : 2;
+              // Both selection states use a light stroke: the old dim grey
+              // scored 1.05:1 against purple, i.e. no indicator at all.
+              // Provisional vs committed is carried by the dash instead.
+              stroke = scoring ? "#ffffff" : "#ece6dc";
+              strokeWidth = scoring ? 3 : 2;
+              dash = scoring ? undefined : "5 4";
             }
 
             return (
@@ -70,11 +121,16 @@ const CellLayer = memo(function CellLayer({
                 data-i={c.i}
                 className={`cell${own !== null ? " cell--owned" : ""}`}
                 points={c.verts.map((v) => `${v[0]},${v[1]}`).join(" ")}
-                fill={fill}
+                fill={hatch ? `url(#${patternId(base)})` : base}
                 fillOpacity={opacity}
                 stroke={stroke}
                 strokeWidth={strokeWidth}
+                strokeDasharray={dash}
                 strokeLinejoin="round"
+                // Stroke widths are in viewBox units, so on a 334px phone
+                // board every one of them fell below 1 CSS px -- and strokes
+                // carry 100% of the dynamic state.
+                vectorEffect="non-scaling-stroke"
               />
             );
           })}
@@ -85,25 +141,27 @@ const CellLayer = memo(function CellLayer({
 });
 
 /**
- * Hover overlay: rings the three mirror partners of the pointed-at cell,
+ * Cursor overlay: rings the three mirror partners of the pointed-at cell,
  * solid where the charges are coherent (a legal pairing) and dashed where
  * they are not. This is the whole lesson of the game, drawn live.
  */
-function HoverLayer({
+function CursorLayer({
   figure,
-  hovered,
+  cursor,
 }: {
   figure: Figure;
-  hovered: number | null;
+  cursor: number | null;
 }) {
-  if (hovered === null) return null;
-  const cell = figure.cells[hovered];
+  if (cursor === null || cursor >= figure.cells.length) return null;
+  const cell = figure.cells[cursor];
 
   return (
     <g style={{ pointerEvents: "none" }}>
       {AXES.map((ax) => {
         const p = figure.cells[cell.mirror[ax]];
         const ok = cell.coherentAxes.includes(ax);
+        // A cell straddling its own median has no partner to point at; the
+        // median line already shows where it sits.
         if (p.i === cell.i) return null;
         return (
           <g key={ax}>
@@ -116,6 +174,7 @@ function HoverLayer({
               strokeWidth={ok ? 1.8 : 1}
               strokeDasharray={ok ? undefined : "4 5"}
               opacity={ok ? 0.85 : 0.3}
+              vectorEffect="non-scaling-stroke"
             />
             <polygon
               className={ok ? "partner-ring" : undefined}
@@ -126,16 +185,28 @@ function HoverLayer({
               strokeDasharray={ok ? undefined : "3 4"}
               opacity={ok ? 1 : 0.45}
               strokeLinejoin="round"
+              vectorEffect="non-scaling-stroke"
             />
           </g>
         );
       })}
+      {/* Dark casing under the white ring: gold is bright enough that a
+          bare white outline sits at 2.38:1 against it. */}
+      <polygon
+        points={cell.verts.map((v) => `${v[0]},${v[1]}`).join(" ")}
+        fill="none"
+        stroke="#0a0908"
+        strokeWidth={5.5}
+        strokeLinejoin="round"
+        vectorEffect="non-scaling-stroke"
+      />
       <polygon
         points={cell.verts.map((v) => `${v[0]},${v[1]}`).join(" ")}
         fill="none"
         stroke="#ffffff"
         strokeWidth={3}
         strokeLinejoin="round"
+        vectorEffect="non-scaling-stroke"
       />
     </g>
   );
@@ -147,36 +218,65 @@ export default function Board({
   owner,
   scoringCells,
   showMedians,
+  colorMode,
   onToggle,
-  onHover,
-  hovered,
+  cursor,
+  onCursor,
 }: BoardProps) {
-  const [focusIdx, setFocusIdx] = useState(0);
-
   // One delegated handler for the whole board rather than 4^d closures.
-  const readIndex = (e: React.PointerEvent | React.MouseEvent) => {
+  const readIndex = (e: React.PointerEvent) => {
     const t = e.target as SVGElement;
     const raw = t.getAttribute?.("data-i");
     return raw === null || raw === undefined ? null : Number(raw);
   };
 
   const handleMove = useCallback(
-    (e: React.PointerEvent) => {
-      const i = readIndex(e);
-      onHover(i);
-    },
-    [onHover]
+    (e: React.PointerEvent) => onCursor(readIndex(e)),
+    [onCursor]
   );
 
-  const handleClick = useCallback(
-    (e: React.MouseEvent) => {
+  /**
+   * Selection happens on POINTER DOWN, not on click.
+   *
+   * A `click` event is dispatched at the nearest common ancestor of the
+   * mousedown and mouseup targets. Press inside one triangle, drift a
+   * couple of pixels across the shared edge, release, and the click lands
+   * on the enclosing <g> — which carries no data-i, so the toggle was
+   * silently dropped. At depth 5 the cells are ~30px across and on touch
+   * that drift is near-guaranteed.
+   */
+  const handleDown = useCallback(
+    (e: React.PointerEvent) => {
       const i = readIndex(e);
-      if (i !== null) {
-        onToggle(i);
-        setFocusIdx(i);
-      }
+      if (i === null) return;
+      onCursor(i);
+      onToggle(i);
     },
-    [onToggle]
+    [onCursor, onToggle]
+  );
+
+  /** Nearest cell in a compass direction, preferring straight ahead. */
+  const step = useCallback(
+    (from: number, dx: number, dy: number) => {
+      const [cx, cy] = figure.cells[from].centroid;
+      let best = from;
+      let bestScore = Infinity;
+      for (const o of figure.cells) {
+        if (o.i === from) continue;
+        const vx = o.centroid[0] - cx;
+        const vy = o.centroid[1] - cy;
+        const along = vx * dx + vy * dy;
+        if (along <= 0) continue;
+        const perp = Math.abs(vx * dy - vy * dx);
+        const score = along + perp * 2.5;
+        if (score < bestScore) {
+          bestScore = score;
+          best = o.i;
+        }
+      }
+      return best;
+    },
+    [figure]
   );
 
   const medians = useMemo(() => {
@@ -192,35 +292,78 @@ export default function Board({
     ];
   }, [figure]);
 
+  // Pattern period tracks the cell size so the hatch reads at every depth.
+  const period = Math.max(7, 1024 / 2 ** figure.depth / 3);
+
   return (
     <svg
       className="board-svg"
       viewBox={`0 0 ${figure.width} ${figure.height}`}
       role="application"
-      aria-label={`Fourfold board, depth ${figure.depth}, ${figure.cells.length} cells. Use arrow keys to move and space to select.`}
+      aria-label={`Fourfold board, depth ${figure.depth}, ${figure.cells.length} cells. Arrow keys move, space selects, A B or C jumps to the mirror partner across that median, Home goes to the hub.`}
       tabIndex={0}
+      onFocus={() => {
+        // Land the cursor somewhere visible so Space never acts on a cell
+        // the player cannot see.
+        if (cursor === null) onCursor(figure.hub, true);
+      }}
       onKeyDown={(e) => {
         const n = figure.cells.length;
-        if (e.key === "ArrowRight" || e.key === "ArrowDown") {
-          e.preventDefault();
-          const next = (focusIdx + 1) % n;
-          setFocusIdx(next);
-          onHover(next);
-        } else if (e.key === "ArrowLeft" || e.key === "ArrowUp") {
-          e.preventDefault();
-          const next = (focusIdx - 1 + n) % n;
-          setFocusIdx(next);
-          onHover(next);
-        } else if (e.key === " " || e.key === "Enter") {
-          e.preventDefault();
-          onToggle(focusIdx);
+        const at = cursor === null || cursor >= n ? figure.hub : cursor;
+        const k = e.key;
+        if (k === "ArrowRight") { e.preventDefault(); onCursor(step(at, 1, 0), true); }
+        else if (k === "ArrowLeft") { e.preventDefault(); onCursor(step(at, -1, 0), true); }
+        else if (k === "ArrowDown") { e.preventDefault(); onCursor(step(at, 0, 1), true); }
+        else if (k === "ArrowUp") { e.preventDefault(); onCursor(step(at, 0, -1), true); }
+        else if (k === " " || k === "Enter") { e.preventDefault(); onToggle(at); }
+        else if (k === "Home") { e.preventDefault(); onCursor(figure.hub, true); }
+        else if (k === "Escape") { onCursor(null); }
+        else {
+          // Jump straight to a mirror partner — otherwise a keyboard player
+          // can see the partner rings but never reach them.
+          const ax = k.toUpperCase();
+          if (ax === "A" || ax === "B" || ax === "C") {
+            e.preventDefault();
+            onCursor(figure.cells[at].mirror[ax as Axis], true);
+          }
         }
       }}
     >
+      <defs>
+        {hatchedColours(colorMode).map((hex) => (
+          <pattern
+            key={hex}
+            id={patternId(hex)}
+            width={period}
+            height={period}
+            patternUnits="userSpaceOnUse"
+            patternTransform="rotate(45)"
+          >
+            <rect width={period} height={period} fill={hex} />
+            <line
+              x1={0}
+              y1={0}
+              x2={0}
+              y2={period}
+              stroke="#0a0908"
+              strokeOpacity={0.42}
+              strokeWidth={period / 2.4}
+            />
+          </pattern>
+        ))}
+      </defs>
+
       <g
         onPointerMove={handleMove}
-        onPointerLeave={() => onHover(null)}
-        onClick={handleClick}
+        onPointerLeave={(e) => {
+          // Keep the cursor if the board still holds keyboard focus, or a
+          // player who arrows to a cell then moves the mouse away loses the
+          // only thing showing them what Space will act on.
+          const svg = e.currentTarget.ownerSVGElement;
+          if (svg && document.activeElement === svg) return;
+          onCursor(null);
+        }}
+        onPointerDown={handleDown}
       >
         {/* Hit target so pointer-leave fires reliably over the gaps. */}
         <rect width={figure.width} height={figure.height} fill="transparent" />
@@ -229,6 +372,7 @@ export default function Board({
           selection={selection}
           owner={owner}
           scoringCells={scoringCells}
+          colorMode={colorMode}
         />
       </g>
 
@@ -244,11 +388,12 @@ export default function Board({
             strokeWidth={2}
             strokeDasharray="9 8"
             opacity={0.5}
+            vectorEffect="non-scaling-stroke"
             style={{ pointerEvents: "none" }}
           />
         ))}
 
-      <HoverLayer figure={figure} hovered={hovered} />
+      <CursorLayer figure={figure} cursor={cursor} />
     </svg>
   );
 }
