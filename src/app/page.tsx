@@ -112,9 +112,10 @@ export default function Page() {
               <strong>blue / red</strong>.
             </p>
             <p>
-              A claim needs <strong>three scoring cells</strong> to stand.
-              Unpaired cells score nothing and are released back to the board.
-              Two passes in a row ends the game.
+              A claim needs <strong>three scoring cells</strong> to stand and may
+              use at most <strong>twelve</strong> — a symmetry is a motif, not a
+              landgrab. Unpaired cells score nothing and are released back to the
+              board. Two passes in a row ends the game.
             </p>
           </div>
 

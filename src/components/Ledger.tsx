@@ -11,6 +11,7 @@ import {
 import {
   AXIS_VALUE,
   axisCapacity,
+  MAX_CLAIM,
   winner,
   type ClaimAnalysis,
   type GameState,
@@ -181,6 +182,20 @@ export default function Ledger({
               </span>
             </div>
           ))}
+          <div className="row">
+            <span className="row-key">selected</span>
+            <span
+              className="row-val"
+              style={{
+                color:
+                  state.selection.size >= MAX_CLAIM
+                    ? "var(--warn)"
+                    : undefined,
+              }}
+            >
+              {state.selection.size}/{MAX_CLAIM} max
+            </span>
+          </div>
           <div className="row">
             <span className="row-key">cells claimed</span>
             <span className="row-val">

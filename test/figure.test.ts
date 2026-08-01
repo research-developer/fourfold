@@ -6,7 +6,15 @@ import {
   firstNonX,
   type Axis,
 } from "../src/lib/figure";
-import { analyseClaim, AXIS_VALUE, MIN_CLAIM, newGame, submitClaim, toggleCell } from "../src/lib/game";
+import {
+  analyseClaim,
+  AXIS_VALUE,
+  MAX_CLAIM,
+  MIN_CLAIM,
+  newGame,
+  submitClaim,
+  toggleCell,
+} from "../src/lib/game";
 
 import golden2 from "./golden/golden_d2.json";
 import golden3 from "./golden/golden_d3.json";
@@ -18,10 +26,11 @@ interface GoldenCell {
   charge: number;
   eps: number;
   ftype: string;
-  verts: [number, number][];
+  // Widened to match what `resolveJsonModule` infers from the fixtures.
+  verts: number[][];
   mirror: Record<string, number>;
   coherentAxes: string[];
-  centroid: [number, number];
+  centroid: number[];
 }
 interface Golden {
   depth: number;
@@ -239,6 +248,34 @@ describe("claim scoring", () => {
     for (const i of before.dead) expect(after.owner[i]).toBeNull();
     expect(after.turn).toBe(1);
     expect(after.scores[0]).toBe(before.points);
+  });
+
+  it("refuses a board sweep", () => {
+    // m_A is an exact symmetry, so a selection of EVERY cell has every cell
+    // paired. Without a cap, player one claims the whole board on turn one.
+    for (const d of [3, 4]) {
+      const f = buildFigure(d);
+      const everything = new Set(f.cells.map((c) => c.i));
+      const a = analyseClaim(f, everything);
+      expect(a.verdicts.size).toBe(f.cells.length); // every cell does pair
+      expect(a.valid).toBe(false); // ...and it is still refused
+      expect(a.reason).toMatch(/at most/);
+    }
+  });
+
+  it("will not grow a selection past the cap", () => {
+    let g = newGame(4);
+    for (const c of g.figure.cells) g = toggleCell(g, c.i);
+    expect(g.selection.size).toBe(MAX_CLAIM);
+  });
+
+  it("still allows deselecting at the cap", () => {
+    let g = newGame(4);
+    for (const c of g.figure.cells) g = toggleCell(g, c.i);
+    const first = [...g.selection][0];
+    g = toggleCell(g, first);
+    expect(g.selection.size).toBe(MAX_CLAIM - 1);
+    expect(g.selection.has(first)).toBe(false);
   });
 
   it("refuses a claim that does not stand", () => {
