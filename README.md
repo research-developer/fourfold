@@ -4,6 +4,8 @@ A two-player symmetry-claiming game played on the V₄ XOR Sierpiński figure.
 
 **▶ Play: https://fourfold-seven.vercel.app**
 
+![The charge view at depth 5](docs/img/view_charge.png)
+
 ---
 
 ## The board
@@ -74,6 +76,24 @@ having 120° rotational symmetry.
 
 The all-X **hub** is the unique cell on all three medians, and the only place
 where the figure's threefold structure is exact.
+
+## Three views of the same board
+
+**Charge** — the four Galois automorphisms. **Coset** — collapsed to the one
+distinction the rules use, `H` versus its complement. Cells outside `H` are
+hatched in every view, so the pairing rule never depends on telling hues
+apart.
+
+![The coset view](docs/img/view_coset.png)
+
+**Phase** — each region coloured by *which* recolouring realises its mirror.
+Every sub-triangle has one; gold means it acts with the same palette map as
+the whole figure, purple means the `H`-cosets are swapped. The split is
+exactly even, and the field is self-similar in its own right — a second
+pattern sitting on the first, collapsing to the cell's own coset at full
+scale.
+
+![The mirror-phase field at four scales](docs/img/view_phase_grid.png)
 
 ## Verification
 
