@@ -2,6 +2,8 @@
 
 A two-player symmetry-claiming game played on the V₄ XOR Sierpiński figure.
 
+**▶ Play: https://fourfold-seven.vercel.app**
+
 ---
 
 ## The board
