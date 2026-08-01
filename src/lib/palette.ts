@@ -26,6 +26,15 @@ export const COSET_FILL: Record<"H" | "notH", readonly [string, string]> = {
 };
 
 /**
+ * Mirror-phase fills. Sub-triangles whose prefix charge lies in H mirror in
+ * phase with the global figure; the rest mirror with the cosets swapped.
+ */
+export const PHASE_FILL: Record<"in" | "out", readonly [string, string]> = {
+  in: ["#d4a017", "#9c7510"],
+  out: ["#7c3aed", "#5a26b0"],
+};
+
+/**
  * Axis accents. Kept off the four charge hues so they never read as fills.
  * Axis A is tinted cyan rather than off-white: bone was within ΔE 4 of the
  * BONE player colour, so "vertical axis" and "player one" read as one thing.

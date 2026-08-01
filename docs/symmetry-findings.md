@@ -167,3 +167,112 @@ Verified by set equality — not by counting — at depths 2, 3, 4, 5, 6.
   geometrically distinguished among the three wavefront families. Is it?
 - Does the `ftype` decomposition survive to the `sc` (self-count) variant, or
   does the lexicographic self-count rule cut across the arms?
+
+---
+
+# Part 3 — where the symmetry lives, and what causes the obstruction
+
+Later additions, same standard of evidence: exhaustive enumeration, no
+sampling. Scripts in `tools/`.
+
+## The symmetry-breaking scale is exactly two levels
+
+Exact colour-symmetry group of a sub-triangle spanning `j` levels:
+
+| `j` | leaves | group order | isometries that lift exactly |
+|---|---|---|---|
+| 0 | 1 | **6** | all |
+| 1 | 4 | **6** | all |
+| 2 | 16 | **2** | id, `r_A` |
+| 3–6 | 64–4096 | **2** | id, `r_A` |
+
+Full triangle symmetry holds at one level of nesting and dies at two. No
+gradual decay — one step, cliff edge.
+
+**The cause is pigeonhole, not geometry.** At `j = 1` the four cells carry
+four *distinct* charges, so any rearrangement can be undone by recolouring
+and every isometry lifts for free. At `j = 2` there are sixteen cells and
+four charges, each repeating four times, and a recolouring must satisfy
+sixteen constraints with four degrees of freedom. **Symmetry survives
+exactly as long as the colouring is injective.** The `j ≤ 1` symmetry is
+real but vacuous.
+
+## Every region mirrors, in one of two phases
+
+All 1364 sub-triangles of the depth-6 figure carry an exact mirror — zero
+mismatches. What varies is which recolouring realises it. With twist
+`t(u) = c(u) · φ(c(u))`:
+
+| prefix charge | twist | mirror acts by |
+|---|---|---|
+| gold, purple (in `H`) | identity | same map as the whole figure |
+| blue, red (outside `H`) | `σ₂σ₃` | **H-cosets swapped**: gold↦purple, blue↦red |
+
+Split at depth 6: **682 / 682**, exactly even. Half the regions mirror in
+phase with the global figure, half out of phase, and the phase is determined
+entirely by the path taken to reach the region. This is rendered live in the
+app's `phase` view.
+
+## The ±1 residual
+
+Each ftype arm splits across the two cosets to within exactly one cell, at
+every depth:
+
+| | in `H` | outside | excess |
+|---|---|---|---|
+| arm A | `(4ᵈ+2)/6` | `(4ᵈ−4)/6` | **+1** |
+| arms B, C | `(4ᵈ−4)/6` | `(4ᵈ+2)/6` | **−1** |
+| hub | 1 | 0 | **+1** |
+
+`1, 3, 11, 43, 171, 683, 2731, …` satisfying `a(d) = 4a(d−1) − 1`. The four
+imbalances cancel to zero, so the board is exactly halved. The residual is
+forced by the hub: it is the one cell with no partner to balance against,
+and `(σ₂σ₃)ᵈ ∈ H` for every `d`.
+
+## The obstruction is the inverted child, not the triangle
+
+| scheme | children | group | result |
+|---|---|---|---|
+| Square quadtree | 4, all translates | V₄ | **full D₄, every depth** |
+| Sierpiński gasket | 3, all upright | ℤ/3 | **full S₃, every depth** |
+| This figure | 3 upright + **1 inverted** | V₄ | order 2 |
+
+Controlled experiment — a square quadtree with exactly one quadrant
+point-reflected, nothing else changed:
+
+```
+PLAIN     id 100%  rot90 100%  rot180 100%  mir_x 100%  diag 100%
+TWISTED   id 100%  rot90  50%  rot180  ~2/3  mir_x  50%  diag 100%
+```
+
+One reflected child in a *square* reproduces the phenomenon, and the
+surviving reflection is precisely the one that **fixes the reflected child**
+— exactly parallel to `r_A` fixing both `A` and `X` here.
+
+**Mechanism.** When every child is a translate, an isometry induces the same
+role permutation at every level, so the action is uniformly digit-wise. The
+label group is abelian and all addresses have equal length `d`, so an affine
+digit map `ψ(g) = t·φ(g)` gives `c(ρw) = tᵈ · φ(c(w))` — the translations
+collect into a constant and the symmetry is exact. An orientation-reversing
+child breaks that: the digit permutation at position `i` comes to depend on
+how many reflected children precede it. That is the carry.
+
+**Two independent routes to an obstruction:**
+
+1. An orientation-reversing child (this figure; any rep-tile with a rotated
+   or reflected piece).
+2. More than four children. Every permutation of the label group is affine
+   only for `|G| ∈ {2, 3, 4}`, where `AGL(1,2) ≅ S₂`, `AGL(1,3) ≅ S₃` and
+   `AGL(2,2) ≅ S₄` are the full symmetric groups. From `|G| = 5` the affine
+   group is proper, so obstructions appear even with all-translate children.
+
+**Why the triangle.** Among regular polygons only the triangle and the
+square are rep-tiles at all. The midpoint subdivision of a triangle into
+`n²` pieces always yields `n(n−1)/2` inverted ones — never zero for `n ≥ 2`
+— while the square's yields zero, always. The triangle is the only regular
+polygon whose self-similar subdivision *forces* an orientation-reversing
+piece. The phenomenon is triangle-specific, but not because of threeness.
+
+**Open:** scaling the triangle to `n² > 4` pieces should keep the
+phenomenon and intensify it, since the inverted count grows quadratically.
+Untested.

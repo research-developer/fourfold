@@ -129,6 +129,41 @@ const sum3 = (p: IVec, q: IVec, r: IVec): IVec => [
   p[2] + q[2] + r[2],
 ];
 
+/** Per-digit charge, exposed for prefix arithmetic. */
+export const DIGIT_CHARGE: Record<Digit, Charge> = {
+  A: ID,
+  B: S2,
+  C: S3,
+  X: S2S3,
+};
+
+/** Charge accumulated over the first `k` digits of an address. */
+export function prefixCharge(addr: string, k: number): Charge {
+  let c: Charge = ID;
+  const n = Math.min(k, addr.length);
+  for (let i = 0; i < n; i++) c = (c ^ DIGIT_CHARGE[addr[i] as Digit]) as Charge;
+  return c;
+}
+
+/**
+ * Mirror phase of the sub-triangle a cell sits in, `k` levels down.
+ *
+ * Every sub-triangle carries an exact mirror -- verified on all 1364
+ * sub-triangles of the depth-6 figure -- but the recolouring that realises
+ * it depends on the prefix charge. The twist is t(u) = c(u) XOR phi(c(u)),
+ * which is the identity exactly when c(u) lies in H. So:
+ *
+ *   prefix in H      -> mirrors IN PHASE with the whole figure
+ *                       (gold stays gold, purple stays purple)
+ *   prefix outside H -> mirrors OUT OF PHASE, H-cosets swapped
+ *                       (gold becomes purple, blue becomes red)
+ *
+ * The split is exactly even: 682 / 682 at depth 6.
+ */
+export function inPhase(addr: string, k: number): boolean {
+  return H.has(prefixCharge(addr, k));
+}
+
 /** First non-X digit. Empty only for the all-X hub. */
 export function firstNonX(addr: string): "" | Digit {
   for (const ch of addr) if (ch !== "X") return ch as Digit;
