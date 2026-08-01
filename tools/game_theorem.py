@@ -15,6 +15,9 @@ X^d).  Then:
 from fractions import Fraction as F
 from collections import Counter
 import json, math, sys
+from pathlib import Path
+
+GOLDEN_DIR = Path(__file__).resolve().parent.parent / "test" / "golden"
 
 ID, S2, S3, S2S3 = 0b00, 0b10, 0b01, 0b11
 V = {'A': ID, 'B': S2, 'C': S3, 'X': S2S3}
@@ -144,7 +147,6 @@ if __name__ == '__main__':
         ok, cells, mm = verify(d)
         allok &= ok
         if d <= 4:
-            emit(d, cells, mm,
-                 f"golden_d{d}.json")
+            emit(d, cells, mm, str(GOLDEN_DIR / f"golden_d{d}.json"))
     print(f"\nTHEOREM VERIFIED AT ALL DEPTHS: {allok}")
     sys.exit(0 if allok else 1)

@@ -1,0 +1,51 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: typecheck
+        run: npx tsc --noEmit
+
+      - name: lint
+        run: npm run lint
+
+      - name: test
+        run: npm test
+
+      - name: build
+        run: npm run build
+
+  # The scoring rule is a mathematical claim. Re-derive it from scratch in
+  # Python and confirm the committed fixtures still match, so the game can
+  # never quietly drift away from the theorem it is built on.
+  theorem:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: re-verify the ftype theorem at depths 2-6
+        run: python3 tools/game_theorem.py
+
+      - name: golden fixtures must be unchanged
+        run: |
+          git diff --exit-code -- test/golden/ \
+            || { echo "::error::regenerated fixtures differ from the committed ones"; exit 1; }
