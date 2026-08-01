@@ -1,8 +1,10 @@
 "use client";
 
 import { useCallback, useMemo, useState } from "react";
-import Board from "@/components/Board";
+import Board, { type ColorMode } from "@/components/Board";
 import Ledger from "@/components/Ledger";
+import { CHARGE_NAME, H, type Figure } from "@/lib/figure";
+import { AXIS_NAME, PLAYER_NAME } from "@/lib/palette";
 import {
   analyseClaim,
   clearSelection,
@@ -15,11 +17,29 @@ import {
 
 const DEPTHS = [3, 4, 5] as const;
 
+/** What a screen reader is told about the cell under the cursor. */
+function describe(figure: Figure, i: number, selected: boolean): string {
+  const c = figure.cells[i];
+  const coset = H.has(c.charge)
+    ? "coset H, pairs with gold and purple"
+    : "outside H, pairs with blue and red";
+  const axes = c.coherentAxes.length
+    ? c.coherentAxes.map((a) => AXIS_NAME[a]).join(", ")
+    : "no axis";
+  return `${c.addr.split("").join(" ")}, ${CHARGE_NAME[c.charge]}, ${coset}, ${
+    c.eps === 0 ? "upright" : "inverted"
+  }, pairs on ${axes}, ${selected ? "selected" : "not selected"}`;
+}
+
 export default function Page() {
   const [depth, setDepth] = useState<number>(4);
   const [state, setState] = useState<GameState>(() => newGame(4));
-  const [hovered, setHovered] = useState<number | null>(null);
+  const [cursor, setCursor] = useState<number | null>(null);
   const [showMedians, setShowMedians] = useState(true);
+  const [colorMode, setColorMode] = useState<ColorMode>("charge");
+  // Two polite regions: one for where the cursor is, one for what happened.
+  const [srCursor, setSrCursor] = useState("");
+  const [srEvent, setSrEvent] = useState("");
 
   const analysis = useMemo(
     () => analyseClaim(state.figure, state.selection),
@@ -34,7 +54,53 @@ export default function Page() {
   const reset = useCallback((d: number) => {
     setDepth(d);
     setState(newGame(d));
-    setHovered(null);
+    setCursor(null);
+    setSrCursor("");
+    setSrEvent(`New game at depth ${d}. ${PLAYER_NAME[0]} to play.`);
+  }, []);
+
+  const handleCursor = useCallback(
+    (i: number | null, viaKeyboard?: boolean) => {
+      setCursor(i);
+      if (viaKeyboard && i !== null) {
+        setSrCursor(describe(state.figure, i, state.selection.has(i)));
+      }
+    },
+    [state.figure, state.selection]
+  );
+
+  const handleSubmit = useCallback(() => {
+    setState((s) => {
+      const a = analyseClaim(s.figure, s.selection);
+      const next = submitClaim(s);
+      if (next === s) return s;
+      const who = PLAYER_NAME[s.turn];
+      const axes = [...new Set([...a.verdicts.values()].flatMap((v) => v.axes))]
+        .sort()
+        .map((x) => AXIS_NAME[x])
+        .join(" and ");
+      setSrEvent(
+        `${who} claimed ${a.verdicts.size} cells on the ${axes} median, plus ${a.points}. ` +
+          `${PLAYER_NAME[0]} ${next.scores[0]}, ${PLAYER_NAME[1]} ${next.scores[1]}. ` +
+          (next.over
+            ? "Board full, game over."
+            : `${PLAYER_NAME[next.turn]} to play.`)
+      );
+      return next;
+    });
+  }, []);
+
+  const handlePass = useCallback(() => {
+    setState((s) => {
+      const next = pass(s);
+      setSrEvent(
+        `${PLAYER_NAME[s.turn]} passed. ` +
+          (next.over
+            ? "Two passes in a row, game over."
+            : `${PLAYER_NAME[next.turn]} to play.`)
+      );
+      return next;
+    });
   }, []);
 
   return (
@@ -47,6 +113,13 @@ export default function Page() {
         </p>
       </header>
 
+      <div className="sr-only" role="status" aria-live="polite">
+        {srEvent}
+      </div>
+      <div className="sr-only" role="status" aria-live="polite">
+        {srCursor}
+      </div>
+
       <div className="layout">
         <section className="plate">
           <div className="plate-rule">
@@ -55,11 +128,17 @@ export default function Page() {
               cells
             </span>
             <span style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <span className="seg">
+              <span
+                className="seg"
+                role="radiogroup"
+                aria-label="Recursion depth"
+              >
                 {DEPTHS.map((d) => (
                   <button
                     key={d}
-                    aria-pressed={depth === d}
+                    role="radio"
+                    aria-checked={depth === d}
+                    aria-label={`Depth ${d}, ${4 ** d} cells`}
                     onClick={() => reset(d)}
                   >
                     d{d}
@@ -73,6 +152,16 @@ export default function Page() {
                 >
                   medians
                 </button>
+                <button
+                  aria-pressed={colorMode === "coset"}
+                  aria-label="Coset mode: recolour the board by pairing group only"
+                  title="Recolour by pairing group only — the most colour-blind-legible view"
+                  onClick={() =>
+                    setColorMode((m) => (m === "coset" ? "charge" : "coset"))
+                  }
+                >
+                  coset
+                </button>
               </span>
             </span>
           </div>
@@ -83,8 +172,9 @@ export default function Page() {
             owner={state.owner}
             scoringCells={scoringCells}
             showMedians={showMedians}
-            hovered={hovered}
-            onHover={setHovered}
+            colorMode={colorMode}
+            cursor={cursor}
+            onCursor={handleCursor}
             onToggle={(i) => setState((s) => toggleCell(s, i))}
           />
         </section>
@@ -92,10 +182,10 @@ export default function Page() {
         <Ledger
           state={state}
           analysis={analysis}
-          hovered={hovered}
-          onSubmit={() => setState(submitClaim)}
+          cursor={cursor}
+          onSubmit={handleSubmit}
           onClear={() => setState(clearSelection)}
-          onPass={() => setState(pass)}
+          onPass={handlePass}
           onReset={() => reset(depth)}
         />
       </div>
@@ -109,13 +199,20 @@ export default function Page() {
               if its mirror partner across some median is <em>also</em> in the
               claim and the two colours are compatible — both from{" "}
               <strong>gold / purple</strong>, or both from{" "}
-              <strong>blue / red</strong>.
+              <strong>blue / red</strong>. Cells outside the gold/purple pair
+              are <strong>hatched</strong>, so the rule never depends on telling
+              hues apart.
             </p>
             <p>
               A claim needs <strong>three scoring cells</strong> to stand and may
               use at most <strong>twelve</strong> — a symmetry is a motif, not a
-              landgrab. Unpaired cells score nothing and are released back to the
-              board. Two passes in a row ends the game.
+              landgrab. Unpaired cells score nothing and are released back to
+              the board. Two passes in a row ends the game.
+            </p>
+            <p>
+              Keyboard: arrows move, space selects, <code>A</code>/<code>B</code>
+              /<code>C</code> jump to the mirror partner across that median,{" "}
+              <code>Home</code> goes to the hub.
             </p>
           </div>
 
@@ -151,12 +248,14 @@ export default function Page() {
             <h3>The hub</h3>
             <p>
               The all-X address is the only cell sitting on all three medians at
-              once. It pairs on every axis, and it is the single cell where the
-              figure&apos;s threefold structure is exact. Its charge is{" "}
-              <code>(σ₂σ₃)ᵈ</code> — gold at even depth, purple at odd.
+              once, and the single cell where the figure&apos;s threefold
+              structure is exact. Its charge is <code>(σ₂σ₃)ᵈ</code> — gold at
+              even depth, purple at odd.
             </p>
             <p>
-              Worth <code>+7</code> if you pair it on all three axes at once.
+              It sits <em>on</em> every median rather than pairing across one, so
+              it collects <code>+7</code> only in a claim where real pairs have
+              established all three axes.
             </p>
           </div>
         </div>
