@@ -108,22 +108,80 @@ three arms are congruent, they tile the board minus the hub, and the rotation
 permutes them cyclically. This is almost certainly what was being seen as
 "off-median symmetries that repeat laterally."
 
-### E. √6 is genuinely distinguished — an open question, answered
+### E. √6 is distinguished by the *convention*, not by the figure
+
+**Corrected 2026-08-02.** This section previously read "√6 is genuinely
+distinguished — an open question, answered" and asserted **"It is genuinely
+special."** That over-claimed, and it also carried a wrong number. Both are
+fixed below; the evidence is `tools/conventions.py`, exhaustive at depths 2–6.
 
 The study guide asked whether √6 is really special or an artifact of which
-child was chosen inverted. **It is genuinely special.** V₄ has three
-non-trivial characters, one per quadratic subfield. Only one survives the
-mirror:
+child was chosen inverted. The answer is neither: it is an artifact of **which
+vertex of each child plays role A** — a variable independent of the inverted
+child, which `equilat_v4.py` and `src/lib/figure.ts` fix without comment.
 
-| character | kernel | preserved by `m_A`, d=6 |
+Two conventions, *identical geometry* — the same 4096 triangles at depth 6,
+the same single inverted centre `(M_BC, M_AC, M_AB)`, verified equal as a set
+at every depth 2–6:
+
+- **apex** — every corner child keeps the parent's corner as its own role-A
+  vertex. This is what this repo implements.
+- **ifs** — each corner child's roles are the images of `(A,B,C)` under the
+  homothety that produces it. The standard IFS reading.
+
+V₄ has three non-trivial characters, one per quadratic subfield. Cells whose
+mirror partner lies in the same coset of the character's kernel, d=6:
+
+**apex** — one median carries a subfield exactly; the other two carry none.
+
+| character | kernel | `m_A` | `m_B` | `m_C` |
+|---|---|---|---|---|
+| `χ_√6` | {gold, purple} | **4096 / 4096** | 1366 / 4096 | 1366 / 4096 |
+| `χ_√3` | {gold, blue} | 2048 / 4096 | 2048 / 4096 | 2050 / 4096 |
+| `χ_√2` | {gold, red} | 2048 / 4096 | 2050 / 4096 | 2048 / 4096 |
+
+**ifs** — *each* median carries a different subfield, exactly.
+
+| character | kernel | `m_A` | `m_B` | `m_C` |
+|---|---|---|---|---|
+| `χ_√6` | {gold, purple} | **4096 / 4096** | 2048 / 4096 | 2048 / 4096 |
+| `χ_√3` | {gold, blue} | 2048 / 4096 | 2048 / 4096 | **4096 / 4096** |
+| `χ_√2` | {gold, red} | 2048 / 4096 | **4096 / 4096** | 2048 / 4096 |
+
+**The number that was wrong.** The old table reported `χ_√2` at 2050/4096
+under `m_A`. It is 2048. Under `m_A` the mirror fixes gold and purple and
+swaps blue with red, so `χ_√3` and `χ_√2` are each preserved on exactly the
+gold ∪ purple cells — 1024 + 1024 = 2048, and they cannot differ from one
+another. The 2050 is real but belongs to a different cell of the grid: it is
+`χ_√2` under `m_B` (and `χ_√3` under `m_C`). A number was carried across from
+the wrong column.
+
+**What survives, and what does not.** The vertical median carries `χ_√6`
+exactly in *both* conventions — that much is a fact about the figure. What
+was wrongly promoted to a fact about the figure is the *exclusivity*: that
+√6 is the only one of the three to get a median. In the ifs convention all
+three do, and `rot⁺` realises
+
+> `1 ↦ 1`,  `σ₂ ↦ σ₂σ₃`,  `σ₃ ↦ σ₂`,  `σ₂σ₃ ↦ σ₃`
+
+a 3-cycle on the non-identity elements. So `Aut(V₄) ≅ S₃` acts **transitively**
+on the three quadratic subfields there, and no one of them is canonical.
+
+The exact symmetry group, both conventions, depths 2–6:
+
+| convention | isometries that lift exactly | order |
 |---|---|---|
-| `χ_√6` | {gold, purple} | **4096 / 4096** |
-| `χ_√3` | {gold, blue} | 2048 / 4096 |
-| `χ_√2` | {gold, red} | 2050 / 4096 |
+| apex | id, `m_A` | **2** |
+| ifs | all six | **6** |
 
-The latter two sit at chance. So the {gold, purple} vs {blue, red} split is
-not one of three equivalent ways to two-colour the figure — it is *the*
-canonical one, forced by X carrying `σ₂σ₃` together with the mirror fixing X.
+with the apex column reproducing 22/64, 86/256, 342/1024, 1366/4096 for every
+non-exact isometry — the same `(4ᵈ−1)/3 + 1` of section C.
+
+So the {gold, purple} vs {blue, red} split is canonical **within the apex
+convention**, forced there by X carrying `σ₂σ₃` together with the mirror
+fixing X. It is not forced by the geometry, which is the same either way.
+This is theory.md §4's law in this figure's terms: *the choice of child-role
+convention selects which subgroup of `Aut(V₄)` is geometrically realised.*
 
 ### F. Under a diagonal mirror, gold never maps to gold
 
@@ -164,7 +222,9 @@ Verified by set equality — not by counting — at depths 2, 3, 4, 5, 6.
   figure whose colour symmetry group has order 2. What is the right object —
   a colouring valued in an `H`-torsor rather than in V₄ itself?
 - The `--waves` overlay draws the three characters. Given E, `χ_√6` should be
-  geometrically distinguished among the three wavefront families. Is it?
+  geometrically distinguished among the three wavefront families **in the apex
+  convention**, and the three should be interchangeable in the ifs convention.
+  Is that what the overlay shows?
 - Does the `ftype` decomposition survive to the `sc` (self-count) variant, or
   does the lexicographic self-count rule cut across the arms?
 
@@ -229,7 +289,27 @@ imbalances cancel to zero, so the board is exactly halved. The residual is
 forced by the hub: it is the one cell with no partner to balance against,
 and `(σ₂σ₃)ᵈ ∈ H` for every `d`.
 
-## The obstruction is the inverted child, not the triangle
+## The obstruction needs the inverted child *and* the role convention
+
+**Qualified 2026-08-02.** This section was headed "the obstruction is the
+inverted child, not the triangle." The negative half stands — it is not
+threeness, and the square experiment below proves it. The positive half was
+too strong: the inverted child is **not sufficient**. Section E holds the
+counterexample — the ifs convention has the same inverted child, the same 4096
+triangles, and *no obstruction at all*. The role convention is a second
+variable, and it was held fixed here without being noticed. (Whether the
+inverted child is *necessary* is untested and stays open — nothing here
+rules out a role convention that obstructs without one.)
+
+The two conventions differ in exactly one place. The centre child is
+`(M_BC, M_AC, M_AB)` in both, so the inverted child is **held constant**;
+only the two corner children `B` and `C` have their role ordering shifted
+(`(P_B, M_BC, M_AB)` in apex against `(M_AB, P_B, M_BC)` in ifs). So in *this*
+figure the obstruction is produced by the corner role shift, with the
+orientation-reversing child fixed throughout.
+
+Read the rest of this section as: *given the apex role convention*, the
+obstruction tracks the inverted child rather than the triangle.
 
 | scheme | children | group | result |
 |---|---|---|---|
@@ -256,6 +336,18 @@ digit map `ψ(g) = t·φ(g)` gives `c(ρw) = tᵈ · φ(c(w))` — the translati
 collect into a constant and the symmetry is exact. An orientation-reversing
 child breaks that: the digit permutation at position `i` comes to depend on
 how many reflected children precede it. That is the carry.
+
+**Caveat on the mechanism, added 2026-08-02.** The diagnosis above — that the
+carry comes from an orientation-reversing child — is *not* what separates the
+two conventions of section E, since both have the same one. In ifs every child
+(the centre included) is the image of the parent under the affine map that
+produces it, with roles transported by that map, so an isometry conjugates to
+the corresponding isometry of every child uniformly. In apex the corner
+children's role-A is the parent's corner rather than the homothety image, and
+that shift is what makes the induced digit permutation position-dependent. The
+square experiment below still stands on its own terms; what is now open is
+whether its twisted quadrant obstructs through orientation-reversal, through
+the role shift that reversal induces, or through both.
 
 **Two independent routes to an obstruction:**
 
