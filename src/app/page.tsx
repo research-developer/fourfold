@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useMemo, useState } from "react";
 import Board, { type ColorMode } from "@/components/Board";
 import Ledger from "@/components/Ledger";
@@ -325,12 +326,17 @@ export default function Page() {
         <span>
           V₄ ≅ Gal(ℚ(√2,√3)/ℚ) · scoring verified exhaustively at depths 2–6
         </span>
-        <a
-          href="https://github.com/research-developer/fourfold"
-          style={{ color: "inherit" }}
-        >
-          source
-        </a>
+        <span style={{ display: "flex", gap: 18 }}>
+          <Link href="/conventions" style={{ color: "inherit" }}>
+            the convention toggle
+          </Link>
+          <a
+            href="https://github.com/research-developer/fourfold"
+            style={{ color: "inherit" }}
+          >
+            source
+          </a>
+        </span>
       </footer>
     </main>
   );

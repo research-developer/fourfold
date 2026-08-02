@@ -32,6 +32,28 @@ export type Digit = "A" | "B" | "C" | "X";
 export const AXES: readonly Axis[] = ["A", "B", "C"] as const;
 
 /**
+ * Which vertex of each child plays role A.
+ *
+ *   apex -- every corner child keeps the PARENT's corner as its role-A
+ *           vertex. This is what equilat_v4.py implements, and what the game
+ *           is built on.
+ *   ifs  -- each corner child's roles are the images of (A,B,C) under the
+ *           homothety that produces it. The standard IFS reading.
+ *
+ * The four children are the SAME four triangles either way, and the centre
+ * child is (M_BC, M_AC, M_AB) -- inverted -- in both. Only the role ordering
+ * of the two corner children B and C differs, and that ordering is what the
+ * recursion carries down, so it decides the digit at every deeper level.
+ *
+ * The consequence is not cosmetic. Under `apex` the exact symmetry group has
+ * order 2; under `ifs` it has order 6, and `Aut(V4)` acts transitively on the
+ * three quadratic subfields. See docs/symmetry-findings.md section E.
+ */
+export type Convention = "apex" | "ifs";
+
+export const CONVENTIONS: readonly Convention[] = ["apex", "ifs"] as const;
+
+/**
  * H = {1, sigma2*sigma3} = {gold, purple}, the order-2 subgroup fixing
  * sqrt6. Its complementary coset {sigma2, sigma3} = {blue, red} is the pair
  * of automorphisms sending sqrt6 to -sqrt6. Every scoring rule in the game
@@ -79,6 +101,12 @@ export interface Cell {
   /** Triangle vertices in SVG pixel space. */
   verts: [number, number][];
   centroid: [number, number];
+  /**
+   * Exact integer barycentric centroid key (the three vertex coordinates
+   * summed). Cells are located by this, never by pixel comparison, so an
+   * isometry can be applied as a permutation of the three slots.
+   */
+  key: [number, number, number];
   /** Mirror partner index across each median. */
   mirror: Record<Axis, number>;
   /** Axes on which this cell's mirror partner is charge-coherent. */
@@ -87,6 +115,7 @@ export interface Cell {
 
 export interface Figure {
   depth: number;
+  convention: Convention;
   cells: Cell[];
   /** Index of the all-X hub, the unique cell on all three medians. */
   hub: number;
@@ -182,7 +211,10 @@ const AXIS_SWAP: Record<Axis, IVec> = {
   C: [1, 0, 2],
 };
 
-export function buildFigure(depth: number): Figure {
+export function buildFigure(
+  depth: number,
+  convention: Convention = "apex"
+): Figure {
   const scale = 2 ** depth;
   const cells: Cell[] = [];
   /** Exact integer centroid key per cell, parallel to `cells`. */
@@ -210,6 +242,7 @@ export function buildFigure(depth: number): Figure {
         ftype: firstNonX(addr),
         verts: [toXY(PA, scale), toXY(PB, scale), toXY(PC, scale)],
         centroid: toXY(key, scale * 3),
+        key: [key[0], key[1], key[2]],
         mirror: { A: -1, B: -1, C: -1 },
         coherentAxes: [],
       });
@@ -218,10 +251,17 @@ export function buildFigure(depth: number): Figure {
     const MAB = half(PA, PB);
     const MAC = half(PA, PC);
     const MBC = half(PB, PC);
-    // Child order and charge XOR are identical to equilat_v4.py's recurse().
+    // The A child and the inverted X child are the same either way; only the
+    // role ordering of the B and C corners moves. Charge XOR is identical to
+    // equilat_v4.py's recurse() in both conventions.
     walk(PA, MAB, MAC, addr + "A", (charge ^ ID) as Charge, nCentres);
-    walk(PB, MBC, MAB, addr + "B", (charge ^ S2) as Charge, nCentres);
-    walk(PC, MAC, MBC, addr + "C", (charge ^ S3) as Charge, nCentres);
+    if (convention === "apex") {
+      walk(PB, MBC, MAB, addr + "B", (charge ^ S2) as Charge, nCentres);
+      walk(PC, MAC, MBC, addr + "C", (charge ^ S3) as Charge, nCentres);
+    } else {
+      walk(MAB, PB, MBC, addr + "B", (charge ^ S2) as Charge, nCentres);
+      walk(MAC, MBC, PC, addr + "C", (charge ^ S3) as Charge, nCentres);
+    }
     walk(MBC, MAC, MAB, addr + "X", (charge ^ S2S3) as Charge, nCentres + 1);
   };
 
@@ -247,6 +287,7 @@ export function buildFigure(depth: number): Figure {
 
   return {
     depth,
+    convention,
     cells,
     hub: cells.findIndex((c) => c.addr === "X".repeat(depth)),
     width: SIDE + 2 * PADDING,

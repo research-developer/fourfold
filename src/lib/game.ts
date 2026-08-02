@@ -28,8 +28,14 @@ import {
   coherent,
   type Axis,
   type Cell,
+  type Charge,
   type Figure,
 } from "./figure";
+import {
+  makeIdentifier,
+  type ClaimReport,
+  type SiteVerdict,
+} from "./identify";
 
 /**
  * Points per cell per satisfied axis. The vertical median is worth least
@@ -60,21 +66,22 @@ export const MAX_CLAIM = 12;
 
 export type PlayerId = 0 | 1;
 
-export interface CellVerdict {
-  /** Axes on which this cell's partner is present in the claim AND coherent. */
-  axes: Axis[];
-  points: number;
-}
+export type CellVerdict = SiteVerdict<Axis>;
+export type ClaimAnalysis = ClaimReport<Axis>;
 
-export interface ClaimAnalysis {
-  /** Only cells that actually score. */
-  verdicts: Map<number, CellVerdict>;
-  /** Selected cells that score nothing. */
-  dead: number[];
-  points: number;
-  valid: boolean;
-  reason: string;
-}
+/**
+ * The game is one configuration of the extracted identifier: the three
+ * medians as axes, H-coset membership as coherence, and the 1/3/3 weighting
+ * that prices the vertical median cheapest because -- in this convention --
+ * it always works.
+ */
+const identify = makeIdentifier<Axis, Charge>({
+  axes: AXES,
+  coherent,
+  axisValue: AXIS_VALUE,
+  minClaim: MIN_CLAIM,
+  maxClaim: MAX_CLAIM,
+});
 
 /**
  * Score a candidate claim. Pure -- takes the selection, returns the verdict
@@ -84,78 +91,7 @@ export function analyseClaim(
   figure: Figure,
   selection: ReadonlySet<number>
 ): ClaimAnalysis {
-  const verdicts = new Map<number, CellVerdict>();
-  const dead: number[] = [];
-  let points = 0;
-
-  /**
-   * Pass 1 — which axes does this claim actually *witness*?
-   *
-   * An axis is witnessed only by a GENUINE pair: two distinct cells that
-   * are each other's mirror image and whose charges are coherent. Cells
-   * that straddle their own median (mirror[ax] === self) are excluded
-   * here, because otherwise they witness an axis by doing nothing: a cell
-   * on m_B is trivially its own partner and trivially coherent with
-   * itself, so three unrelated on-axis cells would score the highest-value
-   * axis three times over while demonstrating no symmetry at all.
-   */
-  const witnessed = new Set<Axis>();
-  for (const i of selection) {
-    const cell = figure.cells[i];
-    for (const ax of AXES) {
-      const j = cell.mirror[ax];
-      if (j === i) continue;
-      if (!selection.has(j)) continue;
-      if (!coherent(cell.charge, figure.cells[j].charge)) continue;
-      witnessed.add(ax);
-    }
-  }
-
-  // Pass 2 — score. A cell on an axis may JOIN a symmetry but cannot
-  // CONSTITUTE one, so it collects an axis only once a real pair has
-  // established it.
-  for (const i of selection) {
-    const cell = figure.cells[i];
-    const axes: Axis[] = [];
-    for (const ax of AXES) {
-      const j = cell.mirror[ax];
-      if (j === i) {
-        if (witnessed.has(ax)) axes.push(ax);
-        continue;
-      }
-      if (!selection.has(j)) continue;
-      if (!coherent(cell.charge, figure.cells[j].charge)) continue;
-      axes.push(ax);
-    }
-    if (axes.length === 0) {
-      dead.push(i);
-      continue;
-    }
-    const p = axes.reduce((s, ax) => s + AXIS_VALUE[ax], 0);
-    verdicts.set(i, { axes, points: p });
-    points += p;
-  }
-
-  const n = verdicts.size;
-  let reason: string;
-  let valid: boolean;
-  if (selection.size === 0) {
-    valid = false;
-    reason = "Nothing selected.";
-  } else if (selection.size > MAX_CLAIM) {
-    valid = false;
-    reason = `A symmetry is a motif, not a landgrab — at most ${MAX_CLAIM} cells (this has ${selection.size}).`;
-  } else if (n < MIN_CLAIM) {
-    valid = false;
-    reason = `A symmetry needs ${MIN_CLAIM} scoring cells — this has ${n}.`;
-  } else {
-    valid = true;
-    reason = `${n} cells in symmetry${
-      dead.length ? `, ${dead.length} unpaired (no points)` : ""
-    }.`;
-  }
-
-  return { verdicts, dead, points, valid, reason };
+  return identify(figure.cells, selection);
 }
 
 export interface LogEntry {
@@ -217,11 +153,7 @@ export function submitClaim(state: GameState): GameState {
   if (!analysis.valid) return state;
 
   const owner = state.owner.slice();
-  const axesUsed = new Set<Axis>();
-  for (const [i, v] of analysis.verdicts) {
-    owner[i] = state.turn;
-    for (const ax of v.axes) axesUsed.add(ax);
-  }
+  for (const i of analysis.verdicts.keys()) owner[i] = state.turn;
   // Cells that scored nothing are released back to the board.
 
   const scores: [number, number] = [...state.scores];
@@ -234,7 +166,7 @@ export function submitClaim(state: GameState): GameState {
       kind: "claim",
       points: analysis.points,
       cells: analysis.verdicts.size,
-      axes: AXES.filter((a) => axesUsed.has(a)),
+      axes: analysis.axes,
     },
   ];
 
