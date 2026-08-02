@@ -107,6 +107,15 @@ export interface Cell {
    * isometry can be applied as a permutation of the three slots.
    */
   key: [number, number, number];
+  /**
+   * The three vertices in exact integer barycentric coordinates over `2^depth`.
+   *
+   * `verts` is the same three points already projected to pixels, which is
+   * lossy for anything that needs to transform them. The hexagon canvas maps
+   * these into the triangular lattice and rotates by exact integer matrices,
+   * so it needs the pre-projection values.
+   */
+  bary: [IVec, IVec, IVec];
   /** Mirror partner index across each median. */
   mirror: Record<Axis, number>;
   /** Axes on which this cell's mirror partner is charge-coherent. */
@@ -130,7 +139,7 @@ const SIDE = 1024;
 const PADDING = 60;
 const SQRT3_2 = Math.sqrt(3) / 2;
 
-type IVec = readonly [number, number, number];
+export type IVec = readonly [number, number, number];
 
 /** Barycentric (integer numerators over `scale`) -> SVG pixels. */
 function toXY(b: IVec, scale: number): [number, number] {
@@ -243,6 +252,7 @@ export function buildFigure(
         verts: [toXY(PA, scale), toXY(PB, scale), toXY(PC, scale)],
         centroid: toXY(key, scale * 3),
         key: [key[0], key[1], key[2]],
+        bary: [PA, PB, PC],
         mirror: { A: -1, B: -1, C: -1 },
         coherentAxes: [],
       });

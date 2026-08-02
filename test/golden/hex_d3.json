@@ -1,0 +1,129 @@
+{
+  "conventions": {
+    "apex": {
+      "hexCensus": {
+        "down": 192,
+        "total": 384,
+        "up": 192
+      },
+      "lift": {
+        "m0": {
+          "matches": 384,
+          "total": 384
+        },
+        "m120": {
+          "matches": 384,
+          "total": 384
+        },
+        "m150": {
+          "matches": 384,
+          "total": 384
+        },
+        "m30": {
+          "matches": 384,
+          "total": 384
+        },
+        "m60": {
+          "matches": 384,
+          "total": 384
+        },
+        "m90": {
+          "matches": 384,
+          "total": 384
+        },
+        "r0": {
+          "matches": 384,
+          "total": 384
+        },
+        "r120": {
+          "matches": 384,
+          "total": 384
+        },
+        "r180": {
+          "matches": 384,
+          "total": 384
+        },
+        "r240": {
+          "matches": 384,
+          "total": 384
+        },
+        "r300": {
+          "matches": 384,
+          "total": 384
+        },
+        "r60": {
+          "matches": 384,
+          "total": 384
+        }
+      },
+      "triangleCensus": {
+        "down": 28,
+        "total": 64,
+        "up": 36
+      }
+    },
+    "ifs": {
+      "hexCensus": {
+        "down": 192,
+        "total": 384,
+        "up": 192
+      },
+      "lift": {
+        "m0": {
+          "matches": 384,
+          "total": 384
+        },
+        "m120": {
+          "matches": 384,
+          "total": 384
+        },
+        "m150": {
+          "matches": 384,
+          "total": 384
+        },
+        "m30": {
+          "matches": 384,
+          "total": 384
+        },
+        "m60": {
+          "matches": 384,
+          "total": 384
+        },
+        "m90": {
+          "matches": 384,
+          "total": 384
+        },
+        "r0": {
+          "matches": 384,
+          "total": 384
+        },
+        "r120": {
+          "matches": 384,
+          "total": 384
+        },
+        "r180": {
+          "matches": 384,
+          "total": 384
+        },
+        "r240": {
+          "matches": 384,
+          "total": 384
+        },
+        "r300": {
+          "matches": 384,
+          "total": 384
+        },
+        "r60": {
+          "matches": 384,
+          "total": 384
+        }
+      },
+      "triangleCensus": {
+        "down": 28,
+        "total": 64,
+        "up": 36
+      }
+    }
+  },
+  "depth": 3
+}

@@ -8,6 +8,7 @@ import {
   buildFigure,
   CHARGE_LABEL,
   CHARGE_NAME,
+  H,
   type Axis,
   type Convention,
 } from "@/lib/figure";
@@ -21,8 +22,19 @@ import {
   isometryReport,
 } from "@/lib/conventions";
 import { AXIS_COLOR, AXIS_NAME } from "@/lib/palette";
+import HexBoard, { HEX_MIRRORS } from "@/components/HexBoard";
+import {
+  buildHexagon,
+  census,
+  hexIsometryReport,
+  indexMap,
+  latKey,
+  triangleCensus,
+} from "@/lib/hexagon";
 
 const DEPTHS = [2, 3, 4, 5] as const;
+
+type Canvas = "triangle" | "hexagon";
 
 const BLURB: Record<Convention, string> = {
   apex: "Every corner child keeps the parent’s corner as its own role-A vertex. This is what equilat_v4.py implements, and what FOURFOLD is played on.",
@@ -31,10 +43,13 @@ const BLURB: Record<Convention, string> = {
 
 export default function ConventionsPage() {
   const [convention, setConvention] = useState<Convention>("apex");
+  const [canvas, setCanvas] = useState<Canvas>("triangle");
   const [depth, setDepth] = useState<number>(4);
   const [focus, setFocus] = useState<number | null>(null);
   const [showMedians, setShowMedians] = useState(true);
   const [markChanged, setMarkChanged] = useState(false);
+
+  const isHex = canvas === "hexagon";
 
   const figure = useMemo(
     () => buildFigure(depth, convention),
@@ -45,12 +60,33 @@ export default function ConventionsPage() {
     [depth, convention]
   );
 
+  // Built only when the hexagon canvas is on, so triangle mode does no extra
+  // work and behaves exactly as it did before.
+  const hex = useMemo(
+    () => (isHex ? buildHexagon(depth, convention) : null),
+    [isHex, depth, convention]
+  );
+  const hexOther = useMemo(
+    () =>
+      isHex
+        ? buildHexagon(depth, convention === "apex" ? "ifs" : "apex")
+        : null,
+    [isHex, depth, convention]
+  );
+
   const isoRows = useMemo(() => isometryReport(figure), [figure]);
   const exact = useMemo(() => exactIsometries(isoRows), [isoRows]);
+  const hexRows = useMemo(() => (hex ? hexIsometryReport(hex) : null), [hex]);
+  const hexExactCount = hexRows ? hexRows.filter((r) => r.exact).length : 0;
   const chars = useMemo(() => characterReport(figure), [figure]);
   const divergence = useMemo(
     () => chargeDivergence(figure, other),
     [figure, other]
+  );
+
+  const balance = useMemo(
+    () => (hex ? census(hex) : triangleCensus(figure)),
+    [hex, figure]
   );
 
   /** Cells the other convention labels differently, by index in THIS figure. */
@@ -63,8 +99,28 @@ export default function ConventionsPage() {
     return out;
   }, [figure, other]);
 
-  const focused = focus === null ? null : figure.cells[focus];
-  const total = figure.cells.length;
+  const hexChanged = useMemo(() => {
+    if (!hex || !hexOther) return new Set<number>();
+    const byKey = new Map(hexOther.cells.map((c) => [latKey(c.key), c]));
+    const out = new Set<number>();
+    for (const c of hex.cells) {
+      if (byKey.get(latKey(c.key))!.charge !== c.charge) out.add(c.i);
+    }
+    return out;
+  }, [hex, hexOther]);
+
+  /** Mirror partners of the focused hexagon cell, across sector seams. */
+  const hexPartners = useMemo(() => {
+    if (!hex || focus === null || !isHex) return null;
+    return HEX_MIRRORS.map((g) => {
+      const j = indexMap(hex, g)[focus];
+      return { g, cell: hex.cells[j] };
+    });
+  }, [hex, focus, isHex]);
+
+  const focused =
+    focus === null ? null : isHex && hex ? hex.cells[focus] : figure.cells[focus];
+  const total = isHex && hex ? hex.cells.length : figure.cells.length;
 
   return (
     <main style={S.page}>
@@ -102,24 +158,61 @@ export default function ConventionsPage() {
                 </button>
               ))}
             </div>
+            <div style={S.seg} role="group" aria-label="canvas">
+              {(["triangle", "hexagon"] as const).map((c) => (
+                <button
+                  key={c}
+                  onClick={() => {
+                    setCanvas(c);
+                    setFocus(null);
+                  }}
+                  aria-pressed={canvas === c}
+                  style={{
+                    ...S.segBtn,
+                    ...(canvas === c ? S.segBtnOn : null),
+                  }}
+                >
+                  {c}
+                </button>
+              ))}
+            </div>
             <span style={S.order}>
               symmetry group order{" "}
-              <b style={{ color: exact.length === 6 ? "#a3e635" : "#f59e0b" }}>
-                {exact.length}
-              </b>
+              {isHex ? (
+                <b
+                  style={{ color: hexExactCount === 12 ? "#a3e635" : "#f59e0b" }}
+                >
+                  {hexExactCount}
+                </b>
+              ) : (
+                <b style={{ color: exact.length === 6 ? "#a3e635" : "#f59e0b" }}>
+                  {exact.length}
+                </b>
+              )}
             </span>
           </div>
 
           <p style={S.blurb}>{BLURB[convention]}</p>
 
-          <ConventionBoard
-            figure={figure}
-            focus={focus}
-            onFocus={setFocus}
-            showMedians={showMedians}
-            changed={changed}
-            markChanged={markChanged}
-          />
+          {isHex && hex ? (
+            <HexBoard
+              hex={hex}
+              focus={focus}
+              onFocus={setFocus}
+              showMedians={showMedians}
+              changed={hexChanged}
+              markChanged={markChanged}
+            />
+          ) : (
+            <ConventionBoard
+              figure={figure}
+              focus={focus}
+              onFocus={setFocus}
+              showMedians={showMedians}
+              changed={changed}
+              markChanged={markChanged}
+            />
+          )}
 
           <div style={S.controls}>
             <label style={S.small}>
@@ -134,7 +227,7 @@ export default function ConventionsPage() {
               >
                 {DEPTHS.map((d) => (
                   <option key={d} value={d}>
-                    {d} — {4 ** d} cells
+                    {d} — {isHex ? 6 * 4 ** d : 4 ** d} cells
                   </option>
                 ))}
               </select>
@@ -178,35 +271,107 @@ export default function ConventionsPage() {
           </div>
 
           <div style={S.card}>
-            <h2 style={S.h2}>isometries that lift exactly</h2>
+            <h2 style={S.h2}>orientation census</h2>
+            <dl style={S.dl}>
+              <Row k="up" v={String(balance.up)} />
+              <Row k="down" v={String(balance.down)} />
+              <Row
+                k={isHex ? "balanced (must be)" : "balanced"}
+                v={
+                  balance.balanced
+                    ? "yes"
+                    : `no — off by ${Math.abs(balance.up - balance.down)}`
+                }
+                good={balance.balanced}
+              />
+            </dl>
+            <p style={S.note}>
+              {isHex ? (
+                <>
+                  Checked live, never assumed: both must read{" "}
+                  <code>3·4ᵈ = {3 * 4 ** depth}</code>. Three sectors are drawn
+                  in each lattice orientation, so the triangle&rsquo;s surplus of{" "}
+                  <code>2ᵈ = {2 ** depth}</code> appears once with each sign and
+                  cancels. Every sector is a <em>complete</em> triangle — no
+                  corner is missing from the hexagon.
+                </>
+              ) : (
+                <>
+                  A lone triangle is not balanced: up −	down ={" "}
+                  <code>2ᵈ = {2 ** depth}</code> exactly, since up ={" "}
+                  <code>(4ᵈ+2ᵈ)/2</code>. Switch to the hexagon and it cancels.
+                </>
+              )}
+            </p>
+          </div>
+
+          <div style={S.card}>
+            <h2 style={S.h2}>
+              isometries that lift exactly{isHex ? " — D₆" : ""}
+            </h2>
             <table style={S.table}>
               <tbody>
-                {isoRows.map((r) => (
-                  <tr key={r.name}>
-                    <td style={S.tdName}>
-                      <code>{r.name}</code>
-                      <span style={S.tdSub}>{ISOMETRY_LABEL[r.name]}</span>
-                    </td>
-                    <td style={S.tdNum}>
-                      {r.matches}/{r.total}
-                    </td>
-                    <td style={S.tdFlag}>
-                      {r.exact ? (
-                        <span style={S.exact}>exact</span>
-                      ) : (
-                        <span style={S.inexact}>
-                          {(((100 * r.matches) / r.total) | 0)}%
-                        </span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                {isHex && hexRows
+                  ? hexRows.map((r) => (
+                      <tr key={r.name}>
+                        <td style={S.tdName}>
+                          <code>{r.name}</code>
+                          <span style={S.tdSub}>{r.label}</span>
+                        </td>
+                        <td style={S.tdNum}>
+                          {r.matches}/{r.total}
+                        </td>
+                        <td style={S.tdFlag}>
+                          {r.exact ? (
+                            <span style={S.exact}>exact</span>
+                          ) : (
+                            <span style={S.inexact}>
+                              {(((100 * r.matches) / r.total) | 0)}%
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    ))
+                  : isoRows.map((r) => (
+                      <tr key={r.name}>
+                        <td style={S.tdName}>
+                          <code>{r.name}</code>
+                          <span style={S.tdSub}>{ISOMETRY_LABEL[r.name]}</span>
+                        </td>
+                        <td style={S.tdNum}>
+                          {r.matches}/{r.total}
+                        </td>
+                        <td style={S.tdFlag}>
+                          {r.exact ? (
+                            <span style={S.exact}>exact</span>
+                          ) : (
+                            <span style={S.inexact}>
+                              {(((100 * r.matches) / r.total) | 0)}%
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
               </tbody>
             </table>
             <p style={S.note}>
-              Best over all 24 relabellings of V₄, every cell checked. In{" "}
-              <code>apex</code> the three non-exact rows all sit at exactly{" "}
-              <code>(4ᵈ−1)/3 + 1</code> — one ftype class plus the hub.
+              {isHex ? (
+                <>
+                  Best over all 24 relabellings of V₄, every one of{" "}
+                  {6 * 4 ** depth} cells checked. All twelve lift — rotations by
+                  the identity relabelling, reflections by φ = (σ₂ σ₃) — and the
+                  table is <b>identical in both conventions</b>. The hexagon
+                  cannot see the apex/ifs difference: its D₆ comes from the
+                  arrangement of six identical sectors, not from the V₄
+                  structure, which lives <em>inside</em> a sector.
+                </>
+              ) : (
+                <>
+                  Best over all 24 relabellings of V₄, every cell checked. In{" "}
+                  <code>apex</code> the three non-exact rows all sit at exactly{" "}
+                  <code>(4ᵈ−1)/3 + 1</code> — one ftype class plus the hub.
+                </>
+              )}
             </p>
           </div>
 
@@ -276,7 +441,62 @@ export default function ConventionsPage() {
                 "hover a cell"
               )}
             </h2>
-            {focused ? (
+            {focused && isHex && hexPartners && "sector" in focused ? (
+              <>
+                <dl style={S.dl}>
+                  <Row k="sector" v={String(focused.sector)} />
+                  <Row
+                    k="charge"
+                    v={`${CHARGE_LABEL[focused.charge]} — ${CHARGE_NAME[focused.charge]}`}
+                  />
+                  <Row
+                    k="orientation (drawn)"
+                    v={`${focused.eps === 0 ? "upright" : "inverted"}${
+                      focused.eps !== focused.baseEps ? " — flipped by sector" : ""
+                    }`}
+                  />
+                </dl>
+                <table style={S.table}>
+                  <tbody>
+                    {hexPartners.map(({ g, cell }) => {
+                      const ok = H.has(focused.charge) === H.has(cell.charge);
+                      return (
+                        <tr key={g.name}>
+                          <td
+                            style={{
+                              ...S.tdName,
+                              color: g.k % 2 === 1 ? "#67e8f9" : "#f59e0b",
+                            }}
+                          >
+                            <code>{g.name}</code>
+                            <span style={S.tdSub}>
+                              {g.k % 2 === 1 ? "spine" : "boundary"}
+                            </span>
+                          </td>
+                          <td style={S.tdNum}>
+                            <code>
+                              s{cell.sector}·{cell.addr}
+                            </code>
+                          </td>
+                          <td style={S.tdFlag}>
+                            {ok ? (
+                              <span style={S.exact}>coherent</span>
+                            ) : (
+                              <span style={S.inexact}>no</span>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                <p style={S.note}>
+                  Partners routinely land in another sector — the readout gives{" "}
+                  <code>sector·address</code>. Cyan links are spine mirrors,
+                  amber are sector boundaries.
+                </p>
+              </>
+            ) : focused && !isHex && "ftype" in focused ? (
               <>
                 <dl style={S.dl}>
                   <Row

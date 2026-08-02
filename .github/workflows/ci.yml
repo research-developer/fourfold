@@ -45,6 +45,12 @@ jobs:
       - name: re-verify the ftype theorem at depths 2-6
         run: python3 tools/game_theorem.py
 
+      # The hexagon lift tables and censuses are computed twice, once in
+      # TypeScript and once here. Regenerating them means the diff check below
+      # catches any drift between the two implementations.
+      - name: re-derive the hexagon tables in Python
+        run: python3 tools/conventions.py --emit test/golden
+
       - name: golden fixtures must be unchanged
         run: |
           git diff --exit-code -- test/golden/ \
