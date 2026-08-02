@@ -368,3 +368,114 @@ piece. The phenomenon is triangle-specific, but not because of threeness.
 **Open:** scaling the triangle to `n² > 4` pieces should keep the
 phenomenon and intensify it, since the inverted count grows quadratically.
 Untested.
+
+---
+
+# Part 4 — the hexagon canvas
+
+Added 2026-08-02. Six copies of the depth-*d* triangle share their apex at a
+common centre vertex; six 60° apex angles close the circle exactly, so the
+sectors tile a regular hexagon of 6·4ᵈ cells with no overlap and no gap.
+Triangle mode is unchanged and remains the default. Evidence:
+`src/lib/hexagon.ts`, `tools/conventions.py`, gates in
+`test/hexagon.test.ts` — exhaustive, no sampling, and computed twice.
+
+## The lattice, and why the index law is exact
+
+Work in the Eisenstein basis `e1 = (1,0)`, `e2 = (1/2, √3/2)`. A 60° rotation
+is then an **integer** matrix, which is the whole reason for the basis:
+
+> `R : (a,b) ↦ (−b, a+b)`  and  `M : (a,b) ↦ (a+b, −b)`
+
+Place the base triangle with apex `A` at the origin, `B` at `scale·e1` and `C`
+at `scale·e2`; a vertex with integer barycentrics `(x,y,z)`, `x+y+z = scale`,
+then sits at `(y, z)`. Every cell is located by an exact integer key and every
+isometry is an exact integer map. Floats appear only in the projection to
+pixels, and never decide an index.
+
+## The index law, derived — and the correction it forced
+
+Sector *s* is `R^s` applied to the base wedge. Then `R·(R^s k) = R^(s+1) k`, and
+dihedral commutation `M·R^s = R^(−s)·M` together with `M` carrying the base
+wedge to sector −1 gives:
+
+| | index law |
+|---|---|
+| the six rotations | `(s, c) ↦ (s + k mod 6, c)` |
+| the six reflections | `(s, c) ↦ (k − 1 − s mod 6, μ(c))` |
+
+where `R·M = [[0,1],[1,0]]` is the swap `a ↔ b` — in barycentric terms the swap
+of the `B` and `C` coordinates, which is exactly `m_A`. So **μ is the
+within-sector median mirror**, already computed as `cell.mirror.A`.
+
+The natural guess — that `rot60` carries a μ, and that the reflections' μ is
+parity-dependent — is **geometrically wrong** under an index intrinsic to the
+sector. The μ belongs uniformly on the six reflections and nowhere on the
+rotations. `test/hexagon.test.ts` plants that exact candidate as a mutation and
+shows it caught: it corrupts precisely the odd rotations (`r60`, `r180`,
+`r300`) and breaks Cayley closure. The difference is one of indexing, not of
+geometry — a *screen-relative* "position within row" would reverse on odd
+sectors and put the μ back on the rotation.
+
+The twelve maps close into D₆: Cayley table verified against
+`r_i·r_j = r_{i+j}`, `r_i·m_j = m_{i+j}`, `m_i·r_j = m_{i−j}`, `m_i·m_j = r_{i−j}`,
+0 escapes of 144, both conventions; `rot60⁶ = id`, `rot60³ = inversion`, every
+mirror an involution, at *d* = 1,2,3. A render-space fixture checks three
+hand-picked cells per isometry against the geometric rotation/reflection of
+their screen centroids.
+
+## What the hexagon measures — the D₆ is free
+
+| | apex | ifs |
+|---|---|---|
+| isometries lifting exactly | **12 / 12** | **12 / 12** |
+| rotations lift by | identity relabelling | identity relabelling |
+| reflections lift by | `φ = (σ₂ σ₃)` | `φ = (σ₂ σ₃)` |
+
+**The hexagon canvas cannot see the convention difference.** Its lift table is
+identical in both, where the triangle's separates them sharply (order 2 against
+order 6, Part 2 section E). The reason is structural rather than surprising:
+every isometry either permutes sectors, leaving each cell's charge untouched,
+or permutes sectors *and* applies μ = `m_A` — and `m_A` lifts exactly in both
+conventions. The D₆ is inherited from the **arrangement** of six identical
+sectors; the V₄ structure that distinguishes the conventions lives *inside* a
+sector, where D₆ never reaches.
+
+This is worth stating plainly because it is the opposite of what a richer
+symmetry group usually means. Going from D₃-with-order-2-realised to a full D₆
+buys no new information about the colouring.
+
+## The balance fact — and a framing that did not survive
+
+A lone triangle is **not** orientation-balanced. With `up = (4ᵈ+2ᵈ)/2` and
+`down = (4ᵈ−2ᵈ)/2`:
+
+| *d* | triangle up / down | surplus | hexagon up / down |
+|---|---|---|---|
+| 1 | 3 / 1 | 2 | 12 / 12 |
+| 2 | 10 / 6 | 4 | 48 / 48 |
+| 3 | 36 / 28 | 8 | 192 / 192 |
+| 4 | 136 / 120 | 16 | 768 / 768 |
+
+The hexagon is exactly balanced at 3·4ᵈ each, at every depth, in both
+conventions — rendered in the app as a live check, not a constant.
+
+**The mechanism is sector parity, not missing corners.** A rotation by an odd
+multiple of 60° exchanges the two lattice orientations, so three sectors are
+drawn in each; the triangle's surplus of 2ᵈ appears once with each sign and
+cancels. Measured directly: the even sectors carry `+3·2ᵈ` and the odd sectors
+`−3·2ᵈ`.
+
+A proposed "corner-defect" framing — that the triangle's imbalance lives in
+three corners the hexagon lacks — does **not** match the measurement, and is
+recorded here as refuted rather than quietly dropped. The imbalance is `2ᵈ`
+(16 at *d* = 4), not 3; and the hexagon contains six *complete* triangles, so
+no corner is absent from it at all.
+
+## Two notes on status
+
+- This corresponds to the **FOLDKEY hex6 profile** — one `s=3` level
+  restricted to its six central codes.
+- Regular hexagons are **not rep-tiles**; sectors are. That is why the hexagon
+  here is a *derived* canvas built from six triangle instances, and not a
+  primitive with a subdivision rule of its own.
