@@ -87,24 +87,46 @@ function indexByKey(figure: Figure): Map<string, number> {
 }
 
 /**
+ * The permutation of cell indices induced by a triangle isometry.
+ *
+ * Permute the three barycentric slots of the exact integer centroid key and
+ * look the result up: no pixel is consulted and no tolerance is chosen, so the
+ * answer is an integer fact about the figure rather than a measurement of it.
+ * Throws if the isometry fails to permute the cell set, which would mean the
+ * geometry is not what this module assumes.
+ *
+ * The hexagon's `indexMap` is the same idea on the Eisenstein lattice; this is
+ * the triangle counterpart, factored out so the orbit engine and the lift
+ * report share one derivation instead of two copies of it.
+ */
+export function triangleIndexMap(
+  figure: Figure,
+  name: IsometryName
+): number[] {
+  const byKey = indexByKey(figure);
+  const p = ISOMETRIES[name];
+  const out = new Array<number>(figure.cells.length);
+  for (const c of figure.cells) {
+    const j = byKey.get([c.key[p[0]], c.key[p[1]], c.key[p[2]]].join(","));
+    if (j === undefined) {
+      throw new Error(`${name}: geometry is not invariant under this isometry`);
+    }
+    out[c.i] = j;
+  }
+  return out;
+}
+
+/**
  * For each isometry, the best permutation of V4 and how many cells it carries
  * correctly. An isometry is EXACT when some relabelling carries every cell.
  */
 export function isometryReport(figure: Figure): IsometryRow[] {
-  const byKey = indexByKey(figure);
   const total = figure.cells.length;
 
   return ISOMETRY_NAMES.map((name) => {
-    const p = ISOMETRIES[name];
-    // The isometry must permute the CELL SET, or the question is malformed.
-    const image: number[] = new Array(total);
-    for (const c of figure.cells) {
-      const j = byKey.get([c.key[p[0]], c.key[p[1]], c.key[p[2]]].join(","));
-      if (j === undefined) {
-        throw new Error(`${name}: geometry is not invariant under this isometry`);
-      }
-      image[c.i] = j;
-    }
+    // The isometry must permute the CELL SET, or the question is malformed;
+    // `triangleIndexMap` throws if it does not.
+    const image = triangleIndexMap(figure, name);
 
     let matches = -1;
     let best: Record<Charge, Charge> = {} as Record<Charge, Charge>;

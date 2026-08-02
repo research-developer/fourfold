@@ -1,0 +1,803 @@
+/* ============================================================
+   FOURFOLD — DRAW
+   The same observatory console as the rest of the app, rebuilt
+   as an instrument panel: a tool rail bolted to the left of a
+   single lit plate. Nothing here is saturated except the work.
+   ============================================================ */
+
+.page {
+  --d-rot: #a78bfa;
+  --d-spine: #67e8f9;
+  --d-boundary: #f59e0b;
+  --d-median-a: #67e8f9;
+  --d-median-b: #4ade80;
+  --d-median-c: #f59e0b;
+
+  max-width: 1560px;
+  margin: 0 auto;
+  padding: clamp(14px, 2.4vw, 30px) clamp(12px, 2.2vw, 30px) 72px;
+}
+
+/* ---------- masthead ---------- */
+
+.head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 18px;
+  flex-wrap: wrap;
+  padding-bottom: 12px;
+  margin-bottom: clamp(12px, 1.8vw, 22px);
+  border-bottom: 1px solid var(--rule);
+}
+
+.brandLine {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.eyebrow {
+  font-size: 10px;
+  letter-spacing: 0.34em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+}
+
+.title {
+  font-family: var(--font-display), Georgia, serif;
+  font-size: clamp(38px, 6.4vw, 66px);
+  line-height: 0.82;
+  letter-spacing: 0.005em;
+  margin: 0;
+  color: var(--bone);
+}
+
+/* The rule under the wordmark IS the active scheme: its stops are the exact
+   colours the current brush would lay down, in orbit order. Change the scheme
+   and the masthead changes with the drawing. */
+.schemeRule {
+  height: 3px;
+  border-radius: 2px;
+  margin-top: 9px;
+  width: min(420px, 62vw);
+  transition: background 260ms ease;
+}
+
+.headNote {
+  font-size: 11px;
+  line-height: 1.8;
+  color: var(--bone-dim);
+  max-width: 54ch;
+  margin: 0 0 2px;
+}
+
+.headNote b {
+  color: var(--bone);
+  font-weight: 500;
+}
+
+.backLink {
+  color: var(--bone-dim);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  text-decoration: none;
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 3px;
+  white-space: nowrap;
+  transition: color 160ms ease, border-color 160ms ease;
+}
+
+.backLink:hover {
+  color: var(--bone);
+  border-color: var(--bone-faint);
+}
+
+/* ---------- stage ---------- */
+
+.stage {
+  display: grid;
+  grid-template-columns: 318px minmax(0, 1fr);
+  gap: clamp(12px, 1.6vw, 24px);
+  align-items: start;
+}
+
+.rail {
+  position: sticky;
+  top: 14px;
+  display: flex;
+  flex-direction: column;
+  background: var(--plate);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  box-shadow: 0 18px 60px -28px rgba(0, 0, 0, 0.9);
+  max-height: calc(100vh - 28px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+@media (max-width: 1040px) {
+  .stage {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .rail {
+    position: static;
+    order: 2;
+    max-height: none;
+    overflow: visible;
+  }
+  .plateCol {
+    order: 1;
+  }
+}
+
+/* ---------- rail sections ---------- */
+
+.section {
+  padding: 11px 13px 13px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.section:last-child {
+  border-bottom: 0;
+}
+
+/* The rail scrolls; without this the last section ends on a hard edge and
+   reads as the bottom of the panel rather than the top of more panel. */
+.railFade {
+  position: sticky;
+  bottom: 0;
+  height: 26px;
+  margin-top: -26px;
+  flex: none;
+  pointer-events: none;
+  background: linear-gradient(rgba(18, 16, 16, 0), var(--plate));
+}
+
+.sectionHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.sectionTitle {
+  font-size: 9.5px;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+  margin: 0;
+  font-weight: 500;
+}
+
+.sectionMeta {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  color: var(--bone-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.hint {
+  font-size: 10px;
+  line-height: 1.7;
+  color: var(--bone-faint);
+  margin: 9px 0 0;
+}
+
+.hint b {
+  color: var(--bone-dim);
+  font-weight: 500;
+}
+
+/* ---------- segmented controls ---------- */
+
+.seg {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  border: 1px solid var(--rule-bright);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.segBtn {
+  border: 0;
+  border-right: 1px solid var(--rule-bright);
+  border-radius: 0;
+  padding: 8px 4px;
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  color: var(--bone-dim);
+  background: transparent;
+  min-width: 0;
+}
+
+.segBtn:last-child {
+  border-right: 0;
+}
+
+.segBtn[aria-pressed="true"] {
+  background: var(--bone);
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.depthRow {
+  margin-top: 8px;
+}
+
+.depthBtn {
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.06em;
+}
+
+/* ---------- brush dial ---------- */
+
+.dial {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 1fr;
+  gap: 6px;
+}
+
+.dialBtn {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 9px 2px 7px;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  background: var(--plate-2);
+  color: var(--bone-dim);
+  letter-spacing: 0;
+  text-transform: none;
+  overflow: hidden;
+  transition: border-color 180ms ease, background 180ms ease, color 180ms ease,
+    transform 140ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.dialBtn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: var(--rule-bright);
+  color: var(--bone);
+}
+
+.dialBtn[aria-pressed="true"] {
+  border-color: var(--bone);
+  background: rgba(236, 230, 220, 0.09);
+  color: var(--bone);
+  transform: translateY(-2px);
+}
+
+.dialBtn[aria-pressed="true"]::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--bone);
+}
+
+.dialGlyph {
+  display: block;
+  width: 30px;
+  height: 30px;
+}
+
+.dialNum {
+  font-family: var(--font-display), Georgia, serif;
+  font-size: 17px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- scheme list ---------- */
+
+.schemeList {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.schemeBtn {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--bone-dim);
+  text-transform: none;
+  letter-spacing: 0.04em;
+  font-size: 11px;
+  text-align: left;
+  transition: background 150ms ease, color 150ms ease, border-color 150ms ease;
+}
+
+.schemeBtn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.05);
+  border-color: var(--rule);
+}
+
+.schemeBtn[aria-pressed="true"] {
+  background: rgba(236, 230, 220, 0.09);
+  border-color: var(--rule-bright);
+  color: var(--bone);
+}
+
+.schemeSwatches {
+  display: flex;
+  flex: none;
+  gap: 2px;
+}
+
+.chip {
+  width: 11px;
+  height: 18px;
+  border-radius: 1px;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+
+.schemeName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.schemeCount {
+  flex: none;
+  font-size: 9px;
+  color: var(--bone-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- colour ---------- */
+
+.hueRail {
+  position: relative;
+  height: 26px;
+  border-radius: 2px;
+  border: 1px solid var(--rule-bright);
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.hueRail:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: 2px;
+}
+
+.hueThumb {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 3px;
+  margin-left: -1.5px;
+  border-radius: 2px;
+  background: var(--bone);
+  box-shadow: 0 0 0 1px rgba(10, 9, 8, 0.85), 0 0 10px rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+}
+
+.slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 12px;
+  border-radius: 2px;
+  border: 1px solid var(--rule);
+  margin: 0;
+  cursor: pointer;
+}
+
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 18px;
+  border-radius: 2px;
+  background: var(--bone);
+  box-shadow: 0 0 0 1px rgba(10, 9, 8, 0.85);
+  cursor: pointer;
+}
+
+.slider::-moz-range-thumb {
+  width: 10px;
+  height: 18px;
+  border: 0;
+  border-radius: 2px;
+  background: var(--bone);
+  box-shadow: 0 0 0 1px rgba(10, 9, 8, 0.85);
+  cursor: pointer;
+}
+
+.slider:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: 2px;
+}
+
+.sliderRow {
+  display: grid;
+  grid-template-columns: 12px 1fr 34px;
+  align-items: center;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.sliderKey {
+  font-size: 9.5px;
+  color: var(--bone-faint);
+  letter-spacing: 0.1em;
+}
+
+.sliderVal {
+  font-size: 9.5px;
+  color: var(--bone-dim);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.presets {
+  display: grid;
+  grid-template-columns: repeat(9, 1fr);
+  gap: 4px;
+  margin-top: 11px;
+}
+
+.preset {
+  aspect-ratio: 1;
+  padding: 0;
+  border: 1px solid rgba(0, 0, 0, 0.5);
+  border-radius: 2px;
+  min-width: 0;
+  transition: transform 140ms cubic-bezier(0.16, 1, 0.3, 1), box-shadow 140ms ease;
+}
+
+.preset:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px -2px rgba(0, 0, 0, 0.7);
+}
+
+.preset[aria-pressed="true"] {
+  box-shadow: 0 0 0 2px var(--bone);
+}
+
+.hexRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 11px;
+}
+
+.hexSample {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  border-radius: 2px;
+  border: 1px solid rgba(0, 0, 0, 0.5);
+}
+
+.hexInput {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  padding: 7px 9px;
+  background: var(--plate-2);
+  color: var(--bone);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  text-transform: lowercase;
+}
+
+.hexInput:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: 1px;
+}
+
+.hexInput[aria-invalid="true"] {
+  border-color: #d6336c;
+}
+
+/* ---------- orbit tape ---------- */
+
+.tape {
+  display: flex;
+  gap: 3px;
+  height: 28px;
+}
+
+.tapeCell {
+  flex: 1;
+  border-radius: 2px;
+  position: relative;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.45);
+  animation: tape-in 420ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.tapeIndex {
+  position: absolute;
+  inset: auto 0 -14px 0;
+  text-align: center;
+  font-size: 8.5px;
+  color: var(--bone-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.tapeWrap {
+  padding-bottom: 15px;
+}
+
+@keyframes tape-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scaleY(0.7);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---------- toggles ---------- */
+
+.checkRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10.5px;
+  color: var(--bone-dim);
+  padding: 4px 0;
+  cursor: pointer;
+  letter-spacing: 0.04em;
+}
+
+.checkRow input {
+  accent-color: var(--lime);
+  cursor: pointer;
+}
+
+/* The UA ring on a checkbox is white and one pixel; every other control on the
+   page rings in lime at two. One focus ring, one meaning. */
+.checkRow input:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: 2px;
+}
+
+/* ---------- plate ---------- */
+
+.plateCol {
+  /* Height the canvas is allowed to take. A drawing program whose canvas does
+     not fit on screen is a scroll bar with a hobby. */
+  --d-avail: calc(100dvh - 288px);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+
+@media (max-width: 1040px) {
+  .plateCol {
+    --d-avail: 74vh;
+  }
+}
+
+.plate {
+  position: relative;
+  background: var(--plate);
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  padding: clamp(10px, 1.4vw, 18px);
+  box-shadow: var(--shadow-plate);
+}
+
+/* Instrument corner ticks. Two gradients per corner, drawn on the padding box
+   so they read as engraved registration marks rather than a border. */
+.plate::before,
+.plate::after {
+  content: "";
+  position: absolute;
+  width: 13px;
+  height: 13px;
+  pointer-events: none;
+  border-color: var(--rule-bright);
+  border-style: solid;
+}
+
+.plate::before {
+  top: 6px;
+  left: 6px;
+  border-width: 1px 0 0 1px;
+}
+
+.plate::after {
+  bottom: 6px;
+  right: 6px;
+  border-width: 0 1px 1px 0;
+}
+
+.plateRule {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px 18px;
+  flex-wrap: wrap;
+  font-size: 9.5px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+  padding-bottom: 9px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.plateRule b {
+  color: var(--bone-dim);
+  font-weight: 500;
+}
+
+.readout {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 16px;
+  min-width: 0;
+}
+
+/* Actions live on the plate, not in the rail: they act on the artwork, and the
+   hand that just finished a stroke is already here. */
+.tools {
+  display: flex;
+  gap: 5px;
+  flex: none;
+}
+
+.tools button {
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 6px 10px;
+}
+
+/* Touch: the toolbar drops onto its own row anyway, so spend the space on
+   targets a thumb can actually hit. */
+@media (max-width: 700px) {
+  .tools {
+    width: 100%;
+  }
+  .tools button {
+    flex: 1;
+    padding: 11px 4px;
+    font-size: 9.5px;
+  }
+}
+
+.canvasHold {
+  position: relative;
+  display: flex;
+  justify-content: center;
+}
+
+.canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  /* Cap the WIDTH by the height budget times the figure's own aspect ratio, so
+     the drawing scales down whole instead of being letterboxed inside an
+     over-wide viewport. `--d-aspect` is set inline from the viewBox. */
+  max-width: min(100%, calc(var(--d-avail) * var(--d-aspect, 1.2)));
+  /* The pointer is a brush here; the page must not pan out from under it. */
+  touch-action: none;
+  cursor: crosshair;
+  border-radius: 2px;
+}
+
+/* The canvas is tabbable so the keyboard path exists, which means a click also
+   focuses it and the UA ring lands around the artwork. Keyboard focus still
+   gets a ring — a stronger one — from :focus-visible. */
+.canvas:focus {
+  outline: none;
+}
+
+.canvas:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: 3px;
+}
+
+.emptyHint {
+  position: absolute;
+  inset: auto 0 8% 0;
+  text-align: center;
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+  pointer-events: none;
+  animation: fade-up 700ms cubic-bezier(0.16, 1, 0.3, 1) both 260ms;
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 0.9;
+    transform: none;
+  }
+}
+
+/* ---------- legend ---------- */
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  padding-top: 10px;
+  margin-top: 10px;
+  border-top: 1px solid var(--rule);
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  color: var(--bone-faint);
+  text-transform: uppercase;
+}
+
+.legendItem {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legendSwatch {
+  width: 16px;
+  height: 0;
+  border-top-width: 2px;
+  border-top-style: solid;
+  flex: none;
+}
+
+.legendDot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 2px solid var(--d-rot);
+  flex: none;
+}
+
+/* ---------- footnote ---------- */
+
+.foot {
+  font-size: 10px;
+  line-height: 1.8;
+  color: var(--bone-faint);
+  margin: 0;
+  max-width: 92ch;
+}
+
+.foot code {
+  color: var(--bone-dim);
+  background: var(--plate-2);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 0 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tapeCell,
+  .emptyHint {
+    animation: none;
+  }
+  .dialBtn,
+  .preset,
+  .schemeRule {
+    transition: none;
+  }
+}

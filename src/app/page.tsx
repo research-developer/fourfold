@@ -330,6 +330,9 @@ export default function Page() {
           <Link href="/conventions" style={{ color: "inherit" }}>
             the convention toggle
           </Link>
+          <Link href="/draw" style={{ color: "inherit" }}>
+            symmetry draw
+          </Link>
           <a
             href="https://github.com/research-developer/fourfold"
             style={{ color: "inherit" }}
