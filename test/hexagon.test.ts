@@ -76,6 +76,33 @@ describe("the hexagon is six sectors of the triangle", () => {
     }
   }
 
+  it("each sector occupies its own 60° wedge, in order", () => {
+    // The visual claim, checked numerically rather than by eye: sector s
+    // spans [60s, 60(s+1)] measured from the centre, counter-clockwise.
+    const hex = buildHexagon(3, "apex");
+    const [cx, cy] = hex.centre;
+    for (const c of hex.cells) {
+      const ang =
+        (Math.atan2(cy - c.centroid[1], c.centroid[0] - cx) * 180) / Math.PI;
+      const norm = ((ang % 360) + 360) % 360;
+      expect([c.sector, norm > 60 * c.sector, norm < 60 * (c.sector + 1)]).toEqual(
+        [c.sector, true, true]
+      );
+    }
+  });
+
+  it("odd sectors are drawn in the opposite lattice orientation", () => {
+    // A rotation by an odd multiple of 60° exchanges up and down triangles.
+    // This is what makes the hexagon balance.
+    const hex = buildHexagon(3, "apex");
+    for (const c of hex.cells) {
+      expect([c.sector, c.eps]).toEqual([
+        c.sector,
+        (c.baseEps ^ (c.sector & 1)) as 0 | 1,
+      ]);
+    }
+  });
+
   it("leaves the triangle untouched — same cells, same charges", () => {
     for (const conv of CONVENTIONS) {
       const hex = buildHexagon(3, conv);

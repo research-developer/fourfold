@@ -117,12 +117,17 @@ export default function HexBoard({
    * sectors, collinear through the centre.
    */
   const lines = ([0, 1, 2, 3, 4, 5] as const).map((k) => {
+    const spine = k % 2 === 1;
+    // Boundaries run to the hexagon's CORNERS (circumradius); spines run to
+    // the EDGE MIDPOINTS (inradius). Using one length for both makes the
+    // spines overshoot the outline.
+    const len = spine ? (R * Math.sqrt(3)) / 2 : R;
     const t = (Math.PI / 180) * 30 * k;
-    const dx = Math.cos(t) * R;
-    const dy = Math.sin(t) * R;
+    const dx = Math.cos(t) * len;
+    const dy = Math.sin(t) * len;
     return {
       k,
-      spine: k % 2 === 1,
+      spine,
       x1: cx - dx,
       y1: cy + dy,
       x2: cx + dx,
