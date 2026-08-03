@@ -102,7 +102,7 @@
 
 import { buildFigure, type Convention, type Figure } from "./figure";
 import { buildHexagon, type Hexagon } from "./hexagon";
-import type { BrushMode, CanvasKind, SymmetrySurface } from "./orbit";
+import { subgroupMaps, type BrushMode, type CanvasKind, type SymmetrySurface } from "./orbit";
 
 export type BandFamily = "A" | "B" | "C";
 
@@ -292,6 +292,10 @@ export function buildBands(
  * though the band itself generally is not: some members of the band's image lie
  * in other bands of the same family, and that is correct — a mirror carries a
  * row to a row, but not to its own row.
+ *
+ * This is the union, which is what a STROKE needs — the set of cells it
+ * touches. It is not what a colour scheme needs; see `bandOrbitGrouped`, whose
+ * flattened union is this exact array.
  */
 export function bandOrbit(
   surface: SymmetrySurface,
@@ -300,17 +304,101 @@ export function bandOrbit(
   family: BandFamily,
   mode: BrushMode
 ): number[] {
-  if (surface.cellCount !== bandSurface.cellCount) {
-    throw new Error(
-      `bandOrbit: surface holds ${surface.cellCount} cells and the band surface ` +
-        `holds ${bandSurface.cellCount}; they are not the same canvas`
-    );
-  }
+  sameCanvas("bandOrbit", surface, bandSurface);
   const out = new Set<number>();
   for (const j of bandSurface.bandThrough(i, family)) {
     for (const k of surface.orbit(j, mode)) out.add(k);
   }
   return [...out].sort((a, b) => a - b);
+}
+
+function sameCanvas(
+  who: string,
+  surface: SymmetrySurface,
+  bandSurface: BandSurface
+): void {
+  if (surface.cellCount !== bandSurface.cellCount) {
+    throw new Error(
+      `${who}: surface holds ${surface.cellCount} cells and the band surface ` +
+        `holds ${bandSurface.cellCount}; they are not the same canvas`
+    );
+  }
+}
+
+/**
+ * The same orbit, kept as the SET OF BANDS it actually is.
+ *
+ * `bandOrbit` returns the union and is right to: what a stroke touches is a set
+ * of cells. But the union has forgotten the one fact a colour scheme wants. An
+ * isometry carries a lattice line to a lattice line — that is what an isometry
+ * IS, on a lattice — so the image of a band under a group element is another
+ * band, and the orbit of a band is a set of bands. Six rows under a 6-fold
+ * brush are six well-defined image bands. Flatten them and a scheme indexed by
+ * position in the cell list paints speckle; keep them and it paints rows.
+ *
+ * Exact, and there is nothing here to tune. Each image is `{ g(j) : j ∈ band }`
+ * for one element g of the subgroup, computed by index lookup on the
+ * permutations `subgroupMaps` hands over. No coordinate is compared and no
+ * tolerance exists to get wrong.
+ *
+ * ── Two things that had to be MEASURED, not assumed ─────────────────────
+ *
+ * A band may be FIXED by an element: on the triangle m_A fixes α and swaps β
+ * with γ, so it carries every family-A band to itself. Its image is therefore
+ * the source band again, and counting it twice would hand two hues to one row.
+ * Deduplication is by cell-set identity, which is exact — an image is a whole
+ * band, so two images are equal or they are not, with nothing in between to
+ * judge. The consequence is worth stating plainly and is measured in the tests:
+ * on the triangle a 6-fold brush on a band yields THREE image bands, not six,
+ * because D3 = C3 ∪ C3·m_A and m_A adds no new image. Six rows is what the
+ * HEXAGON gives, where the six rotations move every band.
+ *
+ * Two image bands may also CROSS. They are lines, and two lines of DIFFERENT
+ * families meet, so one cell can belong to two image bands at once. Whether
+ * that happens at all depends on the subgroup: r180 carries a hexagon row to a
+ * PARALLEL row, so mode 2 on the hexagon produces no crossing anywhere, while
+ * mode 6 puts six rows into three parallel pairs and the remaining twelve pairs
+ * cross once each. Where it does happen it is a genuine ambiguity about which
+ * hue the cell takes, resolved by rule rather than by luck: the LOWER group
+ * index wins, so the source band keeps every cell it holds and each later image
+ * yields to every earlier one. See `brushStamp` in `brush.ts`, which applies
+ * the rule, and `test/bandcolour.test.ts`, which measures the whole census.
+ *
+ * ── Order ───────────────────────────────────────────────────────────────
+ *
+ * Deterministic and identity-first: the source band is emitted first, then each
+ * distinct image in subgroup-element order. The source is placed first
+ * EXPLICITLY rather than by trusting the element lists to begin with the
+ * identity — they do, but a colour that depends on the order of a constant
+ * table should not have to be read out of that table to be believed.
+ *
+ * The flattened, sorted union of the result equals `bandOrbit` exactly. That
+ * equality is the whole warrant for this function: it changes the grouping and
+ * nothing else. `test/bands.test.ts` checks it on both canvases, all three
+ * families, every mode, at depths 1–3.
+ */
+export function bandOrbitGrouped(
+  surface: SymmetrySurface,
+  bandSurface: BandSurface,
+  i: number,
+  family: BandFamily,
+  mode: BrushMode
+): number[][] {
+  sameCanvas("bandOrbitGrouped", surface, bandSurface);
+  const source = bandSurface.bandThrough(i, family);
+  const out: number[][] = [source];
+  const seen = new Set<string>([source.join(",")]);
+
+  for (const m of subgroupMaps(surface, mode)) {
+    // Ascending and deduplicated, so the signature below is a canonical name
+    // for the SET and not for the order the element happened to produce it in.
+    const image = [...new Set(source.map((j) => m[j]))].sort((a, b) => a - b);
+    const sig = image.join(",");
+    if (seen.has(sig)) continue;
+    seen.add(sig);
+    out.push(image);
+  }
+  return out;
 }
 
 // ── measurements ─────────────────────────────────────────────────────────

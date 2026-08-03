@@ -249,6 +249,35 @@ export const SCHEMES: Record<SchemeName, Scheme> = {
 export const SCHEME_NAMES = Object.keys(SCHEMES) as SchemeName[];
 
 /**
+ * The colour for each of a list of scheme POSITIONS.
+ *
+ * The general form, of which `paintOrbit` is the special case where the
+ * positions are 0, 1, 2, … and `span` is the orbit's own length.
+ *
+ * It exists because position-in-the-cell-list is not always the right index. A
+ * band brush paints a set of IMAGE BANDS, and what should carry the hue is
+ * which band a cell is in, not where it sits in the flattened list — six rows
+ * take six hues and each row comes out solid. `bands.ts` computes the grouping
+ * and `brush.ts` turns it into these keys; this function only reads them.
+ *
+ * `span` is how many positions the scheme is being indexed over — the number of
+ * image bands for a band brush, the orbit size for an orbit. It is separate
+ * from `keys.length` because the two differ exactly when the indexing is not
+ * positional, and because it is what the analogous scheme fans its lightness
+ * across: over rows when the brush paints rows, over cells when it paints an
+ * orbit. Both folds inside `scheme.at` are total, so a mismatched pair
+ * degrades to a wrong colour rather than to a crash mid-drag.
+ */
+export function paintKeys(
+  scheme: Scheme,
+  base: Swatch,
+  keys: readonly number[],
+  span: number
+): Swatch[] {
+  return keys.map((k) => scheme.at(base, k, span));
+}
+
+/**
  * The colour of every cell of an orbit, aligned to the orbit array.
  *
  * This is the module's whole purpose in one call: hand it what `orbit()`
@@ -259,5 +288,10 @@ export function paintOrbit(
   base: Swatch,
   orbit: readonly number[]
 ): Swatch[] {
-  return orbit.map((_, k) => scheme.at(base, k, orbit.length));
+  return paintKeys(
+    scheme,
+    base,
+    orbit.map((_, k) => k),
+    orbit.length
+  );
 }

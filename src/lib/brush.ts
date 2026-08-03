@@ -20,7 +20,9 @@
  * way, `planEdits` turns any of them into an ordinary undoable stroke with no
  * per-tool branch anywhere downstream:
  *
- *   paint    the scheme's colour for orbit position k
+ *   paint    the scheme's colour for the cell's scheme POSITION — see the note
+ *            on `BrushStamp`, which is where a position comes from and why it
+ *            is not simply the cell's place in the list
  *   erase    null, everywhere
  *   adjust   the transformed colour where there IS one, and null where there is
  *            not, so an unpainted cell yields from = null, to = null, which
@@ -54,7 +56,12 @@
  */
 
 import { adjustCells, type Adjustment } from "./adjust";
-import { bandOrbit, type BandFamily, type BandSurface } from "./bands";
+import {
+  bandOrbit,
+  bandOrbitGrouped,
+  type BandFamily,
+  type BandSurface,
+} from "./bands";
 import type { BrushMode, CanvasKind, SymmetrySurface } from "./orbit";
 import {
   PROGRESSIONS,
@@ -63,7 +70,7 @@ import {
   type ProgressionName,
 } from "./progression";
 import {
-  paintOrbit,
+  paintKeys,
   swatchFromHex,
   type Scheme,
   type Swatch,
@@ -118,6 +125,119 @@ export function brushCells(
     : bandOrbit(surface, bands, i, shape.band, shape.mode);
 }
 
+/**
+ * One application of the brush, with the scheme's index attached to every cell.
+ *
+ * `brushCells` says WHICH cells. This says which cells and, for each of them,
+ * which position of the colour scheme it takes — and the second half is not
+ * derivable from the first, which is the entire reason this exists.
+ *
+ * ── The law: index the scheme by the IMAGE BAND, not by list position ────
+ *
+ * With no band the two coincide and nothing changes: a k-cell orbit takes the
+ * scheme's k positions in order, exactly as `paintOrbit` always did.
+ *
+ * With a band they come apart badly. The brush paints the row through the cell
+ * carried by the subgroup, which is a set of ROWS — an isometry takes a lattice
+ * line to a lattice line — and indexing the scheme by position in the flattened
+ * cell list hands consecutive hues to cells that happen to be adjacent in index
+ * order, which is speckle. Indexing by which image band the cell belongs to
+ * gives every row one hue and hands the k rows the scheme's k hues. Exact, and
+ * with no tie-break anywhere: `bandOrbitGrouped` returns the bands themselves.
+ *
+ * ── Crossings ───────────────────────────────────────────────────────────
+ *
+ * Image bands are lines and lines of different families cross, so a cell can
+ * lie in two of them at once — and in three, where a band runs through the
+ * triangle's hub, which is fixed by all of D3 and so lands in every image at
+ * once. A cell takes ONE colour, so the tie is settled by rule: the LOWEST
+ * group index wins. The source band is group 0, so it keeps every cell it holds
+ * and each later image yields to every earlier one. Deterministic, and a total
+ * order rather than a pairwise tie-break precisely because three-way overlaps
+ * exist. Measured in `test/bandcolour.test.ts` rather than hoped for: the
+ * hexagon's twelve crossing cells per seed at mode 6 are exactly the twelve
+ * non-parallel pairs among six rows, and nothing anywhere lies in four.
+ *
+ * `span` is what the scheme is indexed OVER — the number of image bands, not
+ * the number of cells — so a 6-fold hexad band reads as six hues even though it
+ * covers hundreds of cells, and the analogous scheme fans its lightness across
+ * the rows rather than across the cell list.
+ */
+export interface BrushStamp {
+  /** The cells one application touches, ascending. Equal to `brushCells`. */
+  cells: number[];
+  /** The scheme position each cell takes, aligned to `cells`. */
+  keys: number[];
+  /** How many positions the scheme is indexed over. */
+  span: number;
+  /**
+   * The image bands, identity first, when the brush carries a band. `null` for
+   * a plain orbit — where there is no grouping, not a grouping of one.
+   */
+  groups: number[][] | null;
+}
+
+/** The positional stamp: cell k of the list takes scheme position k. */
+function positionalStamp(cells: number[]): BrushStamp {
+  return {
+    cells,
+    keys: cells.map((_, k) => k),
+    span: cells.length,
+    groups: null,
+  };
+}
+
+export function brushStamp(
+  surface: SymmetrySurface,
+  bands: BandSurface,
+  i: number,
+  shape: BrushShape
+): BrushStamp {
+  if (shape.band === null) return positionalStamp(surface.orbit(i, shape.mode));
+
+  const groups = bandOrbitGrouped(surface, bands, i, shape.band, shape.mode);
+  // First writer wins, and the groups arrive in ascending index order, so this
+  // IS the lowest-index rule — stated as an insertion order rather than as a
+  // comparison, which is one fewer place for it to be got backwards.
+  const key = new Map<number, number>();
+  groups.forEach((g, k) => {
+    for (const c of g) if (!key.has(c)) key.set(c, k);
+  });
+  const cells = [...key.keys()].sort((a, b) => a - b);
+  return {
+    cells,
+    keys: cells.map((c) => key.get(c) as number),
+    span: groups.length,
+    groups,
+  };
+}
+
+/**
+ * How many positions of the scheme this brush shape will use.
+ *
+ * What the colour tape in the UI is a picture of. Without a band it is the
+ * mode: a generic orbit is |H| cells long and takes |H| hues, and a cell with a
+ * non-trivial stabiliser takes fewer — which the tape cannot show without
+ * knowing which cell, and which the panel says in words instead.
+ *
+ * With a band it is the number of IMAGE BANDS, and that number is emphatically
+ * not the mode. A 6-fold brush is D3 on the triangle, where m_A fixes the
+ * family-A bands and the band orbit is three rows, and C6 on the hexagon, where
+ * it is six. Probed at cell 0 rather than at the cell under the pointer because
+ * the count is a fact about the subgroup and the family and NOT about the cell:
+ * `test/bandcolour.test.ts` measures it at every cell of both canvases and
+ * finds exactly one value per (canvas, mode, family). If that ever stopped
+ * being true the test would fail before this function started lying.
+ */
+export function brushSpan(
+  surface: SymmetrySurface,
+  bands: BandSurface,
+  shape: BrushShape
+): number {
+  if (shape.band === null) return shape.mode;
+  return bandOrbitGrouped(surface, bands, 0, shape.band, shape.mode).length;
+}
+
 // ── what colour they end up ──────────────────────────────────────────────
 
 export interface ColourPlan {
@@ -160,21 +280,42 @@ function swatchPlate(
  * to the preview and the ghost is built from the same numbers, so the ghost
  * cannot promise a colour the stroke will not lay.
  */
+export function stampColours(
+  plan: ColourPlan,
+  paint: PaintMap,
+  stamp: BrushStamp
+): (string | null)[] {
+  const { cells } = stamp;
+  if (plan.tool === "erase") return cells.map(() => null);
+  if (plan.tool === "paint") {
+    return paintKeys(plan.scheme, plan.base, stamp.keys, stamp.span).map(
+      (s) => s.hex
+    );
+  }
+  // adjust. `adjustCells` owns both rules that matter — an unpainted cell is
+  // skipped, and a cell the adjustment does not move is dropped — so a cell
+  // missing from its result keeps whatever it already had, which `planEdits`
+  // then reads as the no-op it is. The scheme is not consulted at all, so the
+  // stamp's keys are irrelevant here and an adjustment behaves identically
+  // whether or not a band is in play.
+  const after = adjustCells(swatchPlate(paint, cells), cells, plan.adjust);
+  return cells.map((c) => after.get(c)?.hex ?? paint.get(c) ?? null);
+}
+
+/**
+ * The colours for a bare cell list, indexed POSITIONALLY.
+ *
+ * The original form, kept because it is the honest answer whenever the caller
+ * has cells and no grouping — and because that is exactly what an orbit is.
+ * A caller holding a band stamp must use `stampColours`, or it will paint the
+ * speckle this pair of functions exists to tell apart.
+ */
 export function brushColours(
   plan: ColourPlan,
   paint: PaintMap,
   cells: readonly number[]
 ): (string | null)[] {
-  if (plan.tool === "erase") return cells.map(() => null);
-  if (plan.tool === "paint") {
-    return paintOrbit(plan.scheme, plan.base, cells).map((s) => s.hex);
-  }
-  // adjust. `adjustCells` owns both rules that matter — an unpainted cell is
-  // skipped, and a cell the adjustment does not move is dropped — so a cell
-  // missing from its result keeps whatever it already had, which `planEdits`
-  // then reads as the no-op it is.
-  const after = adjustCells(swatchPlate(paint, cells), cells, plan.adjust);
-  return cells.map((c) => after.get(c)?.hex ?? paint.get(c) ?? null);
+  return stampColours(plan, paint, positionalStamp([...cells]));
 }
 
 // ── the progression, and the integer it is a function of ─────────────────

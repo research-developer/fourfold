@@ -86,6 +86,19 @@ export interface SymmetrySurface {
   modes: BrushMode[];
   /** The orbit of cell i under the subgroup chosen by `mode`, sorted ascending. */
   orbit(i: number, mode: BrushMode): number[];
+  /**
+   * The subgroup itself, one index permutation per element.
+   *
+   * An orbit is what you get after forgetting WHICH element carried the cell,
+   * and for a single cell that is all anyone needs. For a SET it is not: the
+   * image of a band under one element is a band, and the orbit of a band is a
+   * set of bands, which the flattened union has already thrown away. `bands.ts`
+   * needs the elements back to recover that grouping, so they are published
+   * rather than kept private to the orbit computation.
+   *
+   * Read `subgroupMaps` for the contract; this is the surface's half of it.
+   */
+  maps(mode: BrushMode): number[][];
 }
 
 // ── the subgroups ────────────────────────────────────────────────────────
@@ -205,27 +218,39 @@ function makeSurface<N extends string>(
   mapFor: (name: N) => number[]
 ): SymmetrySurface {
   const maps = new Map<N, number[]>();
+  const groups = new Map<BrushMode, number[][]>();
   const tables = new Map<BrushMode, number[][]>();
 
-  const tableFor = (mode: BrushMode): number[][] => {
-    const cached = tables.get(mode);
+  /**
+   * The subgroup's element maps, memoised per mode AND per element name — the
+   * two caches are separate because the modes SHARE elements (the identity is
+   * in all of them, and mode 3's rotations are also in mode 6), and rebuilding
+   * an index map is a full pass over the figure's keys.
+   */
+  const groupFor = (mode: BrushMode): number[][] => {
+    const cached = groups.get(mode);
     if (cached !== undefined) return cached;
 
     const names = subgroups[mode];
     if (names === undefined) {
       throw new Error(`${kind}: no brush mode ${mode} on this surface`);
     }
-    const built = orbitTable(
-      cellCount,
-      names.map((n) => {
-        let m = maps.get(n);
-        if (m === undefined) {
-          m = mapFor(n);
-          maps.set(n, m);
-        }
-        return m;
-      })
-    );
+    const built = names.map((n) => {
+      let m = maps.get(n);
+      if (m === undefined) {
+        m = mapFor(n);
+        maps.set(n, m);
+      }
+      return m;
+    });
+    groups.set(mode, built);
+    return built;
+  };
+
+  const tableFor = (mode: BrushMode): number[][] => {
+    const cached = tables.get(mode);
+    if (cached !== undefined) return cached;
+    const built = orbitTable(cellCount, groupFor(mode));
     tables.set(mode, built);
     return built;
   };
@@ -242,6 +267,10 @@ function makeSurface<N extends string>(
       // and a caller that sorted or spliced one in place would corrupt them all.
       return [...tableFor(mode)[i]];
     },
+    // Copies for the same reason, and one level deeper: these arrays are the
+    // memoised maps every future orbit on this surface will be computed from,
+    // so one in-place sort by a caller would silently change the geometry.
+    maps: (mode) => groupFor(mode).map((m) => [...m]),
   };
 }
 
@@ -277,6 +306,42 @@ export function buildSurface(
   return kind === "triangle"
     ? triangleSurface(buildFigure(depth, convention))
     : hexagonSurface(buildHexagon(depth, convention));
+}
+
+// ── the subgroup, element by element ─────────────────────────────────────
+
+/**
+ * The subgroup `mode` names, as one index permutation per element.
+ *
+ * `orbit()` is a forgetful function: it says which cells are the same cell and
+ * says nothing about WHICH isometry made them so. For a cell that is the whole
+ * truth. For a SET it is not — an isometry carries a lattice line to a lattice
+ * line, so the orbit of a band is a set of BANDS, and flattening it into one
+ * cell list destroys the only structure a colour scheme could index. Recovering
+ * that grouping needs the elements themselves, so they are exported.
+ *
+ * ── What is guaranteed ──────────────────────────────────────────────────
+ *
+ *   length      exactly `mode` maps, one per element of the subgroup, in the
+ *               order `TRIANGLE_SUBGROUPS` / `HEXAGON_SUBGROUPS` list them —
+ *               which puts the IDENTITY first in every mode on both canvases.
+ *   permutation each map is a bijection of [0, cellCount), by construction:
+ *               `triangleIndexMap` and `indexMap` throw rather than return a
+ *               map that is not, and `test/orbit.test.ts` checks the lists
+ *               close under composition, so these really are groups.
+ *   consistency `orbit(i, mode)` is exactly `{ m[i] : m ∈ maps(mode) }`, sorted
+ *               and deduplicated. Checked in `test/orbit.test.ts` rather than
+ *               argued: it holds because the lists are complete subgroups, and
+ *               would quietly fail if one ever became a generating set instead.
+ *
+ * ZERO FLOAT, like everything else here: these are the permutations the exact
+ * integer key lookup upstream produced, handed on unchanged.
+ */
+export function subgroupMaps(
+  surface: SymmetrySurface,
+  mode: BrushMode
+): number[][] {
+  return surface.maps(mode);
 }
 
 // ── measurements ─────────────────────────────────────────────────────────
