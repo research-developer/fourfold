@@ -288,6 +288,28 @@ export interface ArtworkSpec {
    * exactly the bytes it did.
    */
   payload?: ArtPayload;
+  /**
+   * Flat shapes laid OVER the finished drawing, after the paint.
+   *
+   * The relief uses it, and nothing here knows that. A group is a fill and an
+   * alpha and a list of polygons, which is all a wash of black or white needs to
+   * be — see `relief.ts` for why plain alpha rather than a blend mode.
+   *
+   * The fill sits on the GROUP and never on a polygon, deliberately: the
+   * geometric importer in `artfile.ts` only accepts polygons carrying a fill of
+   * their own, so an overlay written this way cannot be read back as paint. It
+   * is the same rule that keeps the exported tiling out of an import.
+   *
+   * Optional and absent by default, and an empty list emits nothing, so a spec
+   * written before this existed exports exactly the bytes it did.
+   */
+  overlay?: readonly ArtOverlayGroup[];
+}
+
+export interface ArtOverlayGroup {
+  fill: string;
+  opacity: number;
+  shapes: readonly (readonly (readonly [number, number])[])[];
 }
 
 /**
@@ -384,6 +406,31 @@ export function artworkSvg(spec: ArtworkSpec): string {
   }
   parts.push(`</g>`);
 
+  for (const g of spec.overlay ?? []) {
+    if (g.shapes.length === 0) continue;
+    parts.push(`<g fill="${g.fill}" opacity="${fmt3(g.opacity)}">`);
+    for (const shape of g.shapes) {
+      parts.push(
+        `<polygon points="${shape
+          .map((v) => `${fmt(v[0])},${fmt(v[1])}`)
+          .join(" ")}"/>`
+      );
+    }
+    parts.push(`</g>`);
+  }
+
   parts.push(`</svg>`);
   return parts.join("");
+}
+
+/**
+ * Three decimals for an alpha.
+ *
+ * Coordinates get two because two is under a thousandth of a cell edge. An
+ * alpha has no cell edge to be a thousandth of, and at two decimals a smooth
+ * relief ramp visibly bands, so it gets one more.
+ */
+function fmt3(n: number): string {
+  const r = Math.round(n * 1000) / 1000;
+  return Object.is(r, -0) ? "0" : String(r);
 }

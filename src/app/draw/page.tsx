@@ -15,6 +15,7 @@ import DrawBoard, {
   TILE,
   type BoardGeometry,
   type PreviewSpec,
+  type ReliefView,
 } from "@/components/DrawBoard";
 import { ADJUSTMENTS, ADJUST_NAMES, type AdjustName } from "@/lib/adjust";
 import {
@@ -58,12 +59,26 @@ import { buildHexagon, type Hexagon } from "@/lib/hexagon";
 import {
   hexagonSurface,
   triangleSurface,
-  HEXAGON_MODES,
+  BRUSH_SCOPES,
+  SCOPE_LABEL,
+  SCOPE_MODES,
   TRIANGLE_MODES,
   type BrushMode,
+  type BrushScope,
   type CanvasKind,
   type SymmetrySurface,
 } from "@/lib/orbit";
+import {
+  buildRelief,
+  deformPoint,
+  READINGS,
+  READING_LABEL,
+  reliefFrame,
+  restShell,
+  templateShell,
+  type Reading,
+  type ReliefSurface,
+} from "@/lib/relief";
 import { PROGRESSION_NAMES, type ProgressionName } from "@/lib/progression";
 import {
   SCHEMES,
@@ -79,6 +94,7 @@ import {
   type Direction,
   type Pt,
 } from "@/lib/guides";
+import type { ArtOverlayGroup } from "@/lib/strokes";
 import {
   applyEdits,
   artworkSvg,
@@ -224,6 +240,8 @@ interface Canvas {
    * the figure, which is the thing that knows how it was numbered.
    */
   fig: Figure | Hexagon;
+  /** The hexagon, when this is one. `null` on the triangle. */
+  hex: Hexagon | null;
 }
 
 const TOOL_LABEL: Record<Tool, string> = {
@@ -278,6 +296,16 @@ export default function DrawPage() {
   /** Drawn at `apex`; only a loaded file can move it. See the header. */
   const [convention, setConvention] = useState<Convention>(CONVENTION);
   const [mode, setMode] = useState<BrushMode>(6);
+  /**
+   * Whose symmetries the brush uses. Only the hexagon has more than one answer;
+   * see the note on `BrushScope`. A triangle IS a sector, so scoping it to one
+   * would be the identity dressed as a control.
+   */
+  const [scope, setScope] = useState<BrushScope>("hexagon");
+  /** The sector the pointer was last in — what a SECTOR brush is scoped to. */
+  const [sector, setSector] = useState(0);
+  const [reliefOn, setReliefOn] = useState(false);
+  const [reading, setReading] = useState<Reading>("convex");
   const [schemeName, setSchemeName] = useState<SchemeName>("hexad");
   const [base, setBase] = useState<Swatch>(() => swatchFromHex("#d4a017"));
 
@@ -337,7 +365,10 @@ export default function DrawPage() {
 
   const scheme = SCHEMES[schemeName];
   const adjust = ADJUSTMENTS[adjustName];
-  const modes = kind === "triangle" ? TRIANGLE_MODES : HEXAGON_MODES;
+  const modes = kind === "triangle" ? TRIANGLE_MODES : SCOPE_MODES[scope];
+  /** A sector is a copy of the base triangle, so a sector brush wears D₃'s face. */
+  const glyphKind: CanvasKind =
+    kind === "hexagon" && scope !== "hexagon" ? "triangle" : kind;
 
   // A finger has no hover, so the ghost preview — the thing that teaches what
   // the brush does — is unreachable on touch unless the press itself proposes.
@@ -362,6 +393,7 @@ export default function DrawPage() {
         surface: triangleSurface(f),
         bands: buildBandSurface(f),
         fig: f,
+        hex: null,
       };
     }
     const h = buildHexagon(depth, convention);
@@ -376,16 +408,121 @@ export default function DrawPage() {
       },
       frame: { kind: "hexagon", centre: h.centre, radius: h.radius },
       centroids: h.cells.map((c) => c.centroid),
-      surface: hexagonSurface(h),
+      surface: hexagonSurface(h, scope),
       bands: buildBandSurface(h),
       fig: h,
+      hex: h,
     };
-  }, [kind, depth, convention]);
+  }, [kind, depth, convention, scope]);
+
+  /**
+   * Which sectors the axis overlay draws in.
+   *
+   * `null` is the whole plate and its six diameters. A single sector draws that
+   * sector's three medians and nothing else, because a sector brush mirrors
+   * about them and about no diameter — see `symmetryGuides`. SECTOR ×6 draws all
+   * six copies, which is what the group actually contains.
+   */
+  const guideSectors = useMemo(() => {
+    if (kind !== "hexagon" || scope === "hexagon") return null;
+    return scope === "sector" ? [sector] : [0, 1, 2, 3, 4, 5];
+  }, [kind, scope, sector]);
 
   const guides = useMemo(
-    () => symmetryGuides(canvas.frame, mode),
-    [canvas, mode]
+    () =>
+      symmetryGuides(
+        canvas.frame,
+        mode,
+        guideSectors,
+        scope === "sector6" ? 6 : 0
+      ),
+    [canvas, mode, guideSectors, scope]
   );
+
+  /**
+   * The cell the readouts and the relief take their cue from.
+   *
+   * Clamped to the canvas, because a cell index outlives the canvas that
+   * numbered it by exactly one render when the depth changes.
+   */
+  const seedCell =
+    (hover ?? candidate ?? cursor) === null ||
+    (hover ?? candidate ?? cursor)! >= canvas.geom.cells.length
+      ? null
+      : (hover ?? candidate ?? cursor)!;
+
+  /**
+   * Remember which sector a cell was in.
+   *
+   * Called from the gestures rather than derived from `seedCell`, and STICKY on
+   * purpose: the sector overlay must not vanish the moment the pointer leaves
+   * the plate to reach a control, or the guides flicker off every time the brush
+   * is changed. `setSector` with the value it already holds is a no-op, so a
+   * drag inside one sector costs nothing.
+   */
+  const noteSector = useCallback(
+    (i: number | null) => {
+      const h = canvas.hex;
+      if (h === null || i === null) return;
+      const c = h.cells[i];
+      if (c !== undefined) setSector(c.sector);
+    },
+    [canvas]
+  );
+
+  const onHover = useCallback(
+    (i: number | null) => {
+      noteSector(i);
+      setHover(i);
+    },
+    [noteSector]
+  );
+
+  // ── the relief ──────────────────────────────────────────────────────────
+
+  /**
+   * The relief's static half: vertex offsets and their exact ring indices.
+   *
+   * Hexagon only. The six-point construction reads six corresponding cells off
+   * a C6 orbit, and a triangle has no C6; the band-size height field is FLAT
+   * there as well — two values at every depth, measured — so there is nothing
+   * for the toggle to do and it is not offered.
+   */
+  const reliefSurface = useMemo<ReliefSurface | null>(
+    () => (canvas.hex === null ? null : buildRelief(canvas.hex)),
+    [canvas]
+  );
+
+  /**
+   * The template ring: the shell of the cell under the pointer, which is the
+   * ring its whole C6 orbit sits on. An INTEGER, so it changes some fifty times
+   * across a depth-4 plate rather than once per pointer event — which is the
+   * entire reason a 1536-cell display effect is affordable.
+   */
+  const ring =
+    reliefSurface === null
+      ? 0
+      : seedCell === null
+      ? restShell(reliefSurface)
+      : templateShell(reliefSurface, seedCell);
+
+  const frame = useMemo(
+    () =>
+      reliefSurface === null || !reliefOn
+        ? null
+        : reliefFrame(reliefSurface, ring, reading),
+    [reliefSurface, reliefOn, ring, reading]
+  );
+
+  const relief = useMemo<ReliefView | null>(() => {
+    if (frame === null || reliefSurface === null) return null;
+    return {
+      points: frame.points,
+      centroids: frame.centroids,
+      wash: frame.wash,
+      bend: (p) => deformPoint(reliefSurface, frame.scales, p),
+    };
+  }, [frame, reliefSurface]);
 
   // ── the colour the next stroke will start from ──────────────────────────
 
@@ -417,8 +554,8 @@ export default function DrawPage() {
    * is what keeps the tape from advertising six hues the stroke will not lay.
    */
   const span = useMemo(
-    () => brushSpan(canvas.surface, canvas.bands, shape),
-    [canvas, shape]
+    () => brushSpan(canvas.surface, canvas.bands, shape, seedCell ?? 0),
+    [canvas, shape, seedCell]
   );
 
   /** The scheme's colours in stroke order, as the current brush would lay them. */
@@ -537,6 +674,43 @@ export default function DrawPage() {
     wipe(`canvas set to ${next}, depth ${d}, ${cellCount(next, d)} cells — plate cleared`);
   };
 
+  /**
+   * Changing the scope does NOT clear the plate.
+   *
+   * It changes which group the brush uses and nothing about which cells exist,
+   * so every colour already laid still names the cell it was laid on. Mode 12 is
+   * the one thing that has to move: it is a subgroup of D6 and of nothing else,
+   * so a sector scope that kept it would name a brush that scope does not have.
+   * Same rule as `pickKind`, for the same reason.
+   */
+  const pickScope = (next: BrushScope) => {
+    if (next === scope) return;
+    const m = SCOPE_MODES[next].includes(mode) ? mode : 6;
+    setScope(next);
+    setMode(m);
+    setCandidate(null);
+    setAnnounce(
+      `brush scope ${next} — ${SCOPE_LABEL[next]}${
+        m === mode ? "" : `; brush dropped to ${m}-fold`
+      }`
+    );
+  };
+
+  const pickRelief = (on: boolean) => {
+    setReliefOn(on);
+    setAnnounce(
+      on
+        ? `relief on — ${READING_LABEL[reading]}; the ring under the pointer is the template`
+        : "relief off — the plate is flat again"
+    );
+  };
+
+  const pickReading = (next: Reading) => {
+    if (next === reading) return;
+    setReading(next);
+    setAnnounce(`relief ${next} — ${READING_LABEL[next]}`);
+  };
+
   const pickDepth = (d: number) => {
     if (d === depth) return;
     setDepth(d);
@@ -652,11 +826,12 @@ export default function DrawPage() {
 
   const propose = useCallback(
     (i: number) => {
+      noteSector(i);
       setCandidate(i);
       setCursor(i);
       setHover(null);
     },
-    []
+    [noteSector]
   );
 
   const commitCandidate = useCallback(() => {
@@ -741,17 +916,19 @@ export default function DrawPage() {
     (dir: Direction) => {
       const next = stepCursor(canvas.centroids, cursor, dir);
       if (next < 0) return;
+      noteSector(next);
       setCursor(next);
       if (dragMode === "propose") setCandidate(next);
       else setHover(next);
     },
-    [canvas, cursor, dragMode]
+    [canvas, cursor, dragMode, noteSector]
   );
 
   const onCursorPaint = useCallback(() => {
     if (cursor === null) {
       const start = stepCursor(canvas.centroids, null, "up");
       if (start < 0) return;
+      noteSector(start);
       setCursor(start);
       if (dragMode === "propose") setCandidate(start);
       else setHover(start);
@@ -765,6 +942,7 @@ export default function DrawPage() {
     paintAt(cursor);
     endStroke();
   }, [
+    noteSector,
     cursor,
     canvas,
     dragMode,
@@ -795,28 +973,72 @@ export default function DrawPage() {
 
   // ── export ──────────────────────────────────────────────────────────────
 
-  const svgText = useCallback(
-    () =>
-      artworkSvg({
-        width: canvas.geom.width,
-        height: canvas.geom.height,
-        cells: canvas.geom.cells,
-        paint: paintRef.current,
-        background: PLATE_BG,
-        unpainted: showTiling ? TILE : null,
-        tileSeam: SEAM,
-        paintSeam: PAINT_SEAM,
-        weldPaint: weld,
-        seamWidth: canvas.geom.seamWidth,
-        title: `FOURFOLD — ${kind}, depth ${depth}, ${mode}-fold brush, ${schemeName}${
-          band === null ? "" : `, band ${band}`
-        }`,
-        // What makes the file loadable: the plate stated as cells rather than
-        // inferred from shapes. See `artfile.ts`.
-        payload: payloadFromPaint(kind, depth, convention, paintRef.current),
-      }),
-    [canvas, showTiling, weld, kind, depth, convention, mode, schemeName, band]
-  );
+  /**
+   * The file.
+   *
+   * The relief is baked at the RESTING ring, never at the one under the pointer.
+   * Two reasons, and the second is the load-bearing one: the resting ring is
+   * what the plate shows when nobody is pointing at it, so the file matches the
+   * screen it was taken from; and it makes the export a pure function of the
+   * drawing, so paint → export → clear → load → re-export is byte-identical
+   * instead of depending on where the mouse happened to be.
+   */
+  const svgText = useCallback(() => {
+    const baked =
+      reliefSurface === null || !reliefOn
+        ? null
+        : reliefFrame(reliefSurface, restShell(reliefSurface), reading);
+    const cells =
+      baked === null
+        ? canvas.geom.cells
+        : baked.verts.map((verts) => ({ verts }));
+    const overlay: ArtOverlayGroup[] =
+      baked === null
+        ? []
+        : baked.wash.map((w) => ({
+            fill: w.fill,
+            opacity: w.alpha,
+            shapes: w.cells.map((i) => baked.verts[i]),
+          }));
+    return artworkSvg({
+      width: canvas.geom.width,
+      height: canvas.geom.height,
+      cells,
+      paint: paintRef.current,
+      background: PLATE_BG,
+      unpainted: showTiling ? TILE : null,
+      tileSeam: SEAM,
+      paintSeam: PAINT_SEAM,
+      weldPaint: weld,
+      seamWidth: canvas.geom.seamWidth,
+      title: `FOURFOLD — ${kind}, depth ${depth}, ${mode}-fold brush, ${schemeName}${
+        band === null ? "" : `, band ${band}`
+      }${baked === null ? "" : `, ${reading} relief`}`,
+      // What makes the file loadable: the plate stated as cells rather than
+      // inferred from shapes. See `artfile.ts`.
+      payload: payloadFromPaint(
+        kind,
+        depth,
+        convention,
+        paintRef.current,
+        baked === null ? undefined : { on: true, reading }
+      ),
+      overlay,
+    });
+  }, [
+    canvas,
+    showTiling,
+    weld,
+    kind,
+    depth,
+    convention,
+    mode,
+    schemeName,
+    band,
+    reliefSurface,
+    reliefOn,
+    reading,
+  ]);
 
   const nameFor = useCallback(
     (ext: "svg" | "png") =>
@@ -933,6 +1155,12 @@ export default function DrawPage() {
         // Mode 12 is a hexagon subgroup; carrying it onto a triangle would name
         // a brush that canvas does not have. Same rule as `pickKind`.
         if (payload.canvas === "triangle" && mode === 12) setMode(6);
+        // The relief is display state and not paint, but a file that declares
+        // it has to be able to come back looking like itself — and re-export to
+        // the same bytes. A file that says nothing means the relief is off,
+        // which is what every file written before the field existed meant.
+        setReliefOn(payload.relief?.on ?? false);
+        if (payload.relief !== undefined) setReading(payload.relief.reading);
         reset(
           paintFromPayload(payload),
           `loaded ${payload.cells.length} cell${
@@ -1055,16 +1283,20 @@ export default function DrawPage() {
   const legend = useMemo(() => {
     const items: { key: string; label: string; colour: string; dashed: boolean; dot: boolean }[] =
       [];
+    // Deduplicated by isometry NAME, because a sector-scoped overlay draws the
+    // same three medians once per sector and the legend is a key to the
+    // families, not a census of the lines.
+    const named = new Set<string>();
     for (const m of guides.mirrors) {
-      if (m.family === "median") {
-        items.push({
-          key: m.id,
-          label: m.label.replace("—", "·"),
-          colour: { m_A: "#67e8f9", m_B: "#4ade80", m_C: "#f59e0b" }[m.id] ?? "#67e8f9",
-          dashed: false,
-          dot: false,
-        });
-      }
+      if (m.family !== "median" || named.has(m.id)) continue;
+      named.add(m.id);
+      items.push({
+        key: m.id,
+        label: m.label.replace("—", "·").replace(/ · sector \d+$/, ""),
+        colour: { m_A: "#67e8f9", m_B: "#4ade80", m_C: "#f59e0b" }[m.id] ?? "#67e8f9",
+        dashed: false,
+        dot: false,
+      });
     }
     if (guides.mirrors.some((m) => m.family === "spine")) {
       items.push({
@@ -1170,10 +1402,62 @@ export default function DrawPage() {
             <div className={styles.sectionHead}>
               <h2 className={styles.sectionTitle}>Brush symmetry</h2>
               <span className={styles.sectionMeta}>
-                {kind === "triangle" ? "D₃" : "D₆"} subgroups
+                {kind === "triangle" || scope === "hexagon"
+                  ? `${kind === "triangle" ? "D₃" : "D₆"} subgroups`
+                  : scope === "sector"
+                  ? `sector ${sector} · D₃`
+                  : "C₆ × D₃"}
               </span>
             </div>
-            <BrushDial kind={kind} modes={modes} mode={mode} onPick={setMode} />
+            {kind === "hexagon" && (
+              <>
+                <div
+                  className={`${styles.seg} ${styles.scopeSeg}`}
+                  role="group"
+                  aria-label="brush scope"
+                >
+                  {BRUSH_SCOPES.map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      className={styles.segBtn}
+                      aria-pressed={scope === s}
+                      aria-label={`brush scope ${s} — ${SCOPE_LABEL[s]}`}
+                      onClick={() => pickScope(s)}
+                    >
+                      {s === "sector6" ? "sector ×6" : s}
+                    </button>
+                  ))}
+                </div>
+                <p className={styles.hint}>
+                  {scope === "hexagon" ? (
+                    <>
+                      <b>D₆ — the whole plate.</b> Its three spine mirrors each
+                      reflect <i>two opposite sectors at once</i>.
+                    </>
+                  ) : scope === "sector" ? (
+                    <>
+                      <b>The sector&rsquo;s own D₃</b>, in sector{" "}
+                      <b>{sector}</b> alone — three medians and a 120° turn
+                      about <i>its</i> centroid. None of the twelve isometries of
+                      the hexagon does this: reflecting one sector and leaving
+                      its opposite alone is not an isometry at all.
+                    </>
+                  ) : (
+                    <>
+                      <b>C₆ × D₃, order {6 * mode}.</b> The local orbit, repeated
+                      in all six sectors. It meets D₆ only in the rotations.
+                    </>
+                  )}
+                </p>
+              </>
+            )}
+            <BrushDial
+              kind={glyphKind}
+              modes={modes}
+              mode={mode}
+              onPick={setMode}
+            />
             <p className={styles.hint}>
               {mode === 1 ? (
                 <>
@@ -1184,11 +1468,12 @@ export default function DrawPage() {
                   <b>C{guides.rotation?.order ?? mode} — rotations only.</b> No
                   mirror line, so none is drawn.
                 </>
-              ) : guides.rotation ? (
+              ) : guides.rotation ?? guides.local[0] ? (
                 <>
                   <b>
-                    {kind === "triangle" ? "D₃" : "D₆"} — {guides.mirrors.length}{" "}
-                    mirrors and C{guides.rotation.order}.
+                    {glyphKind === "triangle" ? "D₃" : "D₆"} —{" "}
+                    {guides.mirrors.length} mirrors and C
+                    {(guides.rotation ?? guides.local[0]).order}.
                   </b>{" "}
                   A cell on a mirror is <i>pinned</i>; its orbit comes out short.
                 </>
@@ -1322,6 +1607,55 @@ export default function DrawPage() {
               />
               weld painted cells — no seam inside a filled row
             </label>
+
+            {/* Hexagon only. The six-point construction reads six corresponding
+                cells off a C6 orbit, and a triangle has none — and the band-size
+                height field is measurably flat there, two values at every depth,
+                so there would be nothing to curve. */}
+            {kind === "hexagon" && (
+              <>
+                <label className={styles.checkRow}>
+                  <input
+                    type="checkbox"
+                    checked={reliefOn}
+                    onChange={(e) => pickRelief(e.target.checked)}
+                  />
+                  relief — the ring under the pointer curves the plate
+                </label>
+                {reliefOn && (
+                  <>
+                    <div
+                      className={`${styles.seg} ${styles.scopeSeg}`}
+                      role="group"
+                      aria-label="relief reading"
+                    >
+                      {READINGS.map((r) => (
+                        <button
+                          key={r}
+                          type="button"
+                          className={styles.segBtn}
+                          aria-pressed={reading === r}
+                          aria-label={`${r} — ${READING_LABEL[r]}`}
+                          onClick={() => pickReading(r)}
+                        >
+                          {r}
+                        </button>
+                      ))}
+                    </div>
+                    <p className={styles.hint}>
+                      The six cells your brush corresponds to sit on one exact
+                      lattice ring — <b>ring {ring}</b> of {3 * 2 ** depth}. That
+                      ring is the <b>template</b>: it moves, and the whole plate
+                      follows, six-fold symmetric in every frame because the
+                      remap is a function of the ring alone. Height is the{" "}
+                      <b>sum of a cell&rsquo;s three band sizes</b> — three
+                      integers, one addition, <i>no division</i>. The one divide
+                      in the whole effect is one per ring, at pixel emission.
+                    </p>
+                  </>
+                )}
+              </>
+            )}
           </section>
           </div>
 
@@ -1654,6 +1988,7 @@ export default function DrawPage() {
             >
               <DrawBoard
                 geom={canvas.geom}
+                relief={relief}
                 paint={paint}
                 preview={preview}
                 candidate={candidateSpec}
@@ -1670,7 +2005,7 @@ export default function DrawPage() {
                 }. Arrow keys move the cursor, Enter or Space ${
                   dragMode === "propose" ? "proposes then commits" : "paints"
                 }.`}
-                onHover={setHover}
+                onHover={onHover}
                 onPaint={paintAt}
                 onStrokeEnd={endStroke}
                 onPropose={propose}

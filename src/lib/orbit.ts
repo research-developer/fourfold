@@ -73,6 +73,44 @@ import {
 export type CanvasKind = "triangle" | "hexagon";
 
 /**
+ * WHOSE symmetries the hexagon's brush uses.
+ *
+ * `hexagon` is D6 — the twelve isometries of the whole plate. The other two are
+ * NOT subgroups of it, and that is the entire reason they exist.
+ *
+ * ── Why a sector's own D3 is new structure, not a subset ─────────────────
+ *
+ * The six sector spines lie at 30° + 60s, which mod 180 collapse to three
+ * lines, so each of D6's spine mirrors (m30, m90, m150) reflects TWO OPPOSITE
+ * SECTORS AT ONCE. Reflecting one sector and leaving its opposite alone is not
+ * an isometry of the hexagon at all — it is a piecewise map, invisible to every
+ * one of the twelve elements. The sector triangle's own 120° rotation is about
+ * ITS centroid rather than the plate's, so it likewise carries that sector to
+ * itself and touches nothing else.
+ *
+ * Both are exact and cost nothing to compute, because each sector IS a copy of
+ * the base triangle: the local action is `triangleIndexMap` on the cell's `base`
+ * index with its `sector` held fixed. No new geometry, no tolerance.
+ *
+ *   hexagon    D6                       modes 1 2 3 6 12
+ *   sector     D3 inside one sector     modes 1 2 3 6     — paints there only
+ *   sector6    C6 × D3, order 6·mode    modes 1 2 3 6     — the local orbit, six times
+ *
+ * `sector6` really is a group: the sector-local μ acts identically in every
+ * sector, so it COMMUTES with the rotation that permutes them, and the product
+ * is the direct product C6 × D3 of order 6·mode. Its intersection with D6 is
+ * exactly C6 — D6's reflections reverse the sector order, which no element of
+ * C6 × D3 does — so it is a genuinely different group, not a relabelling.
+ */
+export type BrushScope = "hexagon" | "sector" | "sector6";
+
+export const BRUSH_SCOPES: readonly BrushScope[] = [
+  "hexagon",
+  "sector",
+  "sector6",
+] as const;
+
+/**
  * The order of the subgroup a brush uses — NOT the number of cells it paints.
  * See the stabiliser note above: a mode-6 brush on a cell of the vertical
  * median paints three cells, and on the hub, one.
@@ -84,6 +122,24 @@ export interface SymmetrySurface {
   cellCount: number;
   /** Available brush modes for this surface, ascending. */
   modes: BrushMode[];
+  /**
+   * Which part of the canvas the group is confined to, as a cell → region id.
+   *
+   * `0` everywhere for a group that acts on the whole plate, which is every
+   * surface but the SECTOR-scoped hexagon; there the region is the sector, and
+   * an orbit can never leave it. Published because a BAND is a whole-canvas
+   * object and has to be CLIPPED to the region before the brush carries it, or
+   * a stroke escapes the scope it is named for. `bands.ts` is the caller.
+   */
+  regionOf(i: number): number;
+  /**
+   * The ORDER of the subgroup `mode` names on this surface.
+   *
+   * Equal to `mode` everywhere except the SECTOR ×6 scope, where the group is
+   * C6 × D3 and the order is 6·mode. It is what a colour scheme is indexed
+   * over, so it cannot simply be assumed to be the mode number.
+   */
+  order(mode: BrushMode): number;
   /** The orbit of cell i under the subgroup chosen by `mode`, sorted ascending. */
   orbit(i: number, mode: BrushMode): number[];
   /**
@@ -156,6 +212,25 @@ export const HEXAGON_SUBGROUPS: Readonly<
 export const TRIANGLE_MODES: BrushMode[] = [1, 2, 3, 6];
 export const HEXAGON_MODES: BrushMode[] = [1, 2, 3, 6, 12];
 
+/**
+ * The sector-local subgroups are the TRIANGLE's, because a sector IS the
+ * triangle. Naming them again here would be a second copy that could drift.
+ */
+export const SECTOR_MODES: BrushMode[] = [1, 2, 3, 6];
+
+/** Which modes each scope offers. Mode 12 belongs to D6 and to nothing else. */
+export const SCOPE_MODES: Readonly<Record<BrushScope, BrushMode[]>> = {
+  hexagon: HEXAGON_MODES,
+  sector: SECTOR_MODES,
+  sector6: SECTOR_MODES,
+};
+
+export const SCOPE_LABEL: Readonly<Record<BrushScope, string>> = {
+  hexagon: "the whole plate — D₆",
+  sector: "one sector — its own D₃, and nothing outside it",
+  sector6: "one sector's D₃, repeated in all six",
+};
+
 // ── the engine ───────────────────────────────────────────────────────────
 
 /**
@@ -215,7 +290,9 @@ function makeSurface<N extends string>(
   cellCount: number,
   modes: BrushMode[],
   subgroups: Readonly<Partial<Record<BrushMode, readonly N[]>>>,
-  mapFor: (name: N) => number[]
+  mapFor: (name: N) => number[],
+  /** Cell → region id, or `null` when the group acts on the whole canvas. */
+  regions: readonly number[] | null = null
 ): SymmetrySurface {
   const maps = new Map<N, number[]>();
   const groups = new Map<BrushMode, number[][]>();
@@ -259,6 +336,13 @@ function makeSurface<N extends string>(
     kind,
     cellCount,
     modes,
+    regionOf(i) {
+      if (!Number.isInteger(i) || i < 0 || i >= cellCount) {
+        throw new Error(`${kind}: cell ${i} is not on this surface`);
+      }
+      return regions === null ? 0 : regions[i];
+    },
+    order: (mode) => groupFor(mode).length,
     orbit(i, mode) {
       if (!Number.isInteger(i) || i < 0 || i >= cellCount) {
         throw new Error(`${kind}: cell ${i} is not on this surface`);
@@ -285,15 +369,122 @@ export function triangleSurface(figure: Figure): SymmetrySurface {
   );
 }
 
-/** The D6 brush surface of a hexagon. */
-export function hexagonSurface(hex: Hexagon): SymmetrySurface {
-  const byName = new Map(HEX_ISOMETRIES.map((g) => [g.name, g]));
-  return makeSurface<HexIsometryName>(
+// ── the sector-local action ──────────────────────────────────────────────
+
+/**
+ * Cell index by (sector, base-cell), read off the hexagon rather than assumed.
+ *
+ * `buildHexagon` happens to lay the cells out sector-major, so the index IS
+ * `sector·n + base` — but that is a fact about a loop in another module, and a
+ * brush that silently depended on it would break the day the loop was reordered.
+ * The table is built from the cells' own `sector` and `base` fields, and the
+ * lookup throws rather than returning `undefined`.
+ */
+function sectorBaseIndex(hex: Hexagon): (s: number, c: number) => number {
+  const n = hex.base.cells.length;
+  const at = new Array<number>(6 * n).fill(-1);
+  for (const c of hex.cells) at[c.sector * n + c.base] = c.i;
+  return (s, c) => {
+    const i = at[((((s % 6) + 6) % 6) * n) + c];
+    if (i === undefined || i < 0) {
+      throw new Error(`hexagon: no cell in sector ${s} at base index ${c}`);
+    }
+    return i;
+  };
+}
+
+/**
+ * The permutation a sector-local triangle isometry induces, optionally followed
+ * by a rotation of the sectors.
+ *
+ * (s, c) ↦ (s + spin, μ(c)). Exact: μ is `triangleIndexMap` on the BASE figure,
+ * which is itself an exact barycentric key lookup, and the sector arithmetic is
+ * integer. Nothing here compares a coordinate.
+ *
+ * At `spin = 0` this fixes every sector setwise, which is precisely what no
+ * element of D6 does — see the note on `BrushScope`.
+ */
+function sectorMap(
+  hex: Hexagon,
+  at: (s: number, c: number) => number,
+  name: IsometryName,
+  spin: number
+): number[] {
+  const mu = triangleIndexMap(hex.base, name);
+  const out = new Array<number>(hex.cells.length);
+  for (const c of hex.cells) out[c.i] = at(c.sector + spin, mu[c.base]);
+  return out;
+}
+
+/** `spin·name`, the composite element name a `sector6` subgroup lists. */
+const SPIN_NAME = (spin: number, name: IsometryName) => `r${spin}·${name}`;
+
+const parseSpin = (composite: string): [number, IsometryName] => {
+  const cut = composite.indexOf("·");
+  return [Number(composite.slice(1, cut)), composite.slice(cut + 1) as IsometryName];
+};
+
+/**
+ * The element lists of C6 × D3, mode by mode: every sector rotation composed
+ * with every element of the local D3. Built from `TRIANGLE_SUBGROUPS` so the
+ * local half can never disagree with the sector scope's own.
+ */
+const SECTOR6_SUBGROUPS: Readonly<Record<1 | 2 | 3 | 6, readonly string[]>> = (() => {
+  const out = {} as Record<1 | 2 | 3 | 6, readonly string[]>;
+  for (const mode of [1, 2, 3, 6] as const) {
+    const names: string[] = [];
+    for (let spin = 0; spin < 6; spin++) {
+      for (const n of TRIANGLE_SUBGROUPS[mode]) names.push(SPIN_NAME(spin, n));
+    }
+    out[mode] = names;
+  }
+  return out;
+})();
+
+/**
+ * The brush surface of a hexagon, under the scope's group.
+ *
+ * `hexagon` is the original D6 surface and is the default, so every existing
+ * caller gets exactly the surface it always got.
+ */
+export function hexagonSurface(
+  hex: Hexagon,
+  scope: BrushScope = "hexagon"
+): SymmetrySurface {
+  if (scope === "hexagon") {
+    const byName = new Map(HEX_ISOMETRIES.map((g) => [g.name, g]));
+    return makeSurface<HexIsometryName>(
+      "hexagon",
+      hex.cells.length,
+      HEXAGON_MODES,
+      HEXAGON_SUBGROUPS,
+      (name) => indexMap(hex, byName.get(name)!)
+    );
+  }
+
+  const at = sectorBaseIndex(hex);
+  if (scope === "sector") {
+    // The regions ARE the sectors, and they are what stops a band escaping.
+    const regions = hex.cells.map((c) => c.sector);
+    return makeSurface<IsometryName>(
+      "hexagon",
+      hex.cells.length,
+      SECTOR_MODES,
+      TRIANGLE_SUBGROUPS,
+      (name) => sectorMap(hex, at, name, 0),
+      regions
+    );
+  }
+
+  return makeSurface<string>(
     "hexagon",
     hex.cells.length,
-    HEXAGON_MODES,
-    HEXAGON_SUBGROUPS,
-    (name) => indexMap(hex, byName.get(name)!)
+    SECTOR_MODES,
+    SECTOR6_SUBGROUPS,
+    (composite) => {
+      const [spin, name] = parseSpin(composite);
+      return sectorMap(hex, at, name, spin);
+    }
   );
 }
 
@@ -301,11 +492,12 @@ export function hexagonSurface(hex: Hexagon): SymmetrySurface {
 export function buildSurface(
   kind: CanvasKind,
   depth: number,
-  convention: Convention = "apex"
+  convention: Convention = "apex",
+  scope: BrushScope = "hexagon"
 ): SymmetrySurface {
   return kind === "triangle"
     ? triangleSurface(buildFigure(depth, convention))
-    : hexagonSurface(buildHexagon(depth, convention));
+    : hexagonSurface(buildHexagon(depth, convention), scope);
 }
 
 // ── the subgroup, element by element ─────────────────────────────────────
