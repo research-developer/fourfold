@@ -293,6 +293,13 @@
   margin-top: 8px;
 }
 
+/* The scope and reading rails sit under a heading rather than beside a label,
+   so they carry their own gap. Kept as one class because they are the same
+   control in two places and a second name would drift. */
+.scopeSeg {
+  margin: 0 0 8px;
+}
+
 .depthBtn {
   font-variant-numeric: tabular-nums;
   letter-spacing: 0.06em;

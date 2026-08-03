@@ -1,7 +1,14 @@
 "use client";
 
-import { memo, useCallback, useEffect, useRef, type ReactElement } from "react";
-import type { Direction, Guides } from "@/lib/guides";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  type ReactElement,
+} from "react";
+import type { Direction, Guides, RotationGuide } from "@/lib/guides";
 import { WELD_WIDTH, type PaintMap } from "@/lib/strokes";
 
 /**
@@ -98,8 +105,34 @@ export const previewCovers = (spec: PreviewSpec, i: number): boolean =>
 
 export type DragBehaviour = "paint" | "propose";
 
+/**
+ * The relief, as the board needs it: the plate's polygons already deformed.
+ *
+ * Everything here is a DISPLAY substitution — the same cells, in the same order,
+ * with the same indices, drawn somewhere else. The board never learns what the
+ * deformation is; it is handed the answer, which is what keeps a lens out of the
+ * component that owns hit-testing and undo.
+ *
+ * It arrives whole and changes ONLY when the template ring changes. That is the
+ * cheapness: a pointer sweeping a depth-4 hexagon crosses some fifty rings, so
+ * the 1536 polygons are rewritten fifty times over a whole sweep rather than
+ * once per pointer event. In between, this object is referentially identical and
+ * the memoised tiling and hit layers do not re-render at all.
+ */
+export interface ReliefView {
+  /** `points` text per cell, aligned to `geom.cells`. */
+  points: readonly string[];
+  centroids: readonly (readonly [number, number])[];
+  /** Cells grouped by the tone they take, darkest last. */
+  wash: readonly { fill: string; alpha: number; cells: readonly number[] }[];
+  /** The same remap applied to a loose canvas point, for the axis overlay. */
+  bend: (p: readonly [number, number]) => readonly [number, number];
+}
+
 interface Props {
   geom: BoardGeometry;
+  /** `null` when the relief is off, which is also the exported-file default. */
+  relief: ReliefView | null;
   paint: PaintMap;
   preview: PreviewSpec | null;
   /** The standing proposal in `propose` mode. Committed by a tap on itself. */
@@ -143,12 +176,19 @@ export const PAINT_SEAM = "rgba(10,9,8,.34)";
 const points = (c: { readonly verts: readonly (readonly [number, number])[] }) =>
   c.verts.map((v) => `${v[0]},${v[1]}`).join(" ");
 
-/** The tiling. Renders once per figure and then never again. */
+const line = (p: readonly [number, number]) => `${p[0]},${p[1]}`;
+
+/**
+ * The tiling. Renders once per figure — and, with the relief on, once per ring
+ * the pointer crosses, which is what `pts` changing identity means.
+ */
 const TileLayer = memo(function TileLayer({
   geom,
+  pts,
   show,
 }: {
   geom: BoardGeometry;
+  pts: readonly string[];
   show: boolean;
 }) {
   if (!show) return null;
@@ -160,8 +200,40 @@ const TileLayer = memo(function TileLayer({
       strokeWidth={geom.seamWidth}
       pointerEvents="none"
     >
-      {geom.cells.map((c, i) => (
-        <polygon key={i} points={points(c)} />
+      {pts.map((p, i) => (
+        <polygon key={i} points={p} />
+      ))}
+    </g>
+  );
+});
+
+/**
+ * The relief's tone, one group per ring rather than one element per cell.
+ *
+ * Flat black at an alpha, which is an ordinary multiply — see the note in
+ * `relief.ts` on why no blend mode appears anywhere. The fill sits on the GROUP,
+ * so `importByGeometry` cannot mistake a wash for paint when the file is read
+ * back by something that has not found the payload.
+ */
+const WashLayer = memo(function WashLayer({
+  pts,
+  wash,
+}: {
+  pts: readonly string[];
+  wash: readonly { fill: string; alpha: number; cells: readonly number[] }[];
+}) {
+  return (
+    <g data-layer="relief" pointerEvents="none">
+      {wash.map((band) => (
+        <g
+          key={`${band.fill}-${band.alpha}`}
+          fill={band.fill}
+          opacity={band.alpha}
+        >
+          {band.cells.map((i) => (
+            <polygon key={i} points={pts[i]} />
+          ))}
+        </g>
       ))}
     </g>
   );
@@ -180,21 +252,23 @@ const TileLayer = memo(function TileLayer({
  */
 const PaintLayer = memo(function PaintLayer({
   geom,
+  pts,
   paint,
   weld,
 }: {
   geom: BoardGeometry;
+  pts: readonly string[];
   paint: PaintMap;
   weld: boolean;
 }) {
   const out: ReactElement[] = [];
   for (const [i, colour] of paint) {
-    const cell = geom.cells[i];
-    if (cell === undefined) continue;
+    const p = pts[i];
+    if (p === undefined) continue;
     out.push(
       <polygon
         key={i}
-        points={points(cell)}
+        points={p}
         fill={colour}
         stroke={weld ? colour : undefined}
       />
@@ -212,12 +286,19 @@ const PaintLayer = memo(function PaintLayer({
   );
 });
 
-/** Transparent, topmost, and the only thing the pointer ever hits. */
-const HitLayer = memo(function HitLayer({ geom }: { geom: BoardGeometry }) {
+/**
+ * Transparent, topmost, and the only thing the pointer ever hits.
+ *
+ * It carries the SAME deformed points as everything else, so a click lands on
+ * the cell that is under the finger rather than on the cell that would have been
+ * there with the relief off. A lens the pointer does not go through is a lens
+ * that has broken the drawing program.
+ */
+const HitLayer = memo(function HitLayer({ pts }: { pts: readonly string[] }) {
   return (
     <g data-layer="hit" fill="transparent">
-      {geom.cells.map((c, i) => (
-        <polygon key={i} data-i={i} points={points(c)} />
+      {pts.map((p, i) => (
+        <polygon key={i} data-i={i} points={p} />
       ))}
     </g>
   );
@@ -256,16 +337,87 @@ const arcPath = (cx: number, cy: number, r: number, a0: number, a1: number) => {
  * bare plate. Rotational subgroups get arcs and a centre mark instead, because
  * they HAVE no mirror: see the note at the top of `guides.ts`.
  */
+const RotationMark = memo(function RotationMark({
+  rot,
+  quiet,
+}: {
+  rot: RotationGuide;
+  quiet: boolean;
+}) {
+  const gap = Math.min(22, 120 / rot.order);
+  return (
+    <g stroke="#a78bfa" fill="none">
+      <circle
+        cx={rot.cx}
+        cy={rot.cy}
+        r={rot.radius}
+        strokeWidth={1}
+        opacity={0.2}
+        strokeDasharray="3 6"
+      />
+      {Array.from({ length: rot.order }, (_, k) => {
+        const step = 360 / rot.order;
+        const a0 = k * step + gap / 2;
+        const a1 = (k + 1) * step - gap / 2;
+        const [hx, hy] = polar(rot.cx, rot.cy, rot.radius, a1);
+        const t = (a1 * Math.PI) / 180;
+        // Tangent of the anticlockwise sweep, in screen coordinates.
+        const tx = -Math.sin(t);
+        const ty = -Math.cos(t);
+        const nx = -ty;
+        const ny = tx;
+        const s = Math.max(7, rot.radius * (quiet ? 0.05 : 0.07));
+        return (
+          <g key={k}>
+            <path
+              d={arcPath(rot.cx, rot.cy, rot.radius, a0, a1)}
+              strokeWidth={quiet ? 2 : 3.6}
+              opacity={quiet ? 0.5 : 0.92}
+              strokeLinecap="round"
+            />
+            <polygon
+              points={`${hx + tx * s},${hy + ty * s} ${hx - nx * s * 0.55},${
+                hy - ny * s * 0.55
+              } ${hx + nx * s * 0.55},${hy + ny * s * 0.55}`}
+              fill="#a78bfa"
+              stroke="none"
+              opacity={quiet ? 0.6 : 0.95}
+            />
+          </g>
+        );
+      })}
+      <circle
+        cx={rot.cx}
+        cy={rot.cy}
+        r={quiet ? 5 : 7}
+        strokeWidth={quiet ? 2 : 2.6}
+        opacity={0.92}
+      />
+      <circle
+        cx={rot.cx}
+        cy={rot.cy}
+        r={2}
+        fill="#a78bfa"
+        stroke="none"
+        opacity={0.92}
+      />
+    </g>
+  );
+});
+
+/** How many segments a bent mirror is drawn with. Twelve is smooth at any depth. */
+const BEND_STEPS = 12;
+
 const GuideLayer = memo(function GuideLayer({
   guides,
   show,
+  bend,
 }: {
   guides: Guides;
   show: boolean;
+  bend: ((p: readonly [number, number]) => readonly [number, number]) | null;
 }) {
   if (!show) return null;
-  const rot = guides.rotation;
-  const gap = rot ? Math.min(22, 120 / rot.order) : 0;
   // A rotation drawn beside mirrors is the second thing being said. Alone it is
   // the ONLY thing being said, and has to carry the overlay by itself.
   const quiet = guides.mirrors.length > 0;
@@ -276,23 +428,32 @@ const GuideLayer = memo(function GuideLayer({
         const colour =
           FAMILY_COLOUR[m.id] ?? (m.family === "spine" ? "#67e8f9" : "#f59e0b");
         const dashed = m.family === "boundary";
+        // Under the relief a mirror is still the SAME set of cells, so it has to
+        // ride the deformation with them. Drawn as a polyline through the bent
+        // points rather than as a chord, which would cut across the bulge and
+        // put the axis somewhere the brush does not mirror about.
+        const pts =
+          bend === null
+            ? `${m.x1},${m.y1} ${m.x2},${m.y2}`
+            : Array.from({ length: BEND_STEPS + 1 }, (_, k) => {
+                const t = k / BEND_STEPS;
+                return line(
+                  bend([m.x1 + (m.x2 - m.x1) * t, m.y1 + (m.y2 - m.y1) * t])
+                );
+              }).join(" ");
         return (
-          <g key={m.id}>
-            <line
-              x1={m.x1}
-              y1={m.y1}
-              x2={m.x2}
-              y2={m.y2}
+          <g key={`${m.id}-${m.sector ?? ""}`}>
+            <polyline
+              points={pts}
+              fill="none"
               stroke={colour}
               strokeWidth={7}
               opacity={0.13}
               strokeLinecap="round"
             />
-            <line
-              x1={m.x1}
-              y1={m.y1}
-              x2={m.x2}
-              y2={m.y2}
+            <polyline
+              points={pts}
+              fill="none"
               stroke={colour}
               strokeWidth={2.1}
               // The dashed boundaries cross the whole figure corner to corner
@@ -305,64 +466,12 @@ const GuideLayer = memo(function GuideLayer({
         );
       })}
 
-      {rot && (
-        <g stroke="#a78bfa" fill="none">
-          <circle
-            cx={rot.cx}
-            cy={rot.cy}
-            r={rot.radius}
-            strokeWidth={1}
-            opacity={0.2}
-            strokeDasharray="3 6"
-          />
-          {Array.from({ length: rot.order }, (_, k) => {
-            const step = 360 / rot.order;
-            const a0 = k * step + gap / 2;
-            const a1 = (k + 1) * step - gap / 2;
-            const [hx, hy] = polar(rot.cx, rot.cy, rot.radius, a1);
-            const t = (a1 * Math.PI) / 180;
-            // Tangent of the anticlockwise sweep, in screen coordinates.
-            const tx = -Math.sin(t);
-            const ty = -Math.cos(t);
-            const nx = -ty;
-            const ny = tx;
-            const s = Math.max(7, rot.radius * (quiet ? 0.05 : 0.07));
-            return (
-              <g key={k}>
-                <path
-                  d={arcPath(rot.cx, rot.cy, rot.radius, a0, a1)}
-                  strokeWidth={quiet ? 2 : 3.6}
-                  opacity={quiet ? 0.5 : 0.92}
-                  strokeLinecap="round"
-                />
-                <polygon
-                  points={`${hx + tx * s},${hy + ty * s} ${hx - nx * s * 0.55},${
-                    hy - ny * s * 0.55
-                  } ${hx + nx * s * 0.55},${hy + ny * s * 0.55}`}
-                  fill="#a78bfa"
-                  stroke="none"
-                  opacity={quiet ? 0.6 : 0.95}
-                />
-              </g>
-            );
-          })}
-          <circle
-            cx={rot.cx}
-            cy={rot.cy}
-            r={quiet ? 5 : 7}
-            strokeWidth={quiet ? 2 : 2.6}
-            opacity={0.92}
-          />
-          <circle
-            cx={rot.cx}
-            cy={rot.cy}
-            r={2}
-            fill="#a78bfa"
-            stroke="none"
-            opacity={0.92}
-          />
-        </g>
+      {guides.rotation && (
+        <RotationMark rot={guides.rotation} quiet={quiet} />
       )}
+      {guides.local.map((r, k) => (
+        <RotationMark key={k} rot={r} quiet />
+      ))}
     </g>
   );
 });
@@ -383,26 +492,30 @@ const GuideLayer = memo(function GuideLayer({
  */
 const Ghost = memo(function Ghost({
   geom,
+  pts,
+  centroids,
   spec,
   standing,
   dashClass,
 }: {
   geom: BoardGeometry;
+  pts: readonly string[];
+  centroids: readonly (readonly [number, number])[];
   spec: PreviewSpec;
   standing: boolean;
   dashClass: string;
 }) {
-  const seed = geom.cells[spec.seed];
+  const seed = centroids[spec.seed];
   return (
     <g pointerEvents="none">
       {spec.cells.map((i, k) => {
-        const cell = geom.cells[i];
-        if (cell === undefined) return null;
+        const p = pts[i];
+        if (p === undefined) return null;
         const colour = spec.erasing ? "#ece6dc" : spec.colours[k] ?? "#ece6dc";
         return (
           <g key={i}>
             <polygon
-              points={points(cell)}
+              points={p}
               fill="none"
               stroke="rgba(10,9,8,.85)"
               strokeWidth={5}
@@ -410,7 +523,7 @@ const Ghost = memo(function Ghost({
             />
             <polygon
               className={standing ? dashClass : undefined}
-              points={points(cell)}
+              points={p}
               fill={spec.erasing ? "none" : colour}
               fillOpacity={standing ? 0.26 : 0.55}
               stroke={colour}
@@ -426,12 +539,12 @@ const Ghost = memo(function Ghost({
 
       {/* Reached, and nothing to do here. */}
       {spec.inert.map((i) => {
-        const cell = geom.cells[i];
-        if (cell === undefined) return null;
+        const p = pts[i];
+        if (p === undefined) return null;
         return (
           <polygon
             key={`inert-${i}`}
-            points={points(cell)}
+            points={p}
             fill="none"
             stroke="rgba(236,230,220,.42)"
             strokeWidth={1.2}
@@ -443,8 +556,8 @@ const Ghost = memo(function Ghost({
 
       {seed && (
         <circle
-          cx={seed.centroid[0]}
-          cy={seed.centroid[1]}
+          cx={seed[0]}
+          cy={seed[1]}
           r={Math.max(3, geom.seamWidth * 5)}
           fill="none"
           stroke="#ece6dc"
@@ -458,6 +571,7 @@ const Ghost = memo(function Ghost({
 
 export default function DrawBoard({
   geom,
+  relief,
   paint,
   preview,
   candidate,
@@ -478,6 +592,19 @@ export default function DrawBoard({
   onArrow,
   onCursorPaint,
 }: Props) {
+  /**
+   * The plate's polygons, from whichever source is in force.
+   *
+   * One array, shared by every layer, so a point string is built once and not
+   * once per layer. With the relief off it is memoised on the figure and is
+   * therefore built once ever; with it on it arrives whole from the page and
+   * changes only when the template ring does.
+   */
+  const flat = useMemo(() => geom.cells.map(points), [geom]);
+  const pts = relief === null ? flat : relief.points;
+  const flatCentroids = useMemo(() => geom.cells.map((c) => c.centroid), [geom]);
+  const centroids = relief === null ? flatCentroids : relief.centroids;
+
   const drawing = useRef(false);
   const proposing = useRef(false);
   /** A press that landed inside the standing candidate: a tap here commits. */
@@ -591,7 +718,7 @@ export default function DrawBoard({
     }
   };
 
-  const cursorCell = cursor === null ? null : geom.cells[cursor];
+  const cursorPoints = cursor === null ? undefined : pts[cursor];
 
   return (
     <svg
@@ -614,9 +741,13 @@ export default function DrawBoard({
 
       <rect width={geom.width} height={geom.height} fill="url(#draw-vignette)" />
 
-      <TileLayer geom={geom} show={showTiling} />
-      <PaintLayer geom={geom} paint={paint} weld={weld} />
+      <TileLayer geom={geom} pts={pts} show={showTiling} />
+      <PaintLayer geom={geom} pts={pts} paint={paint} weld={weld} />
+      {relief && <WashLayer pts={pts} wash={relief.wash} />}
 
+      {/* The outline never moves under the relief: the rim is one level set of
+          the ring index, so its scale factor is pinned at 1 and the plate
+          curves inside a boundary that stays exactly where it was. */}
       <polygon
         points={geom.outline.map((v) => `${v[0]},${v[1]}`).join(" ")}
         fill="none"
@@ -625,11 +756,17 @@ export default function DrawBoard({
         pointerEvents="none"
       />
 
-      <GuideLayer guides={guides} show={showGuides} />
+      <GuideLayer
+        guides={guides}
+        show={showGuides}
+        bend={relief === null ? null : relief.bend}
+      />
 
       {preview && (
         <Ghost
           geom={geom}
+          pts={pts}
+          centroids={centroids}
           spec={preview}
           standing={false}
           dashClass={candidateClass}
@@ -638,15 +775,17 @@ export default function DrawBoard({
       {candidate && (
         <Ghost
           geom={geom}
+          pts={pts}
+          centroids={centroids}
           spec={candidate}
           standing
           dashClass={candidateClass}
         />
       )}
 
-      {cursorCell && (
+      {cursorPoints !== undefined && (
         <polygon
-          points={points(cursorCell)}
+          points={cursorPoints}
           fill="none"
           stroke="#a3e635"
           strokeWidth={3}
@@ -655,7 +794,7 @@ export default function DrawBoard({
         />
       )}
 
-      <HitLayer geom={geom} />
+      <HitLayer pts={pts} />
     </svg>
   );
 }

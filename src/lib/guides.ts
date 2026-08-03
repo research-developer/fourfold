@@ -60,6 +60,15 @@ export interface MirrorGuide {
   y1: number;
   x2: number;
   y2: number;
+  /**
+   * Which sector this median belongs to, for a SECTOR-scoped brush.
+   *
+   * Absent for a whole-plate mirror, which is a diameter and belongs to no
+   * sector in particular. Present, the same `id` occurs once per sector the
+   * scope covers — the local m_A of sector 2 and of sector 5 are two different
+   * lines and two different maps, and neither is an isometry of the hexagon.
+   */
+  sector?: number;
 }
 
 export interface RotationGuide {
@@ -73,7 +82,17 @@ export interface RotationGuide {
 
 export interface Guides {
   mirrors: MirrorGuide[];
+  /** The rotation the group performs about the CANVAS centre, if any. */
   rotation: RotationGuide | null;
+  /**
+   * Rotation centres that are not the canvas centre.
+   *
+   * Empty on every whole-plate group, and that is not an accident of this
+   * implementation — a rotation of the hexagon about anything but its centre is
+   * not a symmetry of the hexagon. A sector's own 120° turn is about the
+   * SECTOR's centroid, so it can only ever appear here.
+   */
+  local: RotationGuide[];
 }
 
 export type Pt = readonly [number, number];
@@ -112,7 +131,11 @@ const TRIANGLE_MIRRORS = [
   { id: "m_C", axis: 2, label: "m_C — right diagonal median" },
 ] as const;
 
-function triangleGuides(frame: TriangleFrame, mode: BrushMode): Guides {
+function triangleGuides(
+  frame: TriangleFrame,
+  mode: BrushMode,
+  sector?: number
+): Guides {
   const [A, B, C] = frame.corners;
   const opposite: Pt[] = [mid(B, C), mid(A, C), mid(A, B)];
   const cx = (A[0] + B[0] + C[0]) / 3;
@@ -134,17 +157,19 @@ function triangleGuides(frame: TriangleFrame, mode: BrushMode): Guides {
       return {
         id: m.id,
         family: "median" as const,
-        label: m.label,
+        label: sector === undefined ? m.label : `${m.label} · sector ${sector}`,
         x1: p[0],
         y1: p[1],
         x2: q[0],
         y2: q[1],
+        ...(sector === undefined ? {} : { sector }),
       };
     }),
     // D3 contains A3, so mode 6 shows the rotation centre as well as the three
     // medians: a 6-fold brush really does both things.
     rotation:
       mode === 3 || mode === 6 ? { cx, cy, order: 3, radius: ring } : null,
+    local: [],
   };
 }
 
@@ -185,14 +210,87 @@ function hexagonGuides(frame: HexagonFrame, mode: BrushMode): Guides {
   return {
     mirrors,
     rotation: order === 0 ? null : { cx, cy, order, radius: ring },
+    local: [],
   };
 }
 
-/** The overlay for the active subgroup — mirrors it really has, nothing more. */
-export function symmetryGuides(frame: CanvasFrame, mode: BrushMode): Guides {
-  return frame.kind === "triangle"
-    ? triangleGuides(frame, mode)
-    : hexagonGuides(frame, mode);
+// ── the sector overlays ──────────────────────────────────────────────────
+
+/**
+ * The corners of the hexagon, in the model's own order: corner k at 30°·2k,
+ * anticlockwise from +x. `buildHexagon` places them at `rotK([scale, 0], k)`,
+ * and `latticeToPixel` sends that to (cx + R·cos 60k, cy − R·sin 60k).
+ */
+const hexCorner = (frame: HexagonFrame, k: number): Pt => {
+  const t = (Math.PI / 180) * 60 * (((k % 6) + 6) % 6);
+  return [
+    frame.centre[0] + frame.radius * Math.cos(t),
+    frame.centre[1] - frame.radius * Math.sin(t),
+  ];
+};
+
+/**
+ * Sector s as a triangle frame, with the roles the model gives it.
+ *
+ * Vertex A is the hexagon CENTRE — the shared apex-eye — because the base
+ * figure's A sits at barycentric (scale, 0, 0), which `baryToLat` sends to the
+ * lattice origin. B and C are corners s and s+1, from (0, scale, 0) ↦ (scale, 0)
+ * and (0, 0, scale) ↦ (0, scale), each rotated by 60°·s. So the sector's own m_A
+ * is its spine and m_B, m_C are the two medians that meet the seams — which is
+ * what makes `triangleGuides` the right thing to call here rather than a second
+ * derivation of the same three lines.
+ */
+export function sectorFrame(frame: HexagonFrame, sector: number): TriangleFrame {
+  return {
+    kind: "triangle",
+    corners: [frame.centre, hexCorner(frame, sector), hexCorner(frame, sector + 1)],
+  };
+}
+
+/**
+ * The overlay for the active subgroup — mirrors it really has, nothing more.
+ *
+ * `sectors` restricts the drawing to the sector-local D3 of the sectors named,
+ * which is what a SECTOR-scoped brush actually does. It changes the overlay
+ * completely rather than filtering it, and it has to: the hexagon's own spine
+ * mirrors reflect two opposite sectors at once, so drawing one of them under a
+ * sector brush would promise a symmetry the stroke does not have. What replaces
+ * them is that sector's three medians and its own 120° turn about its own
+ * centroid — lines and a centre that appear in NO element of D6.
+ *
+ * `spin` is the order of the rotation about the canvas centre that the scope
+ * adds on top; 6 for SECTOR ×6, 0 for a single sector.
+ */
+export function symmetryGuides(
+  frame: CanvasFrame,
+  mode: BrushMode,
+  sectors: readonly number[] | null = null,
+  spin = 0
+): Guides {
+  if (frame.kind === "triangle") return triangleGuides(frame, mode);
+  if (sectors === null) return hexagonGuides(frame, mode);
+
+  const mirrors: MirrorGuide[] = [];
+  const local: RotationGuide[] = [];
+  for (const s of sectors) {
+    const g = triangleGuides(sectorFrame(frame, s), mode, s);
+    mirrors.push(...g.mirrors);
+    if (g.rotation !== null) local.push(g.rotation);
+  }
+  const inradius = (frame.radius * Math.sqrt(3)) / 2;
+  return {
+    mirrors,
+    rotation:
+      spin > 1
+        ? {
+            cx: frame.centre[0],
+            cy: frame.centre[1],
+            order: spin,
+            radius: inradius * (mirrors.length > 0 ? RING_WITH_MIRRORS : RING_ALONE),
+          }
+        : null,
+    local,
+  };
 }
 
 // ── the subgroup, as a glyph ─────────────────────────────────────────────

@@ -223,19 +223,31 @@ export function brushStamp(
  * With a band it is the number of IMAGE BANDS, and that number is emphatically
  * not the mode. A 6-fold brush is D3 on the triangle, where m_A fixes the
  * family-A bands and the band orbit is three rows, and C6 on the hexagon, where
- * it is six. Probed at cell 0 rather than at the cell under the pointer because
- * the count is a fact about the subgroup and the family and NOT about the cell:
+ * it is six. Probed at cell 0 by default, because on the whole-plate groups the
+ * count is a fact about the subgroup and the family and NOT about the cell:
  * `test/bandcolour.test.ts` measures it at every cell of both canvases and
  * finds exactly one value per (canvas, mode, family). If that ever stopped
  * being true the test would fail before this function started lying.
+ *
+ * ── Why there is a seed after all ───────────────────────────────────────
+ *
+ * That invariance is a property of the whole-plate groups, and the SECTOR scope
+ * does not have it. A hexagon band clipped to sector s is a band of the base
+ * triangle in family (A, B, C)[s mod 3] — the sector is a rotated copy, so the
+ * lattice direction the family names arrives rotated too — and the local D3
+ * treats the three triangle families differently: ⟨m_A⟩ fixes a family-A band
+ * and swaps B with C, so a mode-2 sector brush spans 1 row in sectors 0, 3 and
+ * 2 rows in the other four. Passing the seed is how a readout can be right
+ * about the sector the pointer is actually in.
  */
 export function brushSpan(
   surface: SymmetrySurface,
   bands: BandSurface,
-  shape: BrushShape
+  shape: BrushShape,
+  seed = 0
 ): number {
-  if (shape.band === null) return shape.mode;
-  return bandOrbitGrouped(surface, bands, 0, shape.band, shape.mode).length;
+  if (shape.band === null) return surface.order(shape.mode);
+  return bandOrbitGrouped(surface, bands, seed, shape.band, shape.mode).length;
 }
 
 // ── what colour they end up ──────────────────────────────────────────────

@@ -42,10 +42,24 @@
 import { CONVENTIONS, type Convention, type Figure } from "./figure";
 import type { Hexagon } from "./hexagon";
 import type { CanvasKind } from "./orbit";
+import { READINGS, type Reading } from "./relief";
 import { swatchFromHex, type Swatch } from "./schemes";
 
 export const ART_MARKER = "fourfold:art";
 export const ART_VERSION = 1;
+
+/**
+ * The relief the plate was exported under.
+ *
+ * The shading is a DISPLAY effect and not paint — no cell holds a colour it did
+ * not hold before — but it is baked into the exported polygons, so a file that
+ * did not say this could not be re-exported to the same bytes. Reading is which
+ * of the two cube corners the plate was read as; see `relief.ts`.
+ */
+export interface ArtRelief {
+  on: boolean;
+  reading: Reading;
+}
 
 export interface ArtPayload {
   version: number;
@@ -54,6 +68,18 @@ export interface ArtPayload {
   convention: Convention;
   /** [cell index, lower-case #rrggbb], ascending by index. */
   cells: [number, string][];
+  /**
+   * Optional, and NOT versioned.
+   *
+   * A field that only ever ADDS a statement about the file does not need a
+   * version bump, because every reader of version 1 that predates it already
+   * behaves correctly on a file that carries it: absent means "no relief", which
+   * is what such a reader assumes, and that is exactly what every file written
+   * before this existed meant. Bumping would have made those files unreadable to
+   * gain nothing. The field is omitted entirely when the relief is off, so a
+   * plain drawing exports the same bytes it always did.
+   */
+  relief?: ArtRelief;
 }
 
 /**
@@ -145,6 +171,9 @@ export function encodeArt(p: ArtPayload): string {
       depth: p.depth,
       convention: p.convention,
       cells: p.cells,
+      // `JSON.stringify` drops an undefined value, so a payload with no relief
+      // writes exactly the bytes it wrote before this field existed.
+      relief: p.relief,
     })
   );
   const line = `<!-- ${ART_MARKER}:${p.version} ${body} -->`;
@@ -237,7 +266,33 @@ function validate(version: number, raw: unknown): ArtPayload | null {
   }
   out.sort((a, b) => a[0] - b[0]);
 
-  return { version, canvas, depth, convention, cells: out };
+  const relief = validateRelief(o.relief);
+  if (relief === REJECT) return null;
+
+  return { version, canvas, depth, convention, cells: out, ...(relief ?? {}) };
+}
+
+/** Distinguishable from `undefined`, which is the legitimate "absent" answer. */
+const REJECT = Symbol("reject");
+
+/**
+ * `undefined` for a file that says nothing about relief — which is every file
+ * written before the field existed, and every plain drawing since.
+ *
+ * A field that is PRESENT and malformed is rejected outright, like every other
+ * malformed field here: a writer that disagrees with us about the shape of this
+ * payload is not a writer whose cell indices we should trust either.
+ */
+function validateRelief(
+  raw: unknown
+): { relief: ArtRelief } | undefined | typeof REJECT {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return REJECT;
+  const r = raw as Record<string, unknown>;
+  if (typeof r.on !== "boolean") return REJECT;
+  const reading = r.reading as Reading;
+  if (!READINGS.includes(reading)) return REJECT;
+  return { relief: { on: r.on, reading } };
 }
 
 // ── plate ↔ payload ──────────────────────────────────────────────────────
@@ -281,7 +336,8 @@ export function payloadFromPaint(
   canvas: CanvasKind,
   depth: number,
   convention: Convention,
-  paint: ReadonlyMap<number, string>
+  paint: ReadonlyMap<number, string>,
+  relief?: ArtRelief
 ): ArtPayload {
   const n = cellCount(canvas, depth);
   const cells: [number, string][] = [];
@@ -292,7 +348,14 @@ export function payloadFromPaint(
     cells.push([i, hex]);
   }
   cells.sort((a, b) => a[0] - b[0]);
-  return { version: ART_VERSION, canvas, depth, convention, cells };
+  return {
+    version: ART_VERSION,
+    canvas,
+    depth,
+    convention,
+    cells,
+    ...(relief === undefined ? {} : { relief }),
+  };
 }
 
 /** The paint map a payload restores. */

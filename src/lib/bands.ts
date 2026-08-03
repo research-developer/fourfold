@@ -306,10 +306,37 @@ export function bandOrbit(
 ): number[] {
   sameCanvas("bandOrbit", surface, bandSurface);
   const out = new Set<number>();
-  for (const j of bandSurface.bandThrough(i, family)) {
+  for (const j of sourceBand(surface, bandSurface, i, family)) {
     for (const k of surface.orbit(j, mode)) out.add(k);
   }
   return [...out].sort((a, b) => a - b);
+}
+
+/**
+ * The band through cell `i`, CLIPPED to the region the surface's group acts in.
+ *
+ * A band is a whole-canvas object — the Eisenstein lattice runs straight across
+ * every sector seam, which is the point of `bands.ts` — and a group that acts
+ * inside one sector cannot carry the parts of the row that lie outside it. Hand
+ * the unclipped row to a sector-scoped brush and the stroke paints the entire
+ * width of the hexagon under a brush advertised as local: the scope would be a
+ * label on the orbit and a lie about the band.
+ *
+ * On every surface whose group acts on the whole canvas `regionOf` is 0
+ * everywhere, the filter keeps everything, and this is `bandThrough` with one
+ * extra pass. There is no tolerance and no geometry here: `regionOf` is an
+ * integer read out of a table.
+ */
+function sourceBand(
+  surface: SymmetrySurface,
+  bandSurface: BandSurface,
+  i: number,
+  family: BandFamily
+): number[] {
+  const region = surface.regionOf(i);
+  return bandSurface
+    .bandThrough(i, family)
+    .filter((j) => surface.regionOf(j) === region);
 }
 
 function sameCanvas(
@@ -385,7 +412,7 @@ export function bandOrbitGrouped(
   mode: BrushMode
 ): number[][] {
   sameCanvas("bandOrbitGrouped", surface, bandSurface);
-  const source = bandSurface.bandThrough(i, family);
+  const source = sourceBand(surface, bandSurface, i, family);
   const out: number[][] = [source];
   const seen = new Set<string>([source.join(",")]);
 
