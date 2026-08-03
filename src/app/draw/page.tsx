@@ -18,6 +18,16 @@ import DrawBoard, {
 } from "@/components/DrawBoard";
 import { ADJUSTMENTS, ADJUST_NAMES, type AdjustName } from "@/lib/adjust";
 import {
+  cellCount,
+  extractArt,
+  importByGeometry,
+  MAX_ART_BYTES,
+  MAX_DEPTH,
+  MIN_DEPTH,
+  paintFromPayload,
+  payloadFromPaint,
+} from "@/lib/artfile";
+import {
   BAND_FAMILIES,
   bandSizes,
   buildBandSurface,
@@ -27,14 +37,15 @@ import {
 import {
   activeProgression,
   BAND_NOTE,
-  brushCells,
-  brushColours,
+  brushSpan,
+  brushStamp,
   defaultDragMode,
   EMPTY_EVENTS,
   eventCount,
   progressionIndex,
   pushEvents,
   redoEvents,
+  stampColours,
   TOOLS,
   undoEvents,
   upcomingBases,
@@ -42,8 +53,8 @@ import {
   type EventLog,
   type Tool,
 } from "@/lib/brush";
-import { buildFigure, type Convention } from "@/lib/figure";
-import { buildHexagon } from "@/lib/hexagon";
+import { buildFigure, type Convention, type Figure } from "@/lib/figure";
+import { buildHexagon, type Hexagon } from "@/lib/hexagon";
 import {
   hexagonSurface,
   triangleSurface,
@@ -97,12 +108,19 @@ import styles from "./draw.module.css";
  *
  * ── Convention ──────────────────────────────────────────────────────────
  *
- * Fixed at `apex`, and the choice does not matter here. The apex/ifs question
- * is about which V4 charge a triangle is LABELLED with; the drawing program
- * never reads a charge. Orbits agree as sets of triangles under both
+ * Drawn at `apex`, and the choice does not matter while drawing. The apex/ifs
+ * question is about which V4 charge a triangle is LABELLED with; the drawing
+ * program never reads a charge. Orbits agree as sets of triangles under both
  * conventions — see the header of `orbit.ts` — so a plate drawn here would look
  * identical either way. Exposing the toggle would be a control with no visible
- * effect, which is worse than no control.
+ * effect, which is worse than no control, so there is no control.
+ *
+ * It is nonetheless STATE and not a constant, because a loaded file may declare
+ * one. The two conventions cut the same triangles but, from depth 2, hand them
+ * out in a different ORDER, so cell 4 is a different triangle under each. A
+ * payload that says `ifs` and is read as `apex` restores a permuted plate — a
+ * drawing that was never made. Loading therefore adopts the file's convention,
+ * and this program's own exports go on saying `apex`.
  *
  * ── What re-renders ─────────────────────────────────────────────────────
  *
@@ -132,16 +150,26 @@ import styles from "./draw.module.css";
 
 const CONVENTION: Convention = "apex";
 
+/**
+ * The depths on offer, taken from the loader's ceiling rather than written out.
+ *
+ * Triangle depth 5 is 1024 cells; hexagon depth 4 is 1536, six sectors of 4^4.
+ * Both stay under the point where a full re-render is felt, and the layer split
+ * in DrawBoard means only the paint layer is ever redrawn. `artfile.ts` refuses
+ * to load a plate deeper than a button here can select, so the two lists are
+ * the same list — a second copy of these numbers would be a way for a file to
+ * become loadable but not selectable.
+ */
 const DEPTHS: Record<CanvasKind, number[]> = {
-  // Triangle depth 5 is 1024 cells; hexagon depth 4 is 1536, six sectors of
-  // 4^4. Both stay under the point where a full re-render is felt, and the
-  // layer split in DrawBoard means only the paint layer is ever redrawn.
-  triangle: [1, 2, 3, 4, 5],
-  hexagon: [1, 2, 3, 4],
+  triangle: Array.from(
+    { length: MAX_DEPTH.triangle - MIN_DEPTH + 1 },
+    (_, k) => MIN_DEPTH + k
+  ),
+  hexagon: Array.from(
+    { length: MAX_DEPTH.hexagon - MIN_DEPTH + 1 },
+    (_, k) => MIN_DEPTH + k
+  ),
 };
-
-const cellCount = (kind: CanvasKind, depth: number) =>
-  (kind === "hexagon" ? 6 : 1) * 4 ** depth;
 
 /** Canvas units per cell edge — the triangle is drawn at twice the hexagon's. */
 const edgeAt = (kind: CanvasKind, depth: number) =>
@@ -189,6 +217,13 @@ interface Canvas {
   centroids: Pt[];
   surface: SymmetrySurface;
   bands: BandSurface;
+  /**
+   * The built figure itself, kept so a load can match a foreign file's polygons
+   * against the cells' own vertices. `geom.cells` is the same geometry already
+   * flattened for the board, but the importer's signature is stated in terms of
+   * the figure, which is the thing that knows how it was numbered.
+   */
+  fig: Figure | Hexagon;
 }
 
 const TOOL_LABEL: Record<Tool, string> = {
@@ -240,6 +275,8 @@ function ToolGlyph({ tool }: { tool: Tool }) {
 export default function DrawPage() {
   const [kind, setKind] = useState<CanvasKind>("triangle");
   const [depth, setDepth] = useState(4);
+  /** Drawn at `apex`; only a loaded file can move it. See the header. */
+  const [convention, setConvention] = useState<Convention>(CONVENTION);
   const [mode, setMode] = useState<BrushMode>(6);
   const [schemeName, setSchemeName] = useState<SchemeName>("hexad");
   const [base, setBase] = useState<Swatch>(() => swatchFromHex("#d4a017"));
@@ -263,6 +300,27 @@ export default function DrawPage() {
   const [showTiling, setShowTiling] = useState(true);
   const [weld, setWeld] = useState(false);
   const [announce, setAnnounce] = useState("");
+  /**
+   * Why the last load did not happen.
+   *
+   * Held rather than only announced, because a refusal that exists for one
+   * screen-reader utterance and nowhere on the screen is indistinguishable from
+   * a button that does nothing. It sits beside the plate until it is dismissed
+   * or until a load succeeds. Never an `alert`: a modal would take the focus
+   * off the canvas to say something the canvas could have said itself.
+   */
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [dropping, setDropping] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+  /**
+   * Nesting depth of the drag currently over the plate.
+   *
+   * `dragleave` fires when the pointer crosses onto a CHILD of the drop target,
+   * so a naive enter/leave pair blinks the drop state on and off as the file is
+   * dragged across the polygons. Counting entries against leaves is the fix
+   * that does not depend on knowing which children exist.
+   */
+  const dragDepth = useRef(0);
 
   const paintRef = useRef<ReadonlyMap<number, string>>(new Map());
   const pending = useRef<CellEdit[]>([]);
@@ -289,7 +347,7 @@ export default function DrawPage() {
   const canvas: Canvas = useMemo(() => {
     const seamWidth = seamAt(kind, depth);
     if (kind === "triangle") {
-      const f = buildFigure(depth, CONVENTION);
+      const f = buildFigure(depth, convention);
       return {
         kind,
         geom: {
@@ -303,9 +361,10 @@ export default function DrawPage() {
         centroids: f.cells.map((c) => c.centroid),
         surface: triangleSurface(f),
         bands: buildBandSurface(f),
+        fig: f,
       };
     }
-    const h = buildHexagon(depth, CONVENTION);
+    const h = buildHexagon(depth, convention);
     return {
       kind,
       geom: {
@@ -319,8 +378,9 @@ export default function DrawPage() {
       centroids: h.cells.map((c) => c.centroid),
       surface: hexagonSurface(h),
       bands: buildBandSurface(h),
+      fig: h,
     };
-  }, [kind, depth]);
+  }, [kind, depth, convention]);
 
   const guides = useMemo(
     () => symmetryGuides(canvas.frame, mode),
@@ -345,16 +405,30 @@ export default function DrawPage() {
     [prog, base, driftIndex]
   );
 
-  /** The scheme's colours in orbit order, as the current brush would lay them. */
-  const tape = useMemo(
-    () =>
-      Array.from({ length: mode }, (_, k) =>
-        scheme.at(effectiveBase, k, mode)
-      ),
-    [scheme, effectiveBase, mode]
+  const shape = useMemo(() => ({ mode, band }), [mode, band]);
+
+  /**
+   * How many scheme positions this brush uses — and it is NOT always the mode.
+   *
+   * With a band the brush paints a set of rows, and the count of rows is the
+   * subgroup order divided by the band's stabiliser: three rows for a 6-fold
+   * brush on the triangle, because m_A carries a family-A band to itself, and
+   * six on the hexagon. Reading it from the brush rather than assuming `mode`
+   * is what keeps the tape from advertising six hues the stroke will not lay.
+   */
+  const span = useMemo(
+    () => brushSpan(canvas.surface, canvas.bands, shape),
+    [canvas, shape]
   );
 
-  const shape = useMemo(() => ({ mode, band }), [mode, band]);
+  /** The scheme's colours in stroke order, as the current brush would lay them. */
+  const tape = useMemo(
+    () =>
+      Array.from({ length: span }, (_, k) =>
+        scheme.at(effectiveBase, k, span)
+      ),
+    [scheme, effectiveBase, span]
+  );
 
   /**
    * What the brush would do at `seed`, as the board draws it.
@@ -368,14 +442,15 @@ export default function DrawPage() {
   const specFor = useCallback(
     (seed: number | null): PreviewSpec | null => {
       if (seed === null || seed >= canvas.geom.cells.length) return null;
-      const all = brushCells(canvas.surface, canvas.bands, seed, shape);
+      const stamp = brushStamp(canvas.surface, canvas.bands, seed, shape);
+      const all = stamp.cells;
       if (tool === "erase") {
         return { cells: all, colours: [], inert: [], seed, erasing: true };
       }
-      const colours = brushColours(
+      const colours = stampColours(
         { tool, scheme, base: effectiveBase, adjust },
         paint,
-        all
+        stamp
       );
       if (tool === "paint") {
         return {
@@ -418,8 +493,18 @@ export default function DrawPage() {
 
   // ── the canvas is a different set of cells now ──────────────────────────
 
-  const wipe = useCallback((why: string) => {
-    paintRef.current = new Map();
+  /**
+   * Put a plate on the canvas and forget everything behind it.
+   *
+   * One code path for "the cells changed underneath you" and for "this file is
+   * the drawing now", because both leave a history whose strokes were recorded
+   * against a plate that no longer exists. Undoing into that plate would restore
+   * colours to cells that mean something else, so the stacks are emptied rather
+   * than carried: after this the loaded plate is the single restorable state,
+   * and undo says there is nothing to undo, which is true.
+   */
+  const reset = useCallback((plate: Map<number, string>, why: string) => {
+    paintRef.current = plate;
     pending.current = [];
     pendingEvents.current = 0;
     setLiveEvents(0);
@@ -432,6 +517,15 @@ export default function DrawPage() {
     setCandidate(null);
     setAnnounce(why);
   }, []);
+
+  const wipe = useCallback(
+    (why: string) => {
+      // A cleared plate is a new drawing, and a drawing made here is `apex`.
+      setConvention(CONVENTION);
+      reset(new Map(), why);
+    },
+    [reset]
+  );
 
   const pickKind = (next: CanvasKind) => {
     if (next === kind) return;
@@ -453,16 +547,16 @@ export default function DrawPage() {
 
   const paintAt = useCallback(
     (i: number) => {
-      const cells = brushCells(canvas.surface, canvas.bands, i, shape);
+      const stamp = brushStamp(canvas.surface, canvas.bands, i, shape);
       // Recomputed per application rather than taken from `effectiveBase`, so a
       // drag lays a gradient along its own path instead of one flat colour.
       const n = progressionIndex(events, progOrigin, pendingEvents.current);
-      const colours = brushColours(
+      const colours = stampColours(
         { tool, scheme, base: prog.at(base, n), adjust },
         paintRef.current,
-        cells
+        stamp
       );
-      const edits = planEdits(paintRef.current, cells, colours);
+      const edits = planEdits(paintRef.current, stamp.cells, colours);
       if (edits.length === 0) return;
       if (tool === "paint") {
         pendingEvents.current += 1;
@@ -595,21 +689,33 @@ export default function DrawPage() {
     setAnnounce(`${next} tool — ${TOOL_LABEL[next]}`);
   };
 
+  /**
+   * Selecting a band does exactly one thing: select a band.
+   *
+   * It used to also switch WELD on the first time, and the reasoning was sound
+   * — a row with a seam at every join reads as a run of triangles rather than
+   * as one line — but the mechanism was not. Weld is a property of how the
+   * WHOLE PLATE renders, on screen and in the exported file, including cells
+   * painted long before any band was chosen; a brush control cannot own it
+   * without silently restyling work the band never touched. And a control that
+   * moves another control leaves the panel describing a state the user did not
+   * ask for, which is the one thing a panel must never do.
+   *
+   * So the toggle is strictly manual, and the teaching moved into the text: the
+   * hint under this control names weld and says what it is for. A default is
+   * fine; a default that reaches across the panel to set itself is not.
+   */
   const pickBand = (next: BandFamily | null) => {
     if (next === band) return;
     setBand(next);
-    // A row of cells with a seam at every join reads as a run of triangles, not
-    // as one thick line, so selecting a band welds the paint. The toggle stays
-    // available: this is a default, not a lock.
-    if (next !== null && !weld) {
-      setWeld(true);
-      setAnnounce(
-        `band ${next} — ${BAND_NOTE[kind][next]}; painted cells welded so a row reads as one line`
-      );
-      return;
-    }
     setAnnounce(
-      next === null ? "band brush off" : `band ${next} — ${BAND_NOTE[kind][next]}`
+      next === null
+        ? "band brush off"
+        : `band ${next} — ${BAND_NOTE[kind][next]}; ${brushSpan(
+            canvas.surface,
+            canvas.bands,
+            { mode, band: next }
+          )} rows under the ${mode}-fold brush`
     );
   };
 
@@ -705,8 +811,11 @@ export default function DrawPage() {
         title: `FOURFOLD — ${kind}, depth ${depth}, ${mode}-fold brush, ${schemeName}${
           band === null ? "" : `, band ${band}`
         }`,
+        // What makes the file loadable: the plate stated as cells rather than
+        // inferred from shapes. See `artfile.ts`.
+        payload: payloadFromPaint(kind, depth, convention, paintRef.current),
       }),
-    [canvas, showTiling, weld, kind, depth, mode, schemeName, band]
+    [canvas, showTiling, weld, kind, depth, convention, mode, schemeName, band]
   );
 
   const nameFor = useCallback(
@@ -766,6 +875,144 @@ export default function DrawPage() {
       setAnnounce("PNG export failed — the plate could not be rasterised");
     };
     img.src = url;
+  };
+
+  // ── load ────────────────────────────────────────────────────────────────
+
+  const refuse = useCallback((why: string) => {
+    setLoadError(why);
+    setAnnounce(`load failed — ${why}`);
+  }, []);
+
+  /**
+   * Read an SVG back onto the plate.
+   *
+   * Two outcomes, and they are told apart rather than blended. A file carrying
+   * this program's payload is an EXACT restore: the canvas, the depth and the
+   * convention become the file's, and the plate is its cells. A file without one
+   * can still be matched shape by shape against the canvas as it stands, and
+   * that outcome is reported with its match rate, because "142 of 384" is the
+   * difference between a drawing and a fragment and the user is the only one who
+   * can decide whether the fragment is what they wanted.
+   *
+   * Nothing here hands markup to the DOM. The file is text, and `artfile.ts`
+   * reads it as text; a drawing dropped from a download folder is untrusted
+   * input and is never given a chance to run.
+   */
+  const loadFile = useCallback(
+    async (file: File) => {
+      const named = /\.svg$/i.test(file.name);
+      const typed = file.type === "" || /svg/i.test(file.type);
+      if (!named && !typed) {
+        refuse(`${file.name || "that file"} is not an SVG`);
+        return;
+      }
+      if (file.size > MAX_ART_BYTES) {
+        refuse(
+          `that file is ${Math.round(file.size / 1024 / 1024)} MB — the limit is ${
+            MAX_ART_BYTES / 1024 / 1024
+          } MB`
+        );
+        return;
+      }
+
+      let text: string;
+      try {
+        text = await file.text();
+      } catch {
+        refuse("that file could not be read");
+        return;
+      }
+
+      const payload = extractArt(text);
+      if (payload !== null) {
+        setLoadError(null);
+        setKind(payload.canvas);
+        setDepth(payload.depth);
+        setConvention(payload.convention);
+        // Mode 12 is a hexagon subgroup; carrying it onto a triangle would name
+        // a brush that canvas does not have. Same rule as `pickKind`.
+        if (payload.canvas === "triangle" && mode === 12) setMode(6);
+        reset(
+          paintFromPayload(payload),
+          `loaded ${payload.cells.length} cell${
+            payload.cells.length === 1 ? "" : "s"
+          } — ${payload.canvas}, depth ${payload.depth}, ${
+            payload.convention
+          } · history reset to the loaded plate`
+        );
+        return;
+      }
+
+      if (!/<svg[\s>]/i.test(text)) {
+        refuse("that file is not an SVG this program can read");
+        return;
+      }
+
+      const got = importByGeometry(text, canvas.fig);
+      if (got.matched.size === 0) {
+        refuse(
+          got.total === 0
+            ? "no filled shapes in that file — nothing to import"
+            : `none of the ${got.total} shapes in that file line up with this canvas — try the ${kind} depth it was drawn at`
+        );
+        return;
+      }
+      setLoadError(null);
+      const plate = new Map<number, string>();
+      for (const [i, s] of got.matched) plate.set(i, s.hex);
+      reset(
+        plate,
+        `imported ${got.matched.size} of ${got.total} cells — this file was not made here${
+          got.unmatched === 0 ? "" : `, ${got.unmatched} shapes matched no cell`
+        }`
+      );
+    },
+    [refuse, reset, canvas, kind, mode]
+  );
+
+  const openPicker = () => {
+    setLoadError(null);
+    fileInput.current?.click();
+  };
+
+  const onPicked = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    // Cleared so that picking the SAME file twice still fires a change event —
+    // otherwise a failed load cannot be retried without choosing something else.
+    e.target.value = "";
+    if (file) void loadFile(file);
+  };
+
+  const onDropFile = (e: React.DragEvent) => {
+    e.preventDefault();
+    dragDepth.current = 0;
+    setDropping(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file === undefined) {
+      refuse("nothing was dropped that this program could read");
+      return;
+    }
+    void loadFile(file);
+  };
+
+  const onDragEnter = (e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes("Files")) return;
+    e.preventDefault();
+    dragDepth.current += 1;
+    setDropping(true);
+  };
+
+  const onDragOver = (e: React.DragEvent) => {
+    if (!e.dataTransfer.types.includes("Files")) return;
+    // Without this the browser navigates to the file and the drawing is gone.
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  };
+
+  const onDragLeave = () => {
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDropping(false);
   };
 
   // ── readouts ────────────────────────────────────────────────────────────
@@ -957,7 +1204,7 @@ export default function DrawPage() {
               <span className={styles.sectionMeta}>
                 {bandStat === null
                   ? "off"
-                  : `${bandStat.count} rows · ${bandStat.min}…${bandStat.max}`}
+                  : `${span} × ${bandStat.min}…${bandStat.max} cells`}
               </span>
             </div>
             <div className={styles.seg} role="group" aria-label="band family">
@@ -986,14 +1233,65 @@ export default function DrawPage() {
             <p className={styles.hint}>
               {band === null ? (
                 <>
-                  One cell deep, edge to edge, <b>carried by the brush</b> — a row
-                  under the 6-fold brush is six rows.
+                  One cell deep, edge to edge, <b>carried by the brush</b> — and
+                  each image row takes one hue of the scheme.
                 </>
               ) : (
                 <>
-                  <b>{BAND_NOTE[kind][band]}.</b> Lattice edges run 0°/60°/120° and
-                  medians 30°/90°/150°, so a band is always <i>perpendicular</i> to
-                  a median; there is no median-parallel row.
+                  <b>{BAND_NOTE[kind][band]}.</b> The {mode}-fold brush carries it
+                  to <b>{span}</b> {span === 1 ? "row" : "rows"}
+                  {span < mode && (
+                    <>
+                      {" "}
+                      — fewer than {mode}, because the row is <i>fixed</i> by part
+                      of the subgroup
+                    </>
+                  )}
+                  . Turn on <b>weld</b> below to close the seams inside a row.
+                </>
+              )}
+            </p>
+
+            {/* The tape belongs with the BRUSH, not with the palette: its
+                length is `span` — how many orbit positions or image rows this
+                brush actually has — and only its hues come from the scheme. Put
+                under the band control, "6 rows → 6 hues" is legible at the
+                moment the band is chosen rather than a column away. */}
+            <div className={styles.subHead}>
+              <span className={styles.subTitle}>
+                {band === null ? "orbit colours" : "row colours"}
+              </span>
+              <span className={styles.sectionMeta}>
+                {reach === null ? `k = 0…${span - 1}` : `reach ${reach}`}
+              </span>
+            </div>
+            <div className={styles.tapeWrap}>
+              <div className={styles.tape} aria-hidden="true">
+                {tape.map((s, k) => (
+                  <span
+                    key={`${schemeName}-${span}-${k}-${s.hex}`}
+                    className={styles.tapeCell}
+                    style={{ background: s.hex, animationDelay: `${k * 45}ms` }}
+                  >
+                    <span className={styles.tapeIndex}>{k}</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+            <p className={styles.hint}>
+              {scheme.offsets.length < span ? (
+                <>
+                  <b>{scheme.offsets.length}</b>{" "}
+                  {scheme.offsets.length === 1 ? "hue" : "hues"} over{" "}
+                  <b>{span}</b> positions — a {scheme.offsets.length}-fold colour
+                  period in a {span}-fold shape.
+                </>
+              ) : band === null ? (
+                <>Every position gets its own hue; a pinned cell takes fewer.</>
+              ) : (
+                <>
+                  One hue per <b>row</b>, not per cell. Where two rows cross, the
+                  cell keeps the <i>earlier</i> row&rsquo;s colour.
                 </>
               )}
             </p>
@@ -1072,38 +1370,6 @@ export default function DrawPage() {
               })}
             </div>
 
-            <div className={styles.subHead}>
-              <span className={styles.subTitle}>orbit colours</span>
-              <span className={styles.sectionMeta}>
-                {reach === null ? `k = 0…${mode - 1}` : `reach ${reach}`}
-              </span>
-            </div>
-            <div className={styles.tapeWrap}>
-              <div className={styles.tape} aria-hidden="true">
-                {tape.map((s, k) => (
-                  <span
-                    key={`${schemeName}-${mode}-${k}-${s.hex}`}
-                    className={styles.tapeCell}
-                    style={{ background: s.hex, animationDelay: `${k * 45}ms` }}
-                  >
-                    <span className={styles.tapeIndex}>{k}</span>
-                  </span>
-                ))}
-              </div>
-            </div>
-            <p className={styles.hint}>
-              {scheme.offsets.length < mode ? (
-                <>
-                  <b>{scheme.offsets.length}</b>{" "}
-                  {scheme.offsets.length === 1 ? "hue" : "hues"} over{" "}
-                  <b>{mode}</b> positions —
-                  a {scheme.offsets.length}-fold colour period in a {mode}-fold
-                  shape.
-                </>
-              ) : (
-                <>Every position gets its own hue; a pinned cell takes fewer.</>
-              )}
-            </p>
           </section>
 
           <section className={styles.section}>
@@ -1198,6 +1464,70 @@ export default function DrawPage() {
                   {schemeName} · <b>{paint.size} painted</b>
                 </span>
               </span>
+
+              {/* The tool bench, IN the plate header rather than on a band of
+                  its own beneath it. It was a separate strip and it cost 73px
+                  of canvas height at 1512×950 — measured — while this row was
+                  already wrapping and had the width to carry it for free. The
+                  reasoning that put the tools here in the first place is
+                  unchanged: they act on the ARTWORK, and the hand that has just
+                  finished a stroke is already at the plate. */}
+              <div className={styles.bench}>
+                <div className={styles.benchGroup}>
+                  <span className={styles.benchKey} id="tool-key">
+                    tool
+                  </span>
+                  <div
+                    className={`${styles.seg} ${styles.toolSeg}`}
+                    role="group"
+                    aria-labelledby="tool-key"
+                  >
+                    {TOOLS.map((t) => (
+                      <button
+                        key={t}
+                        type="button"
+                        className={`${styles.segBtn} ${styles.toolBtn}`}
+                        aria-pressed={tool === t}
+                        aria-label={`${t} tool — ${TOOL_LABEL[t]}`}
+                        onClick={() => pickTool(t)}
+                      >
+                        <ToolGlyph tool={t} />
+                        {t}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                <div className={styles.benchGroup}>
+                  <span className={styles.benchKey} id="drag-key">
+                    drag
+                  </span>
+                  <div
+                    className={`${styles.seg} ${styles.dragSeg}`}
+                    role="group"
+                    aria-labelledby="drag-key"
+                  >
+                    {(["paint", "propose"] as DragMode[]).map((d) => (
+                      <button
+                        key={d}
+                        type="button"
+                        className={styles.segBtn}
+                        aria-pressed={dragMode === d}
+                        aria-label={
+                          d === "paint"
+                            ? "drag lays colour continuously"
+                            : "drag proposes a candidate; tap it to commit"
+                        }
+                        onClick={() => pickDragMode(d)}
+                      >
+                        {d}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+              </div>
+
               <span className={styles.tools}>
                 <button
                   type="button"
@@ -1239,133 +1569,89 @@ export default function DrawPage() {
                 >
                   png
                 </button>
+                {/* Never disabled: loading is the one action that is always
+                    available, including on an empty plate, which is the state
+                    a person who has just arrived with a file is in. */}
+                <button
+                  type="button"
+                  onClick={openPicker}
+                  aria-label="load an SVG drawing back onto the plate — or drop one on the canvas"
+                >
+                  load
+                </button>
+                <input
+                  ref={fileInput}
+                  type="file"
+                  accept=".svg,image/svg+xml"
+                  className={styles.fileInput}
+                  onChange={onPicked}
+                  tabIndex={-1}
+                  aria-hidden="true"
+                />
               </span>
             </div>
 
-            {/* The tools act on the artwork and live with it, not in the rail —
-                and the plate has the horizontal room the rail does not have the
-                vertical room for. */}
-            <div className={styles.bench} data-tool={tool}>
-              <div className={styles.benchGroup}>
-                <span className={styles.benchKey} id="tool-key">
-                  tool
+            {/* The adjustment palette keeps a strip of its own, because it is
+                the one bench control that is a GRID and the one that is absent
+                most of the time. Folding it into the header row would make the
+                header jump by a row the moment the tool changed; here it opens
+                below the rule it belongs under, and costs canvas height only
+                while the adjust brush is actually in the hand. */}
+            {tool === "adjust" && (
+              <div className={styles.adjustBar}>
+                <span className={styles.benchKey} id="adjust-key">
+                  adjustment
                 </span>
                 <div
-                  className={`${styles.seg} ${styles.toolSeg}`}
+                  className={styles.adjustGrid}
                   role="group"
-                  aria-labelledby="tool-key"
+                  aria-labelledby="adjust-key"
                 >
-                  {TOOLS.map((t) => (
+                  {ADJUST_NAMES.map((name) => (
                     <button
-                      key={t}
+                      key={name}
                       type="button"
-                      className={`${styles.segBtn} ${styles.toolBtn}`}
-                      aria-pressed={tool === t}
-                      aria-label={`${t} tool — ${TOOL_LABEL[t]}`}
-                      onClick={() => pickTool(t)}
+                      className={styles.adjustBtn}
+                      aria-pressed={adjustName === name}
+                      aria-label={ADJUSTMENTS[name].label}
+                      onClick={() => setAdjustName(name)}
                     >
-                      <ToolGlyph tool={t} />
-                      {t}
+                      <span
+                        className={styles.adjustChip}
+                        aria-hidden="true"
+                        style={{
+                          background: ADJUSTMENTS[name].apply(effectiveBase).hex,
+                        }}
+                      />
+                      {name}
                     </button>
                   ))}
                 </div>
               </div>
+            )}
 
-              <div className={styles.benchGroup}>
-                <span className={styles.benchKey} id="drag-key">
-                  drag
-                </span>
-                <div
-                  className={`${styles.seg} ${styles.dragSeg}`}
-                  role="group"
-                  aria-labelledby="drag-key"
+            {loadError !== null && (
+              <p className={styles.loadError} role="alert">
+                <span>{loadError}</span>
+                <button
+                  type="button"
+                  onClick={() => setLoadError(null)}
+                  aria-label="dismiss the load error"
                 >
-                  {(["paint", "propose"] as DragMode[]).map((d) => (
-                    <button
-                      key={d}
-                      type="button"
-                      className={styles.segBtn}
-                      aria-pressed={dragMode === d}
-                      aria-label={
-                        d === "paint"
-                          ? "drag lays colour continuously"
-                          : "drag proposes a candidate; tap it to commit"
-                      }
-                      onClick={() => pickDragMode(d)}
-                    >
-                      {d}
-                    </button>
-                  ))}
-                </div>
-              </div>
+                  dismiss
+                </button>
+              </p>
+            )}
 
-              {tool === "adjust" && (
-                <div className={`${styles.benchGroup} ${styles.benchWide}`}>
-                  <span className={styles.benchKey} id="adjust-key">
-                    adjustment
-                  </span>
-                  <div
-                    className={styles.adjustGrid}
-                    role="group"
-                    aria-labelledby="adjust-key"
-                  >
-                    {ADJUST_NAMES.map((name) => (
-                      <button
-                        key={name}
-                        type="button"
-                        className={styles.adjustBtn}
-                        aria-pressed={adjustName === name}
-                        aria-label={ADJUSTMENTS[name].label}
-                        onClick={() => setAdjustName(name)}
-                      >
-                        <span
-                          className={styles.adjustChip}
-                          aria-hidden="true"
-                          style={{
-                            background: ADJUSTMENTS[name].apply(effectiveBase).hex,
-                          }}
-                        />
-                        {name}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {candidateSpec !== null && (
-                <div className={`${styles.benchGroup} ${styles.benchEnd}`}>
-                  <span className={styles.benchKey}>candidate</span>
-                  <div className={styles.commitRow}>
-                    {/* Disabled at zero rather than hidden. An adjustment
-                        candidate over bare tiling really would do nothing, and
-                        a greyed COMMIT beside the dashed inert outlines says
-                        that better than a button that shrugs. */}
-                    <button
-                      type="button"
-                      className={styles.commitBtn}
-                      onClick={commitCandidate}
-                      disabled={candidateSpec.cells.length === 0}
-                      aria-label={
-                        candidateSpec.cells.length === 0
-                          ? "nothing to commit — the brush would change no cell here"
-                          : `commit the standing candidate — ${candidateSpec.cells.length} cells`
-                      }
-                    >
-                      commit {candidateSpec.cells.length}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={dropCandidate}
-                      aria-label="drop the standing candidate"
-                    >
-                      drop
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-
-            <div className={styles.canvasHold} data-tool={tool}>
+            <div
+              className={styles.canvasHold}
+              data-tool={tool}
+              data-drop={dropping ? "on" : undefined}
+              onDragEnter={onDragEnter}
+              onDragOver={onDragOver}
+              onDragLeave={onDragLeave}
+              onDrop={onDropFile}
+            >
               <DrawBoard
                 geom={canvas.geom}
                 paint={paint}
@@ -1397,11 +1683,57 @@ export default function DrawPage() {
                   {tool}
                 </span>
               )}
-              {paint.size === 0 && candidateSpec === null && (
+              {/* Commit rides ON the plate, opposite the tool flag.
+                  It used to sit in the tool strip, and from there it was a
+                  control that ARRIVED: a standing candidate pushed the strip to
+                  a third line and moved the canvas 44px down — measured —
+                  under the very finger that had just proposed. Floated over the
+                  corner it costs no layout height at all, so nothing moves when
+                  a proposal appears, and it is beside the ghost it acts on. */}
+              {candidateSpec !== null && (
+                <div className={styles.candidateBar}>
+                  <span className={styles.benchKey}>candidate</span>
+                  <div className={styles.commitRow}>
+                    {/* Disabled at zero rather than hidden. An adjustment
+                        candidate over bare tiling really would do nothing, and
+                        a greyed COMMIT beside the dashed inert outlines says
+                        that better than a button that shrugs. */}
+                    <button
+                      type="button"
+                      className={styles.commitBtn}
+                      onClick={commitCandidate}
+                      disabled={candidateSpec.cells.length === 0}
+                      aria-label={
+                        candidateSpec.cells.length === 0
+                          ? "nothing to commit — the brush would change no cell here"
+                          : `commit the standing candidate — ${candidateSpec.cells.length} cells`
+                      }
+                    >
+                      commit {candidateSpec.cells.length}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={dropCandidate}
+                      aria-label="drop the standing candidate"
+                    >
+                      drop
+                    </button>
+                  </div>
+                </div>
+              )}
+              {paint.size === 0 && candidateSpec === null && !dropping && (
                 <p className={styles.emptyHint}>
                   {dragMode === "propose"
                     ? "drag to propose — tap the ghost to commit"
                     : "click or drag to paint — every stroke is an orbit"}
+                </p>
+              )}
+              {/* The drop target is a state of the plate, not a separate
+                  surface: an overlay that appears only while a file is over it,
+                  so the canvas never gains furniture it does not need. */}
+              {dropping && (
+                <p className={styles.dropNote} aria-hidden="true">
+                  drop the SVG to load it
                 </p>
               )}
             </div>
@@ -1466,7 +1798,12 @@ export default function DrawPage() {
             <b>2r+1</b> cells — checked when the figure is built. Hexagon bands
             are <b>not</b> uniform and each meets exactly three sectors. Changing
             the canvas or the depth changes which cells exist, so the plate is
-            cleared rather than reinterpreted.
+            cleared rather than reinterpreted. An exported SVG carries the plate
+            back with it, in a comment: canvas, depth, convention and the painted
+            cells, so <b>load</b> is an exact restore rather than a reading of
+            the picture. A file without that comment is matched shape by shape
+            against this canvas instead, and the match rate is <i>reported</i>{" "}
+            rather than assumed — see <code>src/lib/artfile.ts</code>.
           </p>
         </div>
       </div>

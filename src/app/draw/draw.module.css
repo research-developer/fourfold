@@ -682,26 +682,23 @@
 
 /* ---------- the bench ---------- */
 
-/* Tools sit on the plate beside undo and export, not in the rail: they act on
-   the ARTWORK, and the plate has the horizontal room that the rail — already at
-   its height budget — does not have vertically. */
+/**
+ * Tools sit on the plate beside undo and export, not in the rail: they act on
+ * the ARTWORK, and the hand that has just finished a stroke is already here.
+ *
+ * They used to sit on a BAND OF THEIR OWN below the plate rule, and that band
+ * was measured at 1512×950: 62px plus an 11px margin plus its own rule, 73px
+ * of canvas height for two segmented controls. The plate rule above it was
+ * already wrapping to two lines with 100px of slack on the second, so the bench
+ * now rides INSIDE that rule and the row it needed was already being paid for.
+ * The canvas got the 73px.
+ */
 .bench {
-  --tool-accent: var(--bone);
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
   gap: 10px 16px;
-  padding-bottom: 11px;
-  margin-bottom: 11px;
-  border-bottom: 1px solid var(--rule);
-}
-
-.bench[data-tool="erase"] {
-  --tool-accent: #f0a3a3;
-}
-
-.bench[data-tool="adjust"] {
-  --tool-accent: #7dd3fc;
+  min-width: 0;
 }
 
 .benchGroup {
@@ -718,12 +715,16 @@
   color: var(--bone-faint);
 }
 
-.benchWide {
-  flex: 1 1 300px;
-}
-
-.benchEnd {
-  margin-left: auto;
+/* The adjustment grid, on its own strip under the rule. Present only while the
+   adjust brush is held, so the height it costs is height the tool asked for. */
+.adjustBar {
+  --tool-accent: #7dd3fc;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding-bottom: 11px;
+  margin-bottom: 11px;
+  border-bottom: 1px solid var(--rule);
 }
 
 .toolSeg,
@@ -798,6 +799,27 @@
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.5);
 }
 
+/* The standing proposal's own controls, floated over the plate opposite the
+   tool flag. Same visual grammar as `.modeFlag` — a dark chip with a hairline
+   — because it is the same kind of thing: a state of the artwork, stated on the
+   artwork. Unlike the flag it is interactive, so it does NOT drop pointer
+   events, and it appears only while a candidate is standing. */
+.candidateBar {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 5px;
+  padding: 6px 8px 7px;
+  border: 1px solid var(--rule-bright);
+  border-radius: 2px;
+  background: rgba(10, 9, 8, 0.82);
+  backdrop-filter: blur(2px);
+}
+
 .commitRow {
   display: flex;
   gap: 6px;
@@ -858,10 +880,17 @@
 /* ---------- plate ---------- */
 
 .plateCol {
-  /* Height the canvas is allowed to take. A drawing program whose canvas does
-     not fit on screen is a scroll bar with a hobby. The reserve counts the
-     masthead, the plate rule, the tool bench and the legend. */
-  --d-avail: calc(100dvh - 330px);
+  /**
+   * Height the canvas is allowed to take. A drawing program whose canvas does
+   * not fit on screen is a scroll bar with a hobby. The reserve counts the
+   * masthead, the plate rule and the legend.
+   *
+   * It counted the tool bench too, until the bench moved into the plate rule
+   * and stopped being a band of its own. 330 → 279 is exactly the 51px that
+   * move gave back, measured at 1512×950: the canvas went 704×620 to 762×671
+   * and the plate as a whole ended at the same height it did before.
+   */
+  --d-avail: calc(100dvh - 279px);
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -908,10 +937,19 @@
   border-width: 0 1px 1px 0;
 }
 
+/**
+ * The plate rule: status, bench and actions in ONE wrapping row.
+ *
+ * `space-between` is deliberately not used any more. With three groups on two
+ * lines it pushed the bench and the actions to opposite ends of an otherwise
+ * empty line, which read as two unrelated toolbars; packed from the start with
+ * the actions pushed right by `margin-left: auto`, the second line reads as one
+ * strip of controls with the destructive and export buttons kept at the far
+ * end, away from the tool the pointer is about to reach for.
+ */
 .plateRule {
   display: flex;
-  justify-content: space-between;
-  align-items: center;
+  align-items: flex-end;
   gap: 10px 18px;
   flex-wrap: wrap;
   font-size: 9.5px;
@@ -959,11 +997,13 @@
 }
 
 /* Actions live on the plate, not in the rail: they act on the artwork, and the
-   hand that just finished a stroke is already here. */
+   hand that just finished a stroke is already here. Pushed to the far end of
+   whichever line they land on, so `clear` is never adjacent to `paint`. */
 .tools {
   display: flex;
   gap: 5px;
   flex: none;
+  margin-left: auto;
 }
 
 .tools button {
@@ -986,6 +1026,7 @@
 
   /* Every bench group takes the full row and every target grows: a phone has
      one column of room and a thumb, not a pointer. */
+  .bench,
   .benchGroup {
     flex: 1 1 100%;
   }
@@ -1007,12 +1048,10 @@
     padding: 9px 8px;
     font-size: 9.5px;
   }
-  .benchEnd {
-    margin-left: 0;
-  }
+  /* A thumb, not a pointer — but the bar is floated over the artwork, so it
+     grows the targets without growing to the full width of the plate. */
   .commitRow button {
-    flex: 1;
-    padding: 11px 8px;
+    padding: 11px 10px;
   }
 }
 
@@ -1115,6 +1154,78 @@
     opacity: 0.9;
     transform: none;
   }
+}
+
+/* ---------- loading a file back ---------- */
+
+/* The file input is driven by the LOAD button and is never itself a tab stop:
+   two focusable controls for one action is one more than there is action. It
+   stays in the layout at zero size rather than `display: none`, because a
+   detached input is a `click()` some browsers decline to deliver. */
+.fileInput {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+  pointer-events: none;
+}
+
+/* A refusal states itself on the plate, beside the thing that refused. Rose
+   rather than red: this is the console's failure colour, already spoken by the
+   erase tool and the invalid hex field. */
+.loadError {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 0 0 11px;
+  padding: 8px 11px;
+  border: 1px solid rgba(240, 163, 163, 0.42);
+  border-left-width: 3px;
+  border-radius: 2px;
+  background: rgba(240, 163, 163, 0.07);
+  color: #f0a3a3;
+  font-size: 10px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.loadError button {
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 5px 9px;
+  color: inherit;
+  border-color: rgba(240, 163, 163, 0.42);
+}
+
+/* The plate accepting a drop. A dashed rule and a lift, so the state reads on a
+   monochrome screen as well as by colour. */
+.canvasHold[data-drop="on"]::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border: 1px dashed var(--lime);
+  border-radius: 3px;
+  background: rgba(163, 230, 53, 0.05);
+  pointer-events: none;
+}
+
+.dropNote {
+  position: absolute;
+  inset: auto 0 8% 0;
+  text-align: center;
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--lime);
+  pointer-events: none;
 }
 
 /* ---------- legend ---------- */

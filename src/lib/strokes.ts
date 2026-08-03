@@ -30,6 +30,7 @@
  * chosen by `orbit.ts`, which does exact integer key lookup.
  */
 
+import { encodeArt, type ArtPayload } from "./artfile";
 import type { BrushMode } from "./orbit";
 
 /** Cell index → `#rrggbb`. Absent means unpainted. */
@@ -274,6 +275,19 @@ export interface ArtworkSpec {
    * exports exactly the bytes it did.
    */
   weldPaint?: boolean;
+  /**
+   * The machine-readable statement of what this file IS, written as a comment
+   * immediately after the opening tag so a reader meets it before the drawing.
+   *
+   * The polygons alone are a picture; they do not say which canvas numbered the
+   * cells, so loading one back is a geometric guess. This says it outright, and
+   * makes a load an exact restore. See `artfile.ts` for the format and for why
+   * the payload lives in a comment rather than in an attribute.
+   *
+   * Optional and absent by default: a spec written before this existed exports
+   * exactly the bytes it did.
+   */
+  payload?: ArtPayload;
 }
 
 /**
@@ -335,6 +349,7 @@ export function artworkSvg(spec: ArtworkSpec): string {
       spec.height
     )}" width="${fmt(spec.width)}" height="${fmt(spec.height)}" role="img">`
   );
+  if (spec.payload !== undefined) parts.push(encodeArt(spec.payload));
   parts.push(`<title>${escapeText(spec.title)}</title>`);
   parts.push(
     `<rect width="${fmt(spec.width)}" height="${fmt(spec.height)}" fill="${spec.background}"/>`
