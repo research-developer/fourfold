@@ -155,6 +155,31 @@ function toXY(b: IVec, scale: number): [number, number] {
   ];
 }
 
+/**
+ * The triangle canvas, independent of depth.
+ *
+ * `buildFigure` returns these three numbers on every figure it builds, because
+ * the frame is a property of the CANVAS and not of the cut. Naming it once means
+ * the sector view — which frames one sector of the hexagon into exactly this
+ * triangle, and must land on the same pixels the standalone triangle always did
+ * — can ask for the frame without building a figure to read it off, and cannot
+ * come to disagree with it either. See `view.ts`.
+ */
+export const TRIANGLE_FRAME: {
+  readonly width: number;
+  readonly height: number;
+  /** Apex (A), bottom-left (B), bottom-right (C), in SVG pixels. */
+  readonly corners: readonly [
+    [number, number],
+    [number, number],
+    [number, number]
+  ];
+} = {
+  width: SIDE + 2 * PADDING,
+  height: SIDE * SQRT3_2 + 2 * PADDING,
+  corners: [toXY([1, 0, 0], 1), toXY([0, 1, 0], 1), toXY([0, 0, 1], 1)],
+};
+
 const half = (p: IVec, q: IVec): IVec => [
   (p[0] + q[0]) / 2,
   (p[1] + q[1]) / 2,
@@ -300,12 +325,15 @@ export function buildFigure(
     convention,
     cells,
     hub: cells.findIndex((c) => c.addr === "X".repeat(depth)),
-    width: SIDE + 2 * PADDING,
-    height: SIDE * SQRT3_2 + 2 * PADDING,
+    width: TRIANGLE_FRAME.width,
+    height: TRIANGLE_FRAME.height,
+    // `toXY([scale,0,0], scale)` is `toXY([1,0,0], 1)` — the corner does not
+    // move with the depth — so the frame is read from the one constant rather
+    // than recomputed here where it could drift from it.
     corners: [
-      toXY([scale, 0, 0], scale),
-      toXY([0, scale, 0], scale),
-      toXY([0, 0, scale], scale),
+      [TRIANGLE_FRAME.corners[0][0], TRIANGLE_FRAME.corners[0][1]],
+      [TRIANGLE_FRAME.corners[1][0], TRIANGLE_FRAME.corners[1][1]],
+      [TRIANGLE_FRAME.corners[2][0], TRIANGLE_FRAME.corners[2][1]],
     ],
   };
 }

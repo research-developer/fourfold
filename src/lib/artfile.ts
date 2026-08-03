@@ -103,6 +103,25 @@ export interface ArtPayload {
    * this field still sees the drawing.
    */
   plate?: [string, string][];
+  /**
+   * The sector the plate was FRAMED in when it was written, or absent for the
+   * whole hexagon.
+   *
+   * Display state, like the relief, and carried for the same reason: the
+   * polygons in the file are the ones that were on screen, and a sector view
+   * draws one sector turned apex-up. A file that did not say so could be
+   * reloaded — the payload names cells, not pictures — but could not be
+   * re-exported to the same bytes, and the round trip is the promise.
+   *
+   * Optional and NOT versioned, on the argument the other two optional fields
+   * make: absent means "the whole plate", which is what every file written
+   * before this existed showed and what a reader that predates it assumes.
+   *
+   * The PLATE is always whole. Only the picture is framed — a file exported from
+   * a sector view still carries every painted address in every sector, or
+   * switching view before saving would quietly destroy five sixths of a drawing.
+   */
+  view?: { sector: number };
 }
 
 /**
@@ -115,7 +134,23 @@ export interface ArtPayload {
  * depth buttons from these numbers, so the two cannot drift apart.
  */
 export const MIN_DEPTH = 1;
-export const MAX_DEPTH: Record<CanvasKind, number> = { triangle: 5, hexagon: 4 };
+/**
+ * The hexagon's ceiling used to be 4 and is now 5, and that is a REAL CHANGE
+ * rather than a loosening for its own sake.
+ *
+ * The triangle stopped being a canvas and became a VIEW of one sector of the
+ * hexagon, so a triangle file at depth 5 — 1024 cells, which this program has
+ * always been able to draw and export — is now a hexagon file at depth 5 with
+ * sector 0 painted. Leaving the hexagon at 4 would have made every one of those
+ * files loadable exactly once: readable as a triangle, and unwritable, because
+ * the re-export declares the canvas it now lives on. A ceiling that turns
+ * existing work into a one-way trip is not a ceiling worth keeping.
+ *
+ * The cost is stated rather than hidden: 6·4^5 = 6144 cells in the model.
+ * `test/view.test.ts` measures what that costs; `page.tsx` says what it means
+ * for the two views.
+ */
+export const MAX_DEPTH: Record<CanvasKind, number> = { triangle: 5, hexagon: 5 };
 
 /** Cells in a canvas: one wedge of 4^d, six of them on the hexagon. */
 export const cellCount = (canvas: CanvasKind, depth: number): number =>
@@ -199,6 +234,7 @@ export function encodeArt(p: ArtPayload): string {
       // field existed.
       relief: p.relief,
       plate: p.plate,
+      view: p.view,
     })
   );
   const line = `<!-- ${ART_MARKER}:${p.version} ${body} -->`;
@@ -297,6 +333,9 @@ function validate(version: number, raw: unknown): ArtPayload | null {
   const plate = validatePlate(o.plate, canvas);
   if (plate === REJECT) return null;
 
+  const view = validateView(o.view, canvas);
+  if (view === REJECT) return null;
+
   return {
     version,
     canvas,
@@ -305,6 +344,7 @@ function validate(version: number, raw: unknown): ArtPayload | null {
     cells: out,
     ...(relief ?? {}),
     ...(plate ?? {}),
+    ...(view ?? {}),
   };
 }
 
@@ -329,6 +369,27 @@ function validateRelief(
   const reading = r.reading as Reading;
   if (!READINGS.includes(reading)) return REJECT;
   return { relief: { on: r.on, reading } };
+}
+
+/**
+ * `undefined` for a file that says nothing about the framing — the whole plate,
+ * which is what every file written before this field existed showed.
+ *
+ * A sector on a TRIANGLE file is rejected rather than ignored: the triangle has
+ * no sectors, so a file claiming one disagrees with its own canvas, and this
+ * module's rule for that has always been to refuse the payload rather than to
+ * guess which half of it was meant.
+ */
+function validateView(
+  raw: unknown,
+  canvas: CanvasKind
+): { view: { sector: number } } | undefined | typeof REJECT {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return REJECT;
+  if (canvas !== "hexagon") return REJECT;
+  const s = (raw as Record<string, unknown>).sector;
+  if (typeof s !== "number" || !Number.isInteger(s) || s < 0 || s > 5) return REJECT;
+  return { view: { sector: s } };
 }
 
 /**
@@ -438,7 +499,12 @@ export function payloadFromPaint(
    * which is what `plateEntries` returns for a drawing that never left one
    * depth — and the field is omitted and the bytes are unchanged.
    */
-  plate?: readonly (readonly [string, string])[]
+  plate?: readonly (readonly [string, string])[],
+  /**
+   * The framed sector, when the picture is one. `undefined` — the whole plate —
+   * writes exactly the bytes it wrote before this field existed.
+   */
+  view?: { sector: number }
 ): ArtPayload {
   const n = cellCount(canvas, depth);
   const cells: [number, string][] = [];
@@ -472,6 +538,15 @@ export function payloadFromPaint(
     cells,
     ...(relief === undefined ? {} : { relief }),
     ...(addressed === undefined ? {} : { plate: addressed }),
+    // Dropped rather than thrown, on the rule the cell list already follows.
+    // Unreachable from this program, whose view control cannot leave 0…5.
+    ...(view === undefined ||
+    canvas !== "hexagon" ||
+    !Number.isInteger(view.sector) ||
+    view.sector < 0 ||
+    view.sector > 5
+      ? {}
+      : { view: { sector: view.sector } }),
   };
 }
 
@@ -605,13 +680,24 @@ const pointsOf = (raw: string): [number, number][] | null => {
  */
 export function importByGeometry(
   svgText: string,
-  canvas: Figure | Hexagon
+  canvas: Figure | Hexagon,
+  /**
+   * The cells AS DRAWN, index-aligned to the canvas, when the view moves them.
+   *
+   * The sector view frames one sector of the hexagon and turns it apex-up, so
+   * the polygons a file exported from it carries are not the model's own pixels.
+   * Matching a foreign file against the model's pixels while the screen shows
+   * something else would report a match rate about a picture nobody has. Absent
+   * — which is every caller that draws the plate where it was built — this is
+   * the canvas's own vertices and nothing changes.
+   */
+  drawn?: readonly { readonly verts: readonly (readonly [number, number])[] }[]
 ): GeometricImport {
   const matched = new Map<number, Swatch>();
   if (typeof svgText !== "string") return { matched, total: 0, unmatched: 0 };
 
   const byShape = new Map<string, number>();
-  canvas.cells.forEach((c, i) => byShape.set(shapeKey(c.verts), i));
+  (drawn ?? canvas.cells).forEach((c, i) => byShape.set(shapeKey(c.verts), i));
 
   let total = 0;
   let unmatched = 0;

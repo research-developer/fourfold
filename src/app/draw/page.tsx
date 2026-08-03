@@ -20,13 +20,7 @@ import DrawBoard, {
   type ViewWindow,
 } from "@/components/DrawBoard";
 import { ADJUSTMENTS, ADJUST_NAMES, type AdjustName } from "@/lib/adjust";
-import {
-  ARMS,
-  armCensus,
-  armMask,
-  clipStamp,
-  type Isolation,
-} from "@/lib/arms";
+import { ARMS, armMaskOver, clipStamp, type Isolation } from "@/lib/arms";
 import {
   cellCount,
   extractArt,
@@ -42,6 +36,7 @@ import {
   planPlateEdits,
   plateEntries,
   plateFromArtPayload,
+  plateIntoSector,
   resolvePlate,
   type Address,
   type AddressPlate,
@@ -49,11 +44,19 @@ import {
 } from "@/lib/plate";
 import {
   BAND_FAMILIES,
-  bandSizes,
   buildBandSurface,
+  sectorBandFamily,
   type BandFamily,
   type BandSurface,
 } from "@/lib/bands";
+import {
+  applyAffine,
+  plateFrame,
+  pointsOf,
+  wrapSector,
+  type Affine,
+  type PlateView,
+} from "@/lib/view";
 import {
   activeProgression,
   BAND_NOTE,
@@ -73,7 +76,7 @@ import {
   type EventLog,
   type Tool,
 } from "@/lib/brush";
-import { buildFigure, type Convention, type Figure } from "@/lib/figure";
+import { buildFigure, type Convention } from "@/lib/figure";
 import { buildHexagon, type Hexagon } from "@/lib/hexagon";
 import {
   clipToRegion,
@@ -97,11 +100,9 @@ import {
 import { SHORTCUTS } from "@/lib/shortcuts";
 import {
   hexagonSurface,
-  triangleSurface,
   BRUSH_SCOPES,
   SCOPE_LABEL,
   SCOPE_MODES,
-  TRIANGLE_MODES,
   type BrushMode,
   type BrushScope,
   type CanvasKind,
@@ -146,6 +147,7 @@ import {
 } from "@/lib/strokes";
 import BrushDial from "./BrushDial";
 import ColourWell from "./ColourWell";
+import SectorDial, { SectorGlyph } from "./SectorDial";
 import styles from "./draw.module.css";
 
 /**
@@ -156,6 +158,40 @@ import styles from "./draw.module.css";
  * the drawing's colour structure is not decoration laid over its symmetry — it
  * is a reading of that symmetry. A 6-orbit painted with the triad comes out
  * with a 3-fold colour period, which is exactly the relation C3 < C6.
+ *
+ * ── One model, two views ────────────────────────────────────────────────
+ *
+ * There used to be two canvases with two INCOMPATIBLE ADDRESS SPACES — the
+ * triangle's `ABX` and the hexagon's `s3:ABX` — so switching between them threw
+ * the drawing away, behind a guard, because nothing painted on one named
+ * anything on the other. There is one model now: the hexagon, always, addressed
+ * `s0:` … `s5:`. The triangle is a VIEW of it.
+ *
+ * That is not an approximation and it is not a new construction. `buildHexagon`
+ * builds every sector by applying an exact integer lattice rotation to
+ * `buildFigure(depth, convention)`, and sector 0 applies the identity — so the
+ * sector view at depth d is the old triangle canvas cell for cell, address for
+ * address, in the same order. `test/view.test.ts` asserts it rather than saying
+ * it. The sector's own D₃ is the SECTOR brush scope, which `orbit.ts` already
+ * had; a triangle row is a hexagon band clipped to a sector, still 2r+1 cells
+ * wide; the arm isolation nests inside a sector instead of replacing it.
+ *
+ * So CHANGING THE VIEW DESTROYS NOTHING. It frames a different region of one
+ * plate. The only destructive control left on the page is NEW.
+ *
+ * The sector view rotates in the RENDER LAYER only — see `view.ts`. Turning the
+ * lattice instead would change every exact integer key, and with it every band,
+ * every orbit, every ring and every address in the file.
+ *
+ * ── What the sector view gains that the standalone triangle could not ────
+ *
+ * The relief. It was hexagon-only because on a bare triangle the height field
+ * H = |band_A| + |band_B| + |band_C| is FLAT — measured, two values at every
+ * depth — so there was nothing to curve. A sector of the hexagon carries the
+ * HEXAGON's H, whose bands run across the seams, and it takes 2^(d+1) − 1
+ * distinct values inside one sector: 31 at depth 4 against the triangle's 2.
+ * So the toggle is offered in both views now, and `test/view.test.ts` measures
+ * the spread rather than asserting it.
  *
  * ── Convention ──────────────────────────────────────────────────────────
  *
@@ -204,31 +240,49 @@ const CONVENTION: Convention = "apex";
 /**
  * The depths on offer, taken from the loader's ceiling rather than written out.
  *
- * Triangle depth 5 is 1024 cells; hexagon depth 4 is 1536, six sectors of 4^4.
- * Both stay under the point where a full re-render is felt, and the layer split
- * in DrawBoard means only the paint layer is ever redrawn. `artfile.ts` refuses
- * to load a plate deeper than a button here can select, so the two lists are
- * the same list — a second copy of these numbers would be a way for a file to
- * become loadable but not selectable.
+ * ONE list now, because there is one model. `artfile.ts` refuses to load a plate
+ * deeper than a button here can select, so the two cannot drift — a second copy
+ * of these numbers would be a way for a file to become loadable but not
+ * selectable.
+ *
+ * ── What depth 5 costs, measured rather than guessed ────────────────────
+ *
+ * The old triangle went to depth 5, 1024 cells, and the hexagon stopped at 4.
+ * Unified, depth 5 is 6·4^5 = 6144 cells in the model, and the ceiling had to
+ * rise to 5 or every depth-5 triangle file ever exported would have become
+ * unreadable — see `MAX_DEPTH` in `artfile.ts`.
+ *
+ * `test/view.test.ts` measures the model at that size: the build is ~2.5 ms, the
+ * band and lattice tables ~1.5 ms, the twelve D₆ index maps and their orbit
+ * table ~6 ms, a relief frame ~3 ms, and one brush application through the
+ * address plate ~0.7 ms. Every one of those is a fraction of a frame and none
+ * of them is the reason to hesitate.
+ *
+ * The DOM is. The board draws one polygon per cell in the tiling layer and one
+ * in the transparent hit layer, so a depth-5 HEXAGON view is 12 288 nodes where
+ * the old maximum was 3072. The sector view is 2048 — the same as the old
+ * triangle at depth 5, exactly, because it is the old triangle at depth 5.
+ *
+ * So the ceiling is 5 and it is not capped further, on the grounds that the
+ * expensive case is one view of one depth, it is reached by a deliberate press,
+ * and the layers are memoised so the cost is paid on arrival rather than per
+ * stroke. What IS done about it is the frame: the sector view renders only the
+ * sector, so the deep end of the program is affordable in the view that most
+ * wants it.
  */
-const DEPTHS: Record<CanvasKind, number[]> = {
-  triangle: Array.from(
-    { length: MAX_DEPTH.triangle - MIN_DEPTH + 1 },
-    (_, k) => MIN_DEPTH + k
-  ),
-  hexagon: Array.from(
-    { length: MAX_DEPTH.hexagon - MIN_DEPTH + 1 },
-    (_, k) => MIN_DEPTH + k
-  ),
-};
+const DEPTHS: number[] = Array.from(
+  { length: MAX_DEPTH.hexagon - MIN_DEPTH + 1 },
+  (_, k) => MIN_DEPTH + k
+);
 
-/** Canvas units per cell edge — the triangle is drawn at twice the hexagon's. */
-const edgeAt = (kind: CanvasKind, depth: number) =>
-  (kind === "triangle" ? 1024 : 512) / 2 ** depth;
-
-/** A hairline that stays a hairline from 4 cells to 1536 of them. */
-const seamAt = (kind: CanvasKind, depth: number) =>
-  Math.min(2.4, Math.max(0.4, edgeAt(kind, depth) * 0.022));
+/**
+ * A hairline that stays a hairline from 6 cells to 6144 of them.
+ *
+ * `edge` comes from the view rather than from the depth alone: the sector view
+ * doubles the plate to fill the triangle canvas, so its cells are twice the
+ * size the same depth draws at in hexagon view and its seam has to be too.
+ */
+const seamAt = (edge: number) => Math.min(2.4, Math.max(0.4, edge * 0.022));
 
 /**
  * The export's plate is FLAT, where the board's is a radial gradient.
@@ -284,7 +338,9 @@ const coarseNow = () => window.matchMedia("(pointer: coarse)").matches;
 const coarseOnServer = () => false;
 
 interface Canvas {
-  kind: CanvasKind;
+  /** The model. Always the hexagon; the view says which part is drawn. */
+  hex: Hexagon;
+  view: PlateView;
   geom: BoardGeometry;
   frame: CanvasFrame;
   centroids: Pt[];
@@ -297,16 +353,20 @@ interface Canvas {
    */
   lattice: LatticeView;
   /**
-   * The built figure itself, kept so a load can match a foreign file's polygons
-   * against the cells' own vertices. `geom.cells` is the same geometry already
-   * flattened for the board, but the importer's signature is stated in terms of
-   * the figure, which is the thing that knows how it was numbered.
+   * The BASE triangle's lattice, for one readout and nothing else.
+   *
+   * "Row r from the apex" is a triangle fact — `rowOf` returns −1 on the hexagon,
+   * which has no apex — and it is the sentence the sector view wants, because a
+   * sector IS the base triangle. 4^d cells to build against the model's 6·4^d.
    */
-  fig: Figure | Hexagon;
-  /** The hexagon, when this is one. `null` on the triangle. */
-  hex: Hexagon | null;
-  /** The triangle, when this is one. `null` on the hexagon. */
-  tri: Figure | null;
+  baseLattice: LatticeView;
+  /** Model pixels → the pixels on screen. The identity in hexagon view. */
+  toView: Affine;
+  fromView: Affine;
+  /** The cells this view draws, ascending. */
+  shown: number[];
+  /** Whether a cell is in the frame. An array lookup, not a search. */
+  inView: (i: number) => boolean;
 }
 
 const TOOL_LABEL: Record<Tool, string> = {
@@ -356,25 +416,38 @@ function ToolGlyph({ tool }: { tool: Tool }) {
 }
 
 export default function DrawPage() {
-  const [kind, setKind] = useState<CanvasKind>("triangle");
+  /**
+   * Which part of the one plate is framed. NOT which plate — there is one.
+   *
+   * `hexagon` draws all six sectors as the model builds them. `sector` draws one,
+   * turned apex-up, which is the triangle this program used to hold as a separate
+   * canvas. Switching between them is a change of frame and touches nothing.
+   */
+  const [viewMode, setViewMode] = useState<"hexagon" | "sector">("sector");
+  /**
+   * Which sector is framed, and — in hexagon view — which one a SECTOR-scoped
+   * brush is pointed at. One number for both, because they are the same question
+   * asked of the same figure, and two would let the overlay and the frame drift.
+   */
+  const [sector, setSector] = useState(0);
   const [depth, setDepth] = useState(4);
   /** Drawn at `apex`; only a loaded file can move it. See the header. */
   const [convention, setConvention] = useState<Convention>(CONVENTION);
   const [mode, setMode] = useState<BrushMode>(6);
   /**
-   * Whose symmetries the brush uses. Only the hexagon has more than one answer;
-   * see the note on `BrushScope`. A triangle IS a sector, so scoping it to one
-   * would be the identity dressed as a control.
+   * Whose symmetries the brush uses, in HEXAGON view; see the note on
+   * `BrushScope`. The sector view has no choice to make — a framed sector's own
+   * D₃ is what the old triangle canvas always had — so it is forced to `sector`
+   * there and the control is not shown.
    */
   const [scope, setScope] = useState<BrushScope>("hexagon");
-  /** The sector the pointer was last in — what a SECTOR brush is scoped to. */
-  const [sector, setSector] = useState(0);
   /**
-   * The triangle's answer to the hexagon's scope: one ftype ARM at a time.
+   * One ftype ARM at a time, INSIDE the framed sector.
    *
-   * `null` is off. Only the triangle offers it — a hexagon sector already IS a
-   * triangle, and stacking an arm inside a sector would be a control whose two
-   * halves nobody can hold in mind at once.
+   * `null` is off. Offered in the sector view alone, which is the nesting the
+   * figure actually has: hexagon, then sector, then arm. In hexagon view the
+   * scope control is the same question asked one level up, and stacking both
+   * would be a pair of controls nobody can hold in mind at once.
    */
   const [isolation, setIsolation] = useState<Isolation>(null);
   const [reliefOn, setReliefOn] = useState(false);
@@ -435,7 +508,7 @@ export default function DrawPage() {
    * second click lands on the same pixels as the first — which is the property
    * that makes it a guard and not a lottery.
    */
-  const [armed, setArmed] = useState<"new" | CanvasKind | null>(null);
+  const [armed, setArmed] = useState<"new" | null>(null);
   const disarmAt = useRef<number | null>(null);
 
   const [helpOpen, setHelpOpen] = useState(false);
@@ -494,59 +567,76 @@ export default function DrawPage() {
 
   const scheme = SCHEMES[schemeName];
   const adjust = ADJUSTMENTS[adjustName];
-  const modes = kind === "triangle" ? TRIANGLE_MODES : SCOPE_MODES[scope];
+  /**
+   * The scope the brush is actually under.
+   *
+   * The sector view forces it, rather than the control being disabled there: a
+   * framed sector's brush is the sector's own D₃ by definition, and the `scope`
+   * state is left where the user put it so returning to hexagon view returns to
+   * the group they had chosen.
+   */
+  const effScope: BrushScope = viewMode === "sector" ? "sector" : scope;
+  const modes = SCOPE_MODES[effScope];
   /** A sector is a copy of the base triangle, so a sector brush wears D₃'s face. */
-  const glyphKind: CanvasKind =
-    kind === "hexagon" && scope !== "hexagon" ? "triangle" : kind;
+  const glyphKind: CanvasKind = effScope === "hexagon" ? "hexagon" : "triangle";
 
   // A finger has no hover, so the ghost preview — the thing that teaches what
   // the brush does — is unreachable on touch unless the press itself proposes.
   const coarse = useSyncExternalStore(subscribeCoarse, coarseNow, coarseOnServer);
   const dragMode = dragChoice ?? defaultDragMode(coarse);
 
+  /**
+   * The model. One figure, rebuilt only when the cut changes.
+   *
+   * Split out from the view below on purpose: the band table, the lattice and
+   * the orbit tables are facts about the HEXAGON and do not move when the frame
+   * does, so switching view must not pay for them again. At depth 5 that is the
+   * difference between a frame change costing ~1 ms and costing ~10.
+   */
+  const hex = useMemo(() => buildHexagon(depth, convention), [depth, convention]);
+  const bands = useMemo(() => buildBandSurface(hex), [hex]);
+  const lattice = useMemo(() => latticeView(hex), [hex]);
+  const baseLattice = useMemo(() => latticeView(hex.base), [hex]);
+  const surface = useMemo(() => hexagonSurface(hex, effScope), [hex, effScope]);
+
+  const plateView = useMemo<PlateView>(
+    () => ({ mode: viewMode, sector }),
+    [viewMode, sector]
+  );
+
   const canvas: Canvas = useMemo(() => {
-    const seamWidth = seamAt(kind, depth);
-    if (kind === "triangle") {
-      const f = buildFigure(depth, convention);
-      return {
-        kind,
-        geom: {
-          width: f.width,
-          height: f.height,
-          outline: f.corners,
-          cells: f.cells,
-          seamWidth,
-        },
-        frame: { kind: "triangle", corners: f.corners },
-        centroids: f.cells.map((c) => c.centroid),
-        surface: triangleSurface(f),
-        bands: buildBandSurface(f),
-        lattice: latticeView(f),
-        fig: f,
-        hex: null,
-        tri: f,
-      };
-    }
-    const h = buildHexagon(depth, convention);
+    const pf = plateFrame(hex, plateView);
+    const framed = pf.view.mode === "sector";
+    const inFrame = new Uint8Array(hex.cells.length);
+    for (const i of pf.shown) inFrame[i] = 1;
+    const [A, B, C] = pf.outline;
     return {
-      kind,
+      hex,
+      view: pf.view,
       geom: {
-        width: h.width,
-        height: h.height,
-        outline: h.corners,
-        cells: h.cells,
-        seamWidth,
+        width: pf.width,
+        height: pf.height,
+        outline: pf.outline,
+        cells: pf.cells,
+        seamWidth: seamAt(pf.edge),
+        // Absent in hexagon view, so the board walks its own indices exactly as
+        // it always did and nothing is filtered on the common path.
+        shown: framed ? pf.shown : undefined,
       },
-      frame: { kind: "hexagon", centre: h.centre, radius: h.radius },
-      centroids: h.cells.map((c) => c.centroid),
-      surface: hexagonSurface(h, scope),
-      bands: buildBandSurface(h),
-      lattice: latticeView(h),
-      fig: h,
-      hex: h,
-      tri: null,
+      frame: framed
+        ? { kind: "triangle", corners: [A, B, C] }
+        : { kind: "hexagon", centre: hex.centre, radius: hex.radius },
+      centroids: pf.cells.map((c) => c.centroid),
+      surface,
+      bands,
+      lattice,
+      baseLattice,
+      toView: pf.transform,
+      fromView: pf.inverse,
+      shown: pf.shown,
+      inView: (i) => inFrame[i] === 1,
     };
-  }, [kind, depth, convention, scope]);
+  }, [hex, plateView, surface, bands, lattice, baseLattice]);
 
   /**
    * The canvas's addresses, and the plate resolved onto them.
@@ -558,7 +648,7 @@ export default function DrawPage() {
    * old numbering to throw away. `resolvePlate` is memoised on plate identity,
    * so this costs one lookup on a re-render that changed neither.
    */
-  const book = useMemo(() => addressBook(canvas.fig), [canvas]);
+  const book = useMemo(() => addressBook(hex), [hex]);
   const paint = useMemo(() => resolvePlate(plate, book), [plate, book]);
 
   /**
@@ -587,36 +677,39 @@ export default function DrawPage() {
   }, [zoom, centre, canvas]);
 
   /**
-   * Which cells the brush may touch — the ISOLATE control, triangle only.
+   * Which cells the brush may touch — the ISOLATE control, sector view only.
    *
-   * The hexagon already has a scope; the triangle's answer is the three ftype
-   * arms, which are a genuine partition of the board minus the hub rather than a
-   * mask. See `arms.ts`, including why the hub is excluded and what clipping
-   * costs the 3- and 6-fold brushes.
+   * The three ftype arms are a genuine partition of a sector minus its hub
+   * rather than a mask, and membership is the first non-X digit of the address,
+   * which every hexagon cell carries because every one of them is a copy of a
+   * base triangle cell. See `arms.ts`, including why the hub is excluded and
+   * what clipping costs the 3- and 6-fold brushes.
+   *
+   * No sector test is needed: the SECTOR-scoped surface cannot carry a cell out
+   * of its own sector, and only the framed sector is on screen to be clicked.
    */
   const keepCell = useMemo(
-    () => (canvas.tri === null ? () => true : armMask(canvas.tri, isolation)),
-    [canvas, isolation]
+    () => armMaskOver(hex.cells, viewMode === "sector" ? isolation : null),
+    [hex, viewMode, isolation]
   );
 
-  /** `(4^d − 1)/3` — the size §D predicts, read off the figure rather than retyped. */
-  const armSize = useMemo(
-    () => (canvas.tri === null ? 0 : armCensus(canvas.tri).predicted),
-    [canvas]
-  );
+  /** `(4^d − 1)/3` — the size §D predicts for one arm of one sector. */
+  const armSize = (4 ** depth - 1) / 3;
 
   /**
    * Which sectors the axis overlay draws in.
    *
-   * `null` is the whole plate and its six diameters. A single sector draws that
-   * sector's three medians and nothing else, because a sector brush mirrors
-   * about them and about no diameter — see `symmetryGuides`. SECTOR ×6 draws all
-   * six copies, which is what the group actually contains.
+   * `null` is whatever the FRAME is: the whole plate and its six diameters in
+   * hexagon view, and — because the sector view hands `symmetryGuides` a
+   * triangle frame — that sector's own three medians in sector view, which is
+   * exactly the overlay the standalone triangle canvas drew. A SECTOR scope
+   * inside the hexagon view names the one sector it acts in, and SECTOR ×6 all
+   * six copies, which is what that group actually contains.
    */
   const guideSectors = useMemo(() => {
-    if (kind !== "hexagon" || scope === "hexagon") return null;
+    if (viewMode === "sector" || scope === "hexagon") return null;
     return scope === "sector" ? [sector] : [0, 1, 2, 3, 4, 5];
-  }, [kind, scope, sector]);
+  }, [viewMode, scope, sector]);
 
   const guides = useMemo(
     () =>
@@ -624,9 +717,9 @@ export default function DrawPage() {
         canvas.frame,
         mode,
         guideSectors,
-        scope === "sector6" ? 6 : 0
+        viewMode === "hexagon" && scope === "sector6" ? 6 : 0
       ),
-    [canvas, mode, guideSectors, scope]
+    [canvas, mode, guideSectors, scope, viewMode]
   );
 
   /**
@@ -652,12 +745,14 @@ export default function DrawPage() {
    */
   const noteSector = useCallback(
     (i: number | null) => {
-      const h = canvas.hex;
-      if (h === null || i === null) return;
-      const c = h.cells[i];
-      if (c !== undefined) setSector(c.sector);
+      if (i === null) return;
+      const c = hex.cells[i];
+      // In SECTOR view the frame already decides the sector, and following the
+      // pointer would be the frame chasing itself: every cell on screen is in
+      // the framed sector, so this could only ever be a no-op or a bug.
+      if (c !== undefined && viewMode === "hexagon") setSector(c.sector);
     },
-    [canvas]
+    [hex, viewMode]
   );
 
   const onHover = useCallback(
@@ -673,15 +768,15 @@ export default function DrawPage() {
   /**
    * The relief's static half: vertex offsets and their exact ring indices.
    *
-   * Hexagon only. The six-point construction reads six corresponding cells off
-   * a C6 orbit, and a triangle has no C6; the band-size height field is FLAT
-   * there as well — two values at every depth, measured — so there is nothing
-   * for the toggle to do and it is not offered.
+   * A function of the MODEL and not of the view, so it survives a frame change
+   * untouched — which is the point. It used to be offered on the hexagon canvas
+   * alone, because a standalone triangle has no C6 to read six corresponding
+   * cells off and its band-size height field is measurably flat, two values at
+   * every depth. A SECTOR of the hexagon has neither problem: the six cells are
+   * still there in the model, and the height field it carries is the hexagon's,
+   * which takes 2^(d+1) − 1 values inside one sector. See `test/view.test.ts`.
    */
-  const reliefSurface = useMemo<ReliefSurface | null>(
-    () => (canvas.hex === null ? null : buildRelief(canvas.hex)),
-    [canvas]
-  );
+  const reliefSurface = useMemo<ReliefSurface>(() => buildRelief(hex), [hex]);
 
   /**
    * The template ring: the shell of the cell under the pointer, which is the
@@ -690,29 +785,48 @@ export default function DrawPage() {
    * entire reason a 1536-cell display effect is affordable.
    */
   const ring =
-    reliefSurface === null
-      ? 0
-      : seedCell === null
+    seedCell === null
       ? restShell(reliefSurface)
       : templateShell(reliefSurface, seedCell);
 
   const frame = useMemo(
-    () =>
-      reliefSurface === null || !reliefOn
-        ? null
-        : reliefFrame(reliefSurface, ring, reading),
+    () => (reliefOn ? reliefFrame(reliefSurface, ring, reading) : null),
     [reliefSurface, reliefOn, ring, reading]
   );
 
+  /**
+   * The relief, moved into the view's own pixels.
+   *
+   * `reliefFrame` deforms the model, in the model's coordinates; the sector view
+   * then carries the whole plate through one similarity. Composing them is the
+   * only honest order — deform, then frame — and the guide bend has to be
+   * conjugated the same way, `T ∘ deform ∘ T⁻¹`, or the axes would ride a bulge
+   * that is not the one under them. In hexagon view the transform is the
+   * identity and the strings are handed straight through, so the common path
+   * allocates nothing it did not before.
+   */
   const relief = useMemo<ReliefView | null>(() => {
-    if (frame === null || reliefSurface === null) return null;
+    if (frame === null) return null;
+    const scales = frame.scales;
+    const bare = (p: readonly [number, number]) =>
+      deformPoint(reliefSurface, scales, p);
+    if (canvas.view.mode === "hexagon") {
+      return {
+        points: frame.points,
+        centroids: frame.centroids,
+        wash: frame.wash,
+        bend: bare,
+      };
+    }
+    const m = canvas.toView;
+    const inv = canvas.fromView;
     return {
-      points: frame.points,
-      centroids: frame.centroids,
+      points: frame.verts.map((v) => pointsOf(v, m)),
+      centroids: frame.centroids.map((p) => applyAffine(m, p)),
       wash: frame.wash,
-      bend: (p) => deformPoint(reliefSurface, frame.scales, p),
+      bend: (p) => applyAffine(m, bare(applyAffine(inv, p))),
     };
-  }, [frame, reliefSurface]);
+  }, [frame, reliefSurface, canvas]);
 
   // ── the colour the next stroke will start from ──────────────────────────
 
@@ -732,7 +846,29 @@ export default function DrawPage() {
     [prog, base, driftIndex]
   );
 
-  const shape = useMemo(() => ({ mode, band }), [mode, band]);
+  /** Which canvas the band NOTES describe — a framed sector is the triangle. */
+  const bandKind: CanvasKind = viewMode === "sector" ? "triangle" : "hexagon";
+
+  /**
+   * The lattice family the chosen letter names IN THIS FRAME.
+   *
+   * A sector is the base triangle rotated by 60°·s, and a rotation permutes the
+   * three lattice line families, so the hexagon family that runs parallel to a
+   * framed sector's outer edge depends on the sector. The sector view turns the
+   * sector back apex-up, so "band A" there has to go on meaning the rows the
+   * triangle has always called A whichever sector is framed — otherwise the
+   * letter would name a different direction under an identical picture. The
+   * identity in sectors 0 and 3, and in hexagon view. See `sectorBandFamily`.
+   */
+  const effBand = useMemo(
+    () =>
+      band === null || viewMode === "hexagon"
+        ? band
+        : sectorBandFamily(band, sector),
+    [band, viewMode, sector]
+  );
+
+  const shape = useMemo(() => ({ mode, band: effBand }), [mode, effBand]);
 
   /**
    * How many scheme positions this brush uses — and it is NOT always the mode.
@@ -948,7 +1084,7 @@ export default function DrawPage() {
    * rest of the session. Escape and a blur disarm it too, so the three ways a
    * person abandons an action all work.
    */
-  const arm = useCallback((what: "new" | CanvasKind, said: string) => {
+  const arm = useCallback((what: "new", said: string) => {
     if (disarmAt.current !== null) window.clearTimeout(disarmAt.current);
     setArmed(what);
     disarmAt.current = window.setTimeout(() => {
@@ -1007,44 +1143,80 @@ export default function DrawPage() {
   };
 
   /**
-   * The canvas still clears, and the depth no longer does.
+   * Changing the VIEW clears nothing, and that is the whole change.
    *
-   * The difference is what the address space IS. A depth change refines or
-   * coarsens the same words, so every address a stroke named is still an
-   * address. A canvas change swaps the alphabet — the hexagon's addresses carry
-   * a sector tag and the triangle's do not — so nothing painted on one names
-   * anything on the other, and carrying the plate across would be inventing a
-   * correspondence the geometry does not have.
+   * The canvas toggle that used to sit here was destructive for a reason that no
+   * longer exists: the triangle and the hexagon were two address spaces, `ABX`
+   * against `s3:ABX`, and nothing painted on one named anything on the other. It
+   * is one space now. A frame change moves the camera; every address the plate
+   * holds is still an address, in every sector, including the five this frame
+   * does not draw. So there is no guard, no confirm and no wipe — the plate is
+   * not at risk, and a guard that fires when there is no risk teaches people to
+   * click through guards.
    *
-   * So it stays destructive, and it goes behind the SAME guard as NEW: on a
-   * plate with paint on it the shape button arms first and switches second. On
-   * an empty plate there is nothing to lose and it switches immediately, because
-   * a guard that fires when there is no risk teaches people to click through
-   * guards.
+   * Two things do move, and neither is the drawing. Mode 12 is a subgroup of D₆
+   * and of nothing else, so a sector frame — whose brush is the sector's own D₃ —
+   * drops to 6, the same rule `pickScope` has always applied. And the zoom is
+   * reset, because a window in the hexagon's pixels means nothing in a frame that
+   * is twice the scale and turned by 120°.
    */
-  const pickKind = (next: CanvasKind) => {
-    if (next === kind) return;
-    if (plateRef.current.size > 0 && armed !== next) {
-      arm(
-        next,
-        `switching to the ${next} would clear ${plateRef.current.size} painted address${
-          plateRef.current.size === 1 ? "" : "es"
-        } — the two canvases do not share addresses. Click again to confirm, or press Escape`
-      );
-      return;
-    }
-    disarm();
-    const d = Math.min(depth, Math.max(...DEPTHS[next]));
-    const m = next === "triangle" && mode === 12 ? 6 : mode;
-    setKind(next);
-    setDepth(d);
-    setMode(m);
+  /**
+   * Drop everything that is an index into the frame that is about to change.
+   *
+   * The plate is not one of them, and that is the point. The cursor, the hover,
+   * a standing candidate and an anchored drag all name cells that may be about
+   * to leave the picture, and the zoom window is in the old frame's pixels — a
+   * sector frame is twice the scale and turned by 120°, so carrying a window
+   * across would land it somewhere nobody asked for.
+   */
+  const reframe = useCallback(() => {
     setZoom(1);
     setCentre(null);
-    // An arm is a triangle object; the hexagon has scopes instead.
-    if (next !== "triangle") setIsolation(null);
-    wipe(`canvas set to ${next}, depth ${d}, ${cellCount(next, d)} cells — plate cleared`);
-  };
+    setHover(null);
+    setCursor(null);
+    setCandidate(null);
+    setShapeDrag(null);
+  }, []);
+
+  const pickView = useCallback(
+    (next: "hexagon" | "sector") => {
+      if (next === viewMode) return;
+      const m = next === "sector" && mode === 12 ? 6 : mode;
+      setViewMode(next);
+      setMode(m);
+      reframe();
+      setAnnounce(
+        next === "sector"
+          ? `sector ${sector} framed — ${4 ** depth} of ${cellCount(
+              "hexagon",
+              depth
+            )} cells, apex at the plate's centre. Nothing was cleared; the other five sectors keep their paint${
+              m === mode ? "" : `. Brush dropped to ${m}-fold — mode 12 is D₆'s alone`
+            }`
+          : `the whole plate — all six sectors, ${cellCount(
+              "hexagon",
+              depth
+            )} cells. Nothing was cleared`
+      );
+    },
+    [viewMode, mode, sector, depth, reframe]
+  );
+
+  /** Frame a different sector. Also clears nothing; see `pickView`. */
+  const pickSector = useCallback(
+    (next: number) => {
+      const s = wrapSector(next);
+      if (s === sector && viewMode === "sector") return;
+      setSector(s);
+      setViewMode("sector");
+      if (mode === 12) setMode(6);
+      reframe();
+      setAnnounce(
+        `sector ${s} framed — ${4 ** depth} cells; the plate is whole and nothing was cleared`
+      );
+    },
+    [sector, viewMode, mode, depth, reframe]
+  );
 
   /**
    * Changing the scope does NOT clear the plate.
@@ -1053,7 +1225,10 @@ export default function DrawPage() {
    * so every colour already laid still names the cell it was laid on. Mode 12 is
    * the one thing that has to move: it is a subgroup of D6 and of nothing else,
    * so a sector scope that kept it would name a brush that scope does not have.
-   * Same rule as `pickKind`, for the same reason.
+   * Same rule as `pickView`, for the same reason.
+   *
+   * Hexagon view only. A framed sector's brush IS the sector's own D₃, so there
+   * is no choice left to make there and the control is not drawn.
    */
   const pickScope = (next: BrushScope) => {
     if (next === scope) return;
@@ -1118,12 +1293,12 @@ export default function DrawPage() {
       setCandidate(null);
       setShapeDrag(null);
       setAnnounce(
-        `depth ${d}, ${cellCount(kind, d)} cells — plate carried across, ${
+        `depth ${d}, ${cellCount("hexagon", d)} cells — plate carried across, ${
           plateRef.current.size
         } address${plateRef.current.size === 1 ? "" : "es"} held`
       );
     },
-    [depth, kind]
+    [depth]
   );
 
   const pickIsolation = (next: Isolation) => {
@@ -1132,8 +1307,8 @@ export default function DrawPage() {
     setCandidate(null);
     setAnnounce(
       next === null
-        ? "isolation off — the whole triangle"
-        : `isolated to arm ${next} — the ftype-${next} triskelion arm, ${armSize} cells; the hub belongs to no arm and is out of reach`
+        ? "isolation off — the whole sector"
+        : `isolated to arm ${next} — the ftype-${next} triskelion arm of sector ${sector}, ${armSize} cells; the hub belongs to no arm and is out of reach`
     );
   };
 
@@ -1341,7 +1516,12 @@ export default function DrawPage() {
    */
   const applyPreset = useCallback(
     (name: PresetName) => {
-      const colours = presetColours(name, canvas.fig, effectiveBase.hex);
+      // The whole plate, in every sector — a preset is a statement about the
+      // FIGURE and the figure is the hexagon. Each sector receives the same
+      // canonical colouring, so a framed sector then shows exactly the drawing
+      // the standalone triangle canvas used to show. `presets.ts` asserts the
+      // gasket count per sector while it does it.
+      const colours = presetColours(name, hex, effectiveBase.hex);
       layStroke(
         colours.map((_, i) => i),
         colours,
@@ -1353,7 +1533,7 @@ export default function DrawPage() {
         `${PRESETS[name].label} — the plate already shows it`
       );
     },
-    [canvas, effectiveBase, layStroke]
+    [hex, effectiveBase, layStroke]
   );
 
   // ── propose and commit ──────────────────────────────────────────────────
@@ -1424,14 +1604,23 @@ export default function DrawPage() {
       setAnnounce(
         next === null
           ? "band brush off"
-          : `band ${next} — ${BAND_NOTE[kind][next]}; ${brushSpan(
+          : `band ${next} — ${BAND_NOTE[bandKind][next]}; ${brushSpan(
               canvas.surface,
               canvas.bands,
-              { mode, band: next }
+              {
+                mode,
+                band:
+                  viewMode === "sector" ? sectorBandFamily(next, sector) : next,
+              },
+              // Probed at a cell of the FRAME. The whole-plate groups give one
+              // answer at every cell; the sector scope does not — see
+              // `brushSpan` — so a readout taken at cell 0 would be about
+              // sector 0 whichever sector is on screen.
+              canvas.shown[0] ?? 0
             )} rows under the ${mode}-fold brush`
       );
     },
-    [band, kind, canvas, mode]
+    [band, bandKind, viewMode, sector, canvas, mode]
   );
 
   const pickProgression = (next: ProgressionName) => {
@@ -1470,19 +1659,30 @@ export default function DrawPage() {
 
   const onArrow = useCallback(
     (dir: Direction) => {
-      const next = stepCursor(canvas.centroids, cursor, dir);
+      // Clipped to the FRAME, so an arrow key cannot walk the cursor into a
+      // sector nobody can see. In hexagon view `inView` admits everything and
+      // this is the walk it always was.
+      const next = stepCursor(canvas.centroids, cursor, dir, canvas.inView);
       if (next < 0) return;
       putCursor(next, null);
     },
     [canvas, cursor, putCursor]
   );
 
-  /** Where the cursor sits, in the words the canvas has for it. */
+  /**
+   * Where the cursor sits, in the words the FRAME has for it.
+   *
+   * A framed sector is the base triangle, so it has an apex and rows counted
+   * from it — read off the base figure's own lattice at the cell's base index,
+   * which is the same number the standalone triangle canvas used to report.
+   */
   const placeOf = useCallback(
-    (i: number) =>
-      canvas.kind === "triangle"
-        ? `row ${canvas.lattice.rowOf(i)} from the apex, ring ${canvas.lattice.ringOf(i)}`
-        : `sector ${canvas.hex?.cells[i].sector ?? 0}, ring ${canvas.lattice.ringOf(i)}`,
+    (i: number) => {
+      const ring = canvas.lattice.ringOf(i);
+      const c = canvas.hex.cells[i];
+      if (canvas.view.mode === "hexagon") return `sector ${c.sector}, ring ${ring}`;
+      return `row ${canvas.baseLattice.rowOf(c.base)} from the apex, ring ${ring}`;
+    },
     [canvas]
   );
 
@@ -1494,36 +1694,63 @@ export default function DrawPage() {
   const onRing = useCallback(
     (dir: RingDir) => {
       if (cursor === null) {
-        const start = stepCursor(canvas.centroids, null, "up");
+        const start = stepCursor(canvas.centroids, null, "up", canvas.inView);
         if (start < 0) return;
         putCursor(start, `cursor at cell ${start} — ${placeOf(start)}`);
         return;
       }
       const next = canvas.lattice.step(cursor, dir);
       if (next < 0) {
-        setAnnounce(`${dir} — the canvas ends here; the cursor did not move`);
+        setAnnounce(`${dir} — the plate ends here; the cursor did not move`);
+        return;
+      }
+      // A ring step is a lattice step and the lattice runs straight across the
+      // sector seams — that is what makes a hexagon band a genuine row. In a
+      // framed sector it would therefore walk the cursor out of the picture, so
+      // the frame stops it and SAYS so, on the same rule as the plate's edge: a
+      // cursor that reappears somewhere invisible has told the user a lie about
+      // the figure. Switch to the whole plate and the same key crosses freely.
+      if (!canvas.inView(next)) {
+        setAnnounce(
+          `${dir} — sector ${sector} ends here; the cell beyond it is on the plate but not in this frame`
+        );
         return;
       }
       putCursor(next, `${dir} — cell ${next}, ${placeOf(next)}`);
     },
-    [canvas, cursor, putCursor, placeOf]
+    [canvas, cursor, putCursor, placeOf, sector]
   );
 
   const onRadial = useCallback(
     (way: Radial) => {
       if (cursor === null) {
-        const start = stepCursor(canvas.centroids, null, "up");
+        const start = stepCursor(canvas.centroids, null, "up", canvas.inView);
         if (start < 0) return;
         putCursor(start, `cursor at cell ${start} — ${placeOf(start)}`);
         return;
       }
       const next = canvas.lattice.radial(cursor, way);
+      if (next >= 0 && !canvas.inView(next)) {
+        // MEASURED, having first been written down the other way twice and
+        // caught both times by `test/view.test.ts`. A radial step translates by
+        // a multiple of rot^s(1,1) — the sector median's DIRECTION, applied to
+        // every cell of the sector and not only to the ones on the median — and
+        // near the apex the wedge is narrow enough that the step carries a cell
+        // clean out of it. Only `in` ever does; at depth 2 it is 42 of the 96
+        // cells. So the frame guards it, on the same rule as the ring keys.
+        setAnnounce(
+          `inward — the cell inward from here is in sector ${
+            canvas.hex.cells[next].sector
+          }, on the plate but outside this frame; the cursor did not move`
+        );
+        return;
+      }
       if (next < 0) {
         setAnnounce(
           `${way === "out" ? "outward" : "inward"} — the ${
-            canvas.kind === "triangle"
+            canvas.view.mode === "sector"
               ? way === "out"
-                ? "base"
+                ? "sector's outer edge"
                 : "apex"
               : way === "out"
               ? "rim"
@@ -1542,7 +1769,7 @@ export default function DrawPage() {
 
   const onCursorPaint = useCallback(() => {
     if (cursor === null) {
-      const start = stepCursor(canvas.centroids, null, "up");
+      const start = stepCursor(canvas.centroids, null, "up", canvas.inView);
       if (start < 0) return;
       noteSector(start);
       setCursor(start);
@@ -1593,12 +1820,12 @@ export default function DrawPage() {
           ? "free brush — every cell the pointer crosses is an application"
           : next === "line"
           ? "line — press, drag along a lattice row and release; the row snaps to one of the three band families, and Option centres it on the anchor"
-          : `ring — press, drag outward and release; the ring is a level set of the exact hexagonal norm about the ${
-              kind === "triangle" ? "centroid, clipped by the three edges" : "centre"
+          : `ring — press, drag outward and release; the ring is a level set of the exact hexagonal norm about the plate's centre${
+              viewMode === "sector" ? ", cut by the framed sector" : ""
             }, and Option centres the annulus on the anchor`
       );
     },
-    [kind]
+    [viewMode]
   );
 
   const openHelp = useCallback(() => {
@@ -1745,11 +1972,7 @@ export default function DrawPage() {
           setAnnounce(`scheme ${name} — ${SCHEMES[name].label}`);
         } else if (e.key.toLowerCase() === "r") {
           e.preventDefault();
-          if (canvas.hex === null) {
-            setAnnounce("the relief is a hexagon effect; this canvas is flat");
-          } else {
-            pickReading(reading === "convex" ? "concave" : "convex");
-          }
+          pickReading(reading === "convex" ? "concave" : "convex");
         }
         return;
       }
@@ -1816,23 +2039,29 @@ export default function DrawPage() {
         return;
       }
       if (k === "r") {
-        if (canvas.hex === null) {
-          setAnnounce("the relief is a hexagon effect; this canvas is flat");
-          return;
-        }
         pickRelief(!reliefOn);
         return;
       }
+      // The view, on the keys nearest the depth pair: V flips the frame, and
+      // the two bracket-neighbours step the sector round the plate. Neither is
+      // destructive, so neither asks.
+      if (k === "v") {
+        pickView(viewMode === "sector" ? "hexagon" : "sector");
+        return;
+      }
+      if (e.key === "," || e.key === ".") {
+        pickSector(sector + (e.key === "." ? 1 : -1));
+        return;
+      }
       if (e.key === "[") {
-        const d = DEPTHS[kind];
-        if (depth <= d[0]) setAnnounce(`depth ${depth} is the shallowest`);
+        if (depth <= DEPTHS[0]) setAnnounce(`depth ${depth} is the shallowest`);
         else pickDepth(depth - 1);
         return;
       }
       if (e.key === "]") {
-        const d = DEPTHS[kind];
-        if (depth >= d[d.length - 1]) setAnnounce(`depth ${depth} is the deepest`);
-        else pickDepth(depth + 1);
+        if (depth >= DEPTHS[DEPTHS.length - 1]) {
+          setAnnounce(`depth ${depth} is the deepest`);
+        } else pickDepth(depth + 1);
         return;
       }
       if (e.key === "+" || e.key === "=") {
@@ -1902,7 +2131,10 @@ export default function DrawPage() {
     reliefOn,
     band,
     tool,
-    kind,
+    viewMode,
+    sector,
+    pickView,
+    pickSector,
     depth,
     zoom,
     setZoomTo,
@@ -1929,26 +2161,37 @@ export default function DrawPage() {
    * instead of depending on where the mouse happened to be.
    */
   const svgText = useCallback(() => {
-    const baked =
-      reliefSurface === null || !reliefOn
-        ? null
-        : reliefFrame(reliefSurface, restShell(reliefSurface), reading);
+    const baked = reliefOn
+      ? reliefFrame(reliefSurface, restShell(reliefSurface), reading)
+      : null;
+    const m = canvas.toView;
+    // `canvas.geom.cells` is already in the view's pixels; the relief deforms
+    // the MODEL, so a baked frame has to be carried through the same transform
+    // before it can stand in for them. Deform, then frame — the other order
+    // would curve the picture about the wrong centre.
     const cells =
       baked === null
         ? canvas.geom.cells
-        : baked.verts.map((verts) => ({ verts }));
+        : baked.verts.map((verts) => ({
+            verts: verts.map((v) => applyAffine(m, v)),
+          }));
     const overlay: ArtOverlayGroup[] =
       baked === null
         ? []
         : baked.wash.map((w) => ({
             fill: w.fill,
             opacity: w.alpha,
-            shapes: w.cells.map((i) => baked.verts[i]),
+            shapes: w.cells.filter(canvas.inView).map((i) => cells[i].verts),
           }));
     return artworkSvg({
       width: canvas.geom.width,
       height: canvas.geom.height,
       cells,
+      // The polygons are the FRAME. The payload below is the whole plate, in
+      // every sector — a file exported from a sector view that carried only the
+      // sector would quietly destroy five sixths of a drawing the moment it was
+      // reloaded, which is the failure this change exists to remove.
+      shown: canvas.view.mode === "sector" ? canvas.shown : undefined,
       // The polygons are the plate AS SHOWN, at this depth; the payload below
       // carries the addresses so a load gets back the depths this view cannot
       // draw. A viewer that only looks at the picture sees exactly the screen.
@@ -1959,13 +2202,15 @@ export default function DrawPage() {
       paintSeam: PAINT_SEAM,
       weldPaint: weld,
       seamWidth: canvas.geom.seamWidth,
-      title: `FOURFOLD — ${kind}, depth ${depth}, ${mode}-fold brush, ${schemeName}${
+      title: `FOURFOLD — ${
+        canvas.view.mode === "sector" ? `sector ${canvas.view.sector}` : "hexagon"
+      }, depth ${depth}, ${mode}-fold brush, ${schemeName}${
         band === null ? "" : `, band ${band}`
       }${baked === null ? "" : `, ${reading} relief`}`,
       // What makes the file loadable: the plate stated as cells rather than
       // inferred from shapes. See `artfile.ts`.
       payload: payloadFromPaint(
-        kind,
+        "hexagon",
         depth,
         convention,
         resolvePlate(plateRef.current, book),
@@ -1973,7 +2218,10 @@ export default function DrawPage() {
         // `undefined` — so the field is omitted and the bytes are unchanged —
         // whenever every painted address is at the exported depth, which is
         // every drawing that never left the depth it was started at.
-        plateEntries(plateRef.current, book)
+        plateEntries(plateRef.current, book),
+        // Likewise omitted in hexagon view, which is the whole plate and needs
+        // nothing said about it.
+        canvas.view.mode === "sector" ? { sector: canvas.view.sector } : undefined
       ),
       overlay,
     });
@@ -1982,7 +2230,6 @@ export default function DrawPage() {
     book,
     showTiling,
     weld,
-    kind,
     depth,
     convention,
     mode,
@@ -1993,10 +2240,21 @@ export default function DrawPage() {
     reading,
   ]);
 
+  /**
+   * The file's name. A framed sector still says `triangle`, because that is what
+   * it is and what every file this program has ever written called it.
+   */
   const nameFor = useCallback(
     (ext: "svg" | "png") =>
-      exportName({ kind, depth, mode, scheme: schemeName, at: new Date(), ext }),
-    [kind, depth, mode, schemeName]
+      exportName({
+        kind: canvas.view.mode === "sector" ? "triangle" : "hexagon",
+        depth,
+        mode,
+        scheme: schemeName,
+        at: new Date(),
+        ext,
+      }),
+    [canvas, depth, mode, schemeName]
   );
 
   const download = (blob: Blob, name: string) => {
@@ -2102,33 +2360,63 @@ export default function DrawPage() {
       const payload = extractArt(text);
       if (payload !== null) {
         setLoadError(null);
-        setKind(payload.canvas);
         setDepth(payload.depth);
         setConvention(payload.convention);
-        // Mode 12 is a hexagon subgroup; carrying it onto a triangle would name
-        // a brush that canvas does not have. Same rule as `pickKind`.
-        if (payload.canvas === "triangle" && mode === 12) setMode(6);
         // The relief is display state and not paint, but a file that declares
         // it has to be able to come back looking like itself — and re-export to
         // the same bytes. A file that says nothing means the relief is off,
         // which is what every file written before the field existed meant.
         setReliefOn(payload.relief?.on ?? false);
         if (payload.relief !== undefined) setReading(payload.relief.reading);
+
         // The file's OWN canvas, not the one on screen: the addresses in the
         // payload are words of the depth it declares, and the book that turns
         // its `cells` indices into addresses has to be that canvas's book.
-        const loaded = plateFromArtPayload(
-          payload,
-          addressBook(
-            payload.canvas === "triangle"
-              ? buildFigure(payload.depth, payload.convention)
-              : buildHexagon(payload.depth, payload.convention)
-          )
-        );
+        //
+        // ── A `triangle` file is not a foreign file. It is sector 0. ────────
+        //
+        // Every drawing exported before the hexagon became the model says
+        // `canvas: "triangle"` and carries a plate keyed by bare words. Those
+        // words are this model's words with a sector tag missing: `buildHexagon`
+        // builds sector 0 by applying the identity rotation to the base figure,
+        // so the triangle's cell i IS the hexagon's cell i and the triangle's
+        // `"ABX"` IS `"s0:ABX"`. The migration is therefore a rename — no cell
+        // is matched by geometry, nothing is resolved to a depth, and a plate
+        // painted across four depths arrives with all four. The view is then set
+        // to that sector, so a person who saved a triangle opens a triangle.
+        const old = payload.canvas === "triangle";
+        const loaded = old
+          ? plateIntoSector(
+              plateFromArtPayload(
+                payload,
+                addressBook(buildFigure(payload.depth, payload.convention))
+              ),
+              0
+            )
+          : plateFromArtPayload(
+              payload,
+              addressBook(buildHexagon(payload.depth, payload.convention))
+            );
+
+        const framed = old ? 0 : payload.view?.sector;
+        if (framed === undefined) {
+          setViewMode("hexagon");
+        } else {
+          setViewMode("sector");
+          setSector(framed);
+          // Mode 12 is D₆'s and nothing else's; a framed sector's brush is the
+          // sector's own D₃. Same rule as `pickView`.
+          if (mode === 12) setMode(6);
+        }
+
         reset(
           loaded,
-          `loaded ${loaded.size} cell${loaded.size === 1 ? "" : "s"} — ${
-            payload.canvas
+          `loaded ${loaded.size} address${loaded.size === 1 ? "" : "es"} — ${
+            old
+              ? `a triangle file, migrated into sector 0 of the plate`
+              : framed === undefined
+              ? "the whole plate"
+              : `sector ${framed} framed`
           }, depth ${payload.depth}, ${payload.convention}${
             payload.plate === undefined ? "" : ", addressed"
           } · history reset to the loaded plate`
@@ -2141,12 +2429,15 @@ export default function DrawPage() {
         return;
       }
 
-      const got = importByGeometry(text, canvas.fig);
+      // Matched against the cells AS DRAWN, so a foreign file is compared with
+      // the picture on screen rather than with the model's own pixels — which
+      // the sector view moves.
+      const got = importByGeometry(text, hex, canvas.geom.cells);
       if (got.matched.size === 0) {
         refuse(
           got.total === 0
             ? "no filled shapes in that file — nothing to import"
-            : `none of the ${got.total} shapes in that file line up with this canvas — try the ${kind} depth it was drawn at`
+            : `none of the ${got.total} shapes in that file line up with this frame — try the depth and view it was drawn at`
         );
         return;
       }
@@ -2162,7 +2453,7 @@ export default function DrawPage() {
         }`
       );
     },
-    [refuse, reset, canvas, book, kind, mode]
+    [refuse, reset, canvas, hex, book, mode]
   );
 
   const openPicker = () => {
@@ -2211,7 +2502,9 @@ export default function DrawPage() {
 
   // ── readouts ────────────────────────────────────────────────────────────
 
-  const total = canvas.geom.cells.length;
+  /** Cells in the FRAME, and cells on the plate. They differ in sector view. */
+  const total = canvas.shown.length;
+  const modelTotal = hex.cells.length;
   const live = candidateSpec ?? preview;
   const reach = live === null ? null : live.cells.length + live.inert.length;
   /**
@@ -2237,16 +2530,28 @@ export default function DrawPage() {
     .map((s, k) => `${s.hex} ${(100 * k) / Math.max(tape.length - 1, 1)}%`)
     .join(", ")})`;
 
-  /** Measured, not assumed: hexagon bands are not uniform. */
+  /**
+   * Measured, not assumed: hexagon bands are not uniform, and a band CLIPPED to
+   * a sector is a different set from the band it was clipped out of.
+   *
+   * In hexagon view `inView` admits everything and this is exactly `bandSizes`.
+   * In sector view it reports what the brush will actually lay, which is the
+   * triangle's own 1, 3, 5, … 2r+1 — the claim `bands.ts` checks at build time
+   * for the standalone triangle, holding here for a clipped sector.
+   */
   const bandStat = useMemo(() => {
-    if (band === null) return null;
-    const sizes = bandSizes(canvas.bands, band);
+    if (effBand === null) return null;
+    const sizes = canvas.bands
+      .bands(effBand)
+      .map((ix) => canvas.bands.band(ix).filter(canvas.inView).length)
+      .filter((n) => n > 0);
+    if (sizes.length === 0) return null;
     return {
       count: sizes.length,
       min: Math.min(...sizes),
       max: Math.max(...sizes),
     };
-  }, [canvas, band]);
+  }, [canvas, effBand]);
 
   const legend = useMemo(() => {
     const items: { key: string; label: string; colour: string; dashed: boolean; dot: boolean }[] =
@@ -2328,65 +2633,103 @@ export default function DrawPage() {
               see `.railCol`. The split is STRUCTURE (what the brush is, and what
               is drawn) against COLOUR (what it lays down). */}
           <div className={styles.railCol}>
+          {/* ONE model, framed two ways. The control is a picture of the
+              figure rather than a pair of words, because the thing that has to
+              be legible at a glance is that the other five sectors are still
+              there — this used to be a toggle between two canvases and it threw
+              the drawing away. See the header, and `view.ts`. */}
           <section className={styles.section}>
             <div className={styles.sectionHead}>
-              <h2 className={styles.sectionTitle}>Canvas</h2>
-              <span className={styles.sectionMeta}>{total} cells</span>
+              <h2 className={styles.sectionTitle}>View</h2>
+              <span className={styles.sectionMeta}>{modelTotal} cells</span>
             </div>
-            <div className={styles.seg} role="group" aria-label="canvas shape">
-              {(["triangle", "hexagon"] as CanvasKind[]).map((k) => (
+            <div className={styles.seg} role="group" aria-label="what is framed">
+              {(["hexagon", "sector"] as const).map((v) => (
                 <button
-                  key={k}
+                  key={v}
                   type="button"
-                  className={`${styles.segBtn} ${
-                    armed === k ? styles.armedBtn : ""
-                  }`}
-                  aria-pressed={kind === k}
+                  className={styles.segBtn}
+                  aria-pressed={viewMode === v}
                   aria-label={
-                    armed === k
-                      ? `confirm — switching to the ${k} clears the plate`
-                      : `canvas ${k}${
-                          kind === k || paint.size === 0
-                            ? ""
-                            : " — this clears the plate, and asks first"
-                        }`
+                    v === "hexagon"
+                      ? "frame the whole plate — all six sectors; nothing is cleared"
+                      : `frame one sector — the triangle, ${4 ** depth} cells; nothing is cleared`
                   }
-                  onClick={() => pickKind(k)}
-                  onBlur={() => {
-                    if (armed === k) disarm();
-                  }}
+                  onClick={() => pickView(v)}
                 >
-                  {armed === k ? "sure?" : k}
+                  <span className={styles.viewFace}>
+                    <SectorGlyph
+                      sector={v === "hexagon" ? null : sector}
+                      active={viewMode === v}
+                    />
+                    {v}
+                  </span>
                 </button>
               ))}
             </div>
+            {viewMode === "sector" && (
+              <SectorDial
+                sector={sector}
+                onPick={pickSector}
+                perSector={4 ** depth}
+              />
+            )}
+            <p className={styles.viewMeta}>
+              <span>
+                {viewMode === "sector" ? `sector ${sector}` : "all six"}
+              </span>
+              <span>
+                <b>{total}</b> drawn of {modelTotal}
+              </span>
+            </p>
             <div
               className={`${styles.seg} ${styles.depthRow}`}
               role="group"
               aria-label="subdivision depth"
             >
-              {DEPTHS[kind].map((d) => (
+              {DEPTHS.map((d) => (
                 <button
                   key={d}
                   type="button"
                   className={`${styles.segBtn} ${styles.depthBtn}`}
                   aria-pressed={depth === d}
-                  aria-label={`depth ${d} — ${cellCount(kind, d)} cells`}
+                  aria-label={`depth ${d} — ${cellCount("hexagon", d)} cells on the plate, ${
+                    4 ** d
+                  } in a sector`}
                   onClick={() => pickDepth(d)}
                 >
                   {d}
                 </button>
               ))}
             </div>
+            <p className={styles.hint}>
+              {viewMode === "sector" ? (
+                <>
+                  <b>Sector {sector} is the triangle.</b> Not a likeness of it —
+                  the plate is built by rotating the depth-{depth} figure into
+                  six sectors, so this is that figure, cell for cell, turned
+                  apex-up for reading. Switching frame <i>destroys nothing</i>:
+                  one address space, <code>s0:</code>…<code>s5:</code>, all the
+                  way through.
+                </>
+              ) : (
+                <>
+                  <b>All six sectors.</b> Six copies of the depth-{depth} figure
+                  sharing an apex at the centre, tiling the hexagon with no
+                  overlap and no gap. Frame one and you are looking at the
+                  triangle; the paint in the other five stays exactly where it is.
+                </>
+              )}
+            </p>
           </section>
 
           <section className={styles.section}>
             <div className={styles.sectionHead}>
               <h2 className={styles.sectionTitle}>Brush symmetry</h2>
               <span className={styles.sectionMeta}>
-                {kind === "triangle"
+                {viewMode === "sector"
                   ? isolation === null
-                    ? "D₃ subgroups"
+                    ? `sector ${sector} · D₃`
                     : `arm ${isolation} · ⟨m_${isolation}⟩`
                   : scope === "hexagon"
                   ? "D₆ subgroups"
@@ -2395,11 +2738,11 @@ export default function DrawPage() {
                   : "C₆ × D₃"}
               </span>
             </div>
-            {/* The triangle's answer to the hexagon's SCOPE. Placed in the same
-                slot as the scope segment, because it is the same question — which
-                part of the plate is the brush allowed to reach — asked of a
-                figure whose parts are not sectors. */}
-            {kind === "triangle" && (
+            {/* One level further in than the SCOPE segment, and in the same
+                slot, because it is the same question — which part of the plate
+                may the brush reach — asked of the part that is already framed.
+                The nesting is hexagon, then sector, then arm. */}
+            {viewMode === "sector" && (
               <>
                 <div
                   className={`${styles.seg} ${styles.scopeSeg}`}
@@ -2410,7 +2753,7 @@ export default function DrawPage() {
                     type="button"
                     className={styles.segBtn}
                     aria-pressed={isolation === null}
-                    aria-label="isolation off — paint the whole triangle"
+                    aria-label="isolation off — paint the whole framed sector"
                     onClick={() => pickIsolation(null)}
                   >
                     off
@@ -2421,7 +2764,7 @@ export default function DrawPage() {
                       type="button"
                       className={styles.segBtn}
                       aria-pressed={isolation === a}
-                      aria-label={`isolate arm ${a} — the ftype-${a} arm, one third of the board`}
+                      aria-label={`isolate arm ${a} — the ftype-${a} arm, one third of the framed sector`}
                       onClick={() => pickIsolation(a)}
                     >
                       {a}
@@ -2433,7 +2776,7 @@ export default function DrawPage() {
                     <>
                       <b>Isolate one arm.</b> The three <i>ftype</i> arms{" "}
                       <code>S_D = {"{ Xʲ D u }"}</code> are congruent, tile the
-                      board minus the hub, and the rotation permutes them
+                      sector minus its hub, and the rotation permutes them
                       cyclically — a genuine partition, not a mask.
                     </>
                   ) : (
@@ -2451,7 +2794,7 @@ export default function DrawPage() {
                 </p>
               </>
             )}
-            {kind === "hexagon" && (
+            {viewMode === "hexagon" && (
               <>
                 <div
                   className={`${styles.seg} ${styles.scopeSeg}`}
@@ -2550,7 +2893,7 @@ export default function DrawPage() {
                   type="button"
                   className={styles.segBtn}
                   aria-pressed={band === f}
-                  aria-label={`band family ${f} — ${BAND_NOTE[kind][f]}`}
+                  aria-label={`band family ${f} — ${BAND_NOTE[bandKind][f]}`}
                   onClick={() => pickBand(f)}
                 >
                   {f}
@@ -2565,7 +2908,7 @@ export default function DrawPage() {
                 </>
               ) : (
                 <>
-                  <b>{BAND_NOTE[kind][band]}.</b> The {mode}-fold brush carries it
+                  <b>{BAND_NOTE[bandKind][band]}.</b> The {mode}-fold brush carries it
                   to <b>{span}</b> {span === 1 ? "row" : "rows"}
                   {span < mode && (
                     <>
@@ -2650,52 +2993,62 @@ export default function DrawPage() {
               weld painted cells — no seam inside a filled row
             </label>
 
-            {/* Hexagon only. The six-point construction reads six corresponding
-                cells off a C6 orbit, and a triangle has none — and the band-size
-                height field is measurably flat there, two values at every depth,
-                so there would be nothing to curve. */}
-            {kind === "hexagon" && (
+            {/* Offered in BOTH views now, which it could not be while the
+                triangle was a canvas of its own: the six-point construction
+                reads six corresponding cells off a C6 orbit that a standalone
+                triangle does not have, and its band-size height field is
+                measurably flat — two values at every depth. A framed sector has
+                the whole model behind it, so it carries the hexagon's height
+                field and 2^(d+1) − 1 rings run through it. Measured in
+                `test/view.test.ts`. */}
+            <label className={styles.checkRow}>
+              <input
+                type="checkbox"
+                checked={reliefOn}
+                onChange={(e) => pickRelief(e.target.checked)}
+              />
+              relief — the ring under the pointer curves the plate
+            </label>
+            {reliefOn && (
               <>
-                <label className={styles.checkRow}>
-                  <input
-                    type="checkbox"
-                    checked={reliefOn}
-                    onChange={(e) => pickRelief(e.target.checked)}
-                  />
-                  relief — the ring under the pointer curves the plate
-                </label>
-                {reliefOn && (
-                  <>
-                    <div
-                      className={`${styles.seg} ${styles.scopeSeg}`}
-                      role="group"
-                      aria-label="relief reading"
+                <div
+                  className={`${styles.seg} ${styles.scopeSeg}`}
+                  role="group"
+                  aria-label="relief reading"
+                >
+                  {READINGS.map((r) => (
+                    <button
+                      key={r}
+                      type="button"
+                      className={styles.segBtn}
+                      aria-pressed={reading === r}
+                      aria-label={`${r} — ${READING_LABEL[r]}`}
+                      onClick={() => pickReading(r)}
                     >
-                      {READINGS.map((r) => (
-                        <button
-                          key={r}
-                          type="button"
-                          className={styles.segBtn}
-                          aria-pressed={reading === r}
-                          aria-label={`${r} — ${READING_LABEL[r]}`}
-                          onClick={() => pickReading(r)}
-                        >
-                          {r}
-                        </button>
-                      ))}
-                    </div>
-                    <p className={styles.hint}>
-                      The six cells your brush corresponds to sit on one exact
-                      lattice ring — <b>ring {ring}</b> of {3 * 2 ** depth}. That
-                      ring is the <b>template</b>: it moves, and the whole plate
-                      follows, six-fold symmetric in every frame because the
-                      remap is a function of the ring alone. Height is the{" "}
-                      <b>sum of a cell&rsquo;s three band sizes</b> — three
-                      integers, one addition, <i>no division</i>. The one divide
-                      in the whole effect is one per ring, at pixel emission.
-                    </p>
-                  </>
-                )}
+                      {r}
+                    </button>
+                  ))}
+                </div>
+                <p className={styles.hint}>
+                  The six cells your brush corresponds to sit on one exact
+                  lattice ring — <b>ring {ring}</b> of {3 * 2 ** depth}. That
+                  ring is the <b>template</b>: it moves, and the whole plate
+                  follows, six-fold symmetric in every frame because the remap is
+                  a function of the ring alone. Height is the{" "}
+                  <b>sum of a cell&rsquo;s three band sizes</b> — three integers,
+                  one addition, <i>no division</i>. The one divide in the whole
+                  effect is one per ring, at pixel emission.
+                  {viewMode === "sector" && (
+                    <>
+                      {" "}
+                      The template ring is the <i>plate&rsquo;s</i>, so in a
+                      framed sector it curves about the apex —{" "}
+                      <b>{2 ** (depth + 1) - 1} rings</b> cross this sector, where
+                      a standalone triangle had a height field with two values in
+                      it.
+                    </>
+                  )}
+                </p>
               </>
             )}
           </section>
@@ -2805,7 +3158,7 @@ export default function DrawPage() {
           <section className={styles.section}>
             <div className={styles.sectionHead}>
               <h2 className={styles.sectionTitle}>Presets</h2>
-              <span className={styles.sectionMeta}>{total} cells</span>
+              <span className={styles.sectionMeta}>{modelTotal} cells</span>
             </div>
             <div className={styles.presetGrid} role="group" aria-label="preset plates">
               {PRESET_NAMES.map((name) => (
@@ -2827,10 +3180,15 @@ export default function DrawPage() {
               order. <b>Coset</b> collapses the four charges onto the H /
               not-H partition. <b>Gasket</b> paints the{" "}
               <code>
-                {kind === "hexagon" ? "6·" : ""}3<sup>{depth}</sup>
+                6·3<sup>{depth}</sup>
               </code>{" "}
               addresses with <i>no X</i> in the colour you are holding, and leaves
-              the other {total - (kind === "hexagon" ? 6 : 1) * 3 ** depth} bare.
+              the other {modelTotal - 6 * 3 ** depth} bare. A preset fills{" "}
+              <i>every</i> sector, so a framed one then shows exactly{" "}
+              <code>
+                3<sup>{depth}</sup>
+              </code>{" "}
+              — the canonical figure, per sector.
             </p>
           </section>
 
@@ -2855,7 +3213,9 @@ export default function DrawPage() {
                     has to infer from a control they are not looking at. */}
                 <span className={styles.toolStatus}>{tool}</span>
                 <span>
-                  {kind} · d{depth} · <b>{total} cells</b>
+                  {viewMode === "sector" ? `sector ${sector}` : "hexagon"} · d
+                  {depth} · <b>{total} cells</b>
+                  {viewMode === "sector" && <> of {modelTotal}</>}
                 </span>
                 <span>
                   brush <b>{mode}-fold</b>
@@ -3169,7 +3529,9 @@ export default function DrawPage() {
                 view={view}
                 className={styles.canvas}
                 candidateClass={styles.marching}
-                label={`${kind} drawing canvas, depth ${depth}, ${total} cells, ${mode}-fold symmetry brush, ${tool} tool, ${shapeTool} shape${
+                label={`drawing plate framed on ${
+                  viewMode === "sector" ? `sector ${sector}` : "all six sectors"
+                }, depth ${depth}, ${total} cells drawn of ${modelTotal}, ${mode}-fold symmetry brush, ${tool} tool, ${shapeTool} shape${
                   band === null ? "" : `, band ${band}`
                 }. Q W E A D Z X C step the cursor on the lattice, W and X move a ring outward and inward, arrow keys walk it by screen direction, Enter ${
                   shapeTool === "free"
@@ -3282,8 +3644,9 @@ export default function DrawPage() {
           <p className={styles.keys}>
             <b>Q W E / A D / Z X C</b> walk the cursor on the exact lattice — the
             six ring keys are the six same-orientation steps, at 0°, 60°, 120°,
-            180°, 240° and 300°, and <b>W</b> / <b>X</b> cross the radial axis.
-            Press <b>?</b> for every shortcut.{" "}
+            180°, 240° and 300°, and <b>W</b> / <b>X</b> cross the radial axis.{" "}
+            <b>V</b> flips the frame and <b>,</b> / <b>.</b> step the sector —
+            neither clears anything. Press <b>?</b> for every shortcut.{" "}
             {dragMode === "propose" ? (
               <>
                 Drag moves a candidate; <b>tap it</b> or press <b>Enter</b> to
@@ -3306,15 +3669,22 @@ export default function DrawPage() {
             only mode 12 has short orbits, from the three spine mirrors. On the
             triangle the all-X hub is fixed by every isometry and is a singleton
             in every mode, and the r-th band from the apex holds exactly{" "}
-            <b>2r+1</b> cells — checked when the figure is built. Hexagon bands
-            are <b>not</b> uniform and each meets exactly three sectors. Changing
-            the canvas or the depth changes which cells exist, so the plate is
-            cleared rather than reinterpreted. An exported SVG carries the plate
-            back with it, in a comment: canvas, depth, convention and the painted
-            cells, so <b>load</b> is an exact restore rather than a reading of
-            the picture. A file without that comment is matched shape by shape
-            against this canvas instead, and the match rate is <i>reported</i>{" "}
-            rather than assumed — see <code>src/lib/artfile.ts</code>.
+            <b>2r+1</b> cells — checked when the figure is built, and still true
+            of a hexagon band <i>clipped to a sector</i>, which is what makes the
+            sector view the triangle rather than a picture of it. Hexagon bands
+            are <b>not</b> uniform and each meets exactly three sectors. There is{" "}
+            <b>one plate</b>: the hexagon, addressed <code>s0:</code>…
+            <code>s5:</code>, and the triangle is a frame on it, so changing the
+            view clears nothing and only the depth ever changes which cells
+            exist — and the address plate carries the drawing through that too.
+            An exported SVG carries the plate back with it, in a comment: canvas,
+            depth, convention, the painted cells and the frame, so <b>load</b> is
+            an exact restore rather than a reading of the picture, and a file
+            written before this — <code>canvas: &quot;triangle&quot;</code> —
+            migrates into sector 0 word for word. A file without that comment is
+            matched shape by shape against the frame instead, and the match rate
+            is <i>reported</i> rather than assumed — see{" "}
+            <code>src/lib/artfile.ts</code> and <code>src/lib/view.ts</code>.
           </p>
         </div>
       </div>

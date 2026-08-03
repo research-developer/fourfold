@@ -250,9 +250,21 @@ describe("extractArt is total", () => {
     ["a fractional depth", wrap(JSON.stringify({ ...good, depth: 2.5 }))],
     ["a depth of zero", wrap(JSON.stringify({ ...good, depth: 0 }))],
     ["a depth past the canvas", wrap(JSON.stringify({ ...good, depth: 99 }))],
+    /**
+     * This row used to be `canvas: "hexagon", depth: 5`, and depth 5 on a
+     * hexagon is now LEGAL — see `MAX_DEPTH`. The triangle stopped being a
+     * canvas and became a view of one sector of the hexagon, so a depth-5
+     * triangle file is a depth-5 hexagon file with sector 0 painted, and a
+     * ceiling of 4 would have made every one of those files loadable exactly
+     * once and never writable again.
+     *
+     * What the row was actually testing — that a depth past the declared canvas's
+     * ceiling is refused rather than clamped — is unchanged, and is kept here one
+     * step further out.
+     */
     [
-      "a hexagon depth on a triangle budget",
-      wrap(JSON.stringify({ ...good, canvas: "hexagon", depth: 5 })),
+      "a hexagon depth past the hexagon's own ceiling",
+      wrap(JSON.stringify({ ...good, canvas: "hexagon", depth: 6 })),
     ],
     ["a NaN depth", wrap('{"canvas":"triangle","depth":null,"convention":"apex","cells":[]}')],
     [
@@ -535,8 +547,24 @@ describe("format constants", () => {
     }
   });
 
+  /**
+   * The hexagon's ceiling was 4 and is 5.
+   *
+   * CHANGED DELIBERATELY, and it is the one existing expectation this work
+   * moved. The triangle is now a VIEW of one sector of the hexagon rather than a
+   * canvas of its own, so a file this program exported at triangle depth 5 —
+   * 1024 cells, always drawable, always exportable — is a hexagon file at depth
+   * 5 with sector 0 painted. Held at 4, the loader would have accepted that file
+   * (its declared canvas is `triangle`, whose ceiling is 5) and then refused
+   * every re-export of it, because the re-export declares the canvas the plate
+   * now lives on. Existing work would have become a one-way trip.
+   *
+   * The two ceilings are equal for exactly that reason, and the triangle's is
+   * kept rather than removed because files declaring it still arrive.
+   */
   it("declares a depth ceiling for each canvas", () => {
     expect(MAX_DEPTH.triangle).toBe(5);
-    expect(MAX_DEPTH.hexagon).toBe(4);
+    expect(MAX_DEPTH.hexagon).toBe(5);
+    expect(MAX_DEPTH.hexagon).toBeGreaterThanOrEqual(MAX_DEPTH.triangle);
   });
 });

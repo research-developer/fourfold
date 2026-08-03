@@ -131,9 +131,31 @@ export function armMask(
   figure: Figure,
   isolation: Isolation
 ): (i: number) => boolean {
+  return armMaskOver(figure.cells, isolation);
+}
+
+/**
+ * The same mask over any cell list that carries an ADDRESS WORD.
+ *
+ * The hexagon's cells do: every one of them is a copy of a base triangle cell
+ * and keeps its `addr`, so `armOfWord` answers the same question there that
+ * `ftype` answers on the triangle. That is what makes the isolation control nest
+ * — hexagon, then sector, then arm — without a second notion of an arm.
+ *
+ * Note what is NOT needed here: the sector. A sector-scoped brush already cannot
+ * leave the sector it started in (`orbit.ts` gives that surface a region per
+ * sector), and only the framed sector's cells are on screen to be clicked, so
+ * confinement to one sector is already exact and this mask has one job.
+ */
+export function armMaskOver(
+  cells: readonly { addr: string }[],
+  isolation: Isolation
+): (i: number) => boolean {
   if (isolation === null) return () => true;
-  const inArm = new Uint8Array(figure.cells.length);
-  for (const c of figure.cells) if (c.ftype === isolation) inArm[c.i] = 1;
+  const inArm = new Uint8Array(cells.length);
+  for (let i = 0; i < cells.length; i++) {
+    if (armOfWord(cells[i].addr) === isolation) inArm[i] = 1;
+  }
   return (i) => inArm[i] === 1;
 }
 

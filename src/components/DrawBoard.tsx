@@ -79,6 +79,16 @@ export interface BoardGeometry {
   cells: readonly BoardCell[];
   /** Hairline width in canvas units, chosen for the depth. */
   seamWidth: number;
+  /**
+   * The cell indices this view draws, ascending. Absent means all of them.
+   *
+   * The board is handed the WHOLE model and told which part of it is framed,
+   * rather than a shortened array, because every index it reports back — a hover,
+   * a paint, a cursor — is an index on the model, and renumbering them at the
+   * edge of the render layer would mean a second address space for the page to
+   * translate. So the array stays whole and the layers walk this list.
+   */
+  shown?: readonly number[];
 }
 
 export interface PreviewSpec {
@@ -235,10 +245,12 @@ const line = (p: readonly [number, number]) => `${p[0]},${p[1]}`;
 const TileLayer = memo(function TileLayer({
   geom,
   pts,
+  order,
   show,
 }: {
   geom: BoardGeometry;
   pts: readonly string[];
+  order: readonly number[];
   show: boolean;
 }) {
   if (!show) return null;
@@ -250,8 +262,8 @@ const TileLayer = memo(function TileLayer({
       strokeWidth={geom.seamWidth}
       pointerEvents="none"
     >
-      {pts.map((p, i) => (
-        <polygon key={i} points={p} />
+      {order.map((i) => (
+        <polygon key={i} points={pts[i]} />
       ))}
     </g>
   );
@@ -268,9 +280,11 @@ const TileLayer = memo(function TileLayer({
 const WashLayer = memo(function WashLayer({
   pts,
   wash,
+  visible,
 }: {
   pts: readonly string[];
   wash: readonly { fill: string; alpha: number; cells: readonly number[] }[];
+  visible: ReadonlySet<number> | null;
 }) {
   return (
     <g data-layer="relief" pointerEvents="none">
@@ -280,9 +294,11 @@ const WashLayer = memo(function WashLayer({
           fill={band.fill}
           opacity={band.alpha}
         >
-          {band.cells.map((i) => (
-            <polygon key={i} points={pts[i]} />
-          ))}
+          {band.cells.map((i) =>
+            visible !== null && !visible.has(i) ? null : (
+              <polygon key={i} points={pts[i]} />
+            )
+          )}
         </g>
       ))}
     </g>
@@ -304,17 +320,23 @@ const PaintLayer = memo(function PaintLayer({
   geom,
   pts,
   paint,
+  visible,
   weld,
 }: {
   geom: BoardGeometry;
   pts: readonly string[];
   paint: PaintMap;
+  visible: ReadonlySet<number> | null;
   weld: boolean;
 }) {
   const out: ReactElement[] = [];
   for (const [i, colour] of paint) {
     const p = pts[i];
     if (p === undefined) continue;
+    // Paint in an unframed sector is still ON the plate — it is simply not in
+    // this picture. Skipped rather than dropped from the model, which is the
+    // difference between a view and a canvas.
+    if (visible !== null && !visible.has(i)) continue;
     out.push(
       <polygon
         key={i}
@@ -344,11 +366,17 @@ const PaintLayer = memo(function PaintLayer({
  * there with the relief off. A lens the pointer does not go through is a lens
  * that has broken the drawing program.
  */
-const HitLayer = memo(function HitLayer({ pts }: { pts: readonly string[] }) {
+const HitLayer = memo(function HitLayer({
+  pts,
+  order,
+}: {
+  pts: readonly string[];
+  order: readonly number[];
+}) {
   return (
     <g data-layer="hit" fill="transparent">
-      {pts.map((p, i) => (
-        <polygon key={i} data-i={i} points={p} />
+      {order.map((i) => (
+        <polygon key={i} data-i={i} points={pts[i]} />
       ))}
     </g>
   );
@@ -660,6 +688,23 @@ export default function DrawBoard({
   const flatCentroids = useMemo(() => geom.cells.map((c) => c.centroid), [geom]);
   const centroids = relief === null ? flatCentroids : relief.centroids;
 
+  /**
+   * The framed cells, as a list to walk and a set to test.
+   *
+   * Both are memoised on the geometry, so the layers below stay memoised: a set
+   * rebuilt every render would defeat the whole layer split. `null` for the
+   * unframed case, which is cheaper than a set holding every index and is also
+   * the honest statement — there is no frame, not a frame that admits everything.
+   */
+  const order = useMemo(
+    () => geom.shown ?? geom.cells.map((_, i) => i),
+    [geom]
+  );
+  const visible = useMemo(
+    () => (geom.shown === undefined ? null : new Set(geom.shown)),
+    [geom]
+  );
+
   const drawing = useRef(false);
   const proposing = useRef(false);
   /** A press that landed inside the standing candidate: a tap here commits. */
@@ -873,9 +918,17 @@ export default function DrawBoard({
 
       <rect width={geom.width} height={geom.height} fill="url(#draw-vignette)" />
 
-      <TileLayer geom={geom} pts={pts} show={showTiling} />
-      <PaintLayer geom={geom} pts={pts} paint={paint} weld={weld} />
-      {relief && <WashLayer pts={pts} wash={relief.wash} />}
+      <TileLayer geom={geom} pts={pts} order={order} show={showTiling} />
+      <PaintLayer
+        geom={geom}
+        pts={pts}
+        paint={paint}
+        visible={visible}
+        weld={weld}
+      />
+      {relief && (
+        <WashLayer pts={pts} wash={relief.wash} visible={visible} />
+      )}
 
       {/* The outline never moves under the relief: the rim is one level set of
           the ring index, so its scale factor is pinned at 1 and the plate
@@ -926,7 +979,7 @@ export default function DrawBoard({
         />
       )}
 
-      <HitLayer pts={pts} />
+      <HitLayer pts={pts} order={order} />
     </svg>
   );
 }

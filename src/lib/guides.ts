@@ -416,21 +416,38 @@ const LATERAL = 3;
 export function stepCursor(
   centroids: readonly Pt[],
   from: number | null,
-  dir: Direction
+  dir: Direction,
+  /**
+   * Which cells the walk may land on. Absent means all of them.
+   *
+   * The sector VIEW draws one sector of the hexagon and the other five are still
+   * in the array — they have to be, because every index in the plate, the
+   * history and the file is an index on the whole model. An arrow key that could
+   * reach them would move the cursor to a cell nobody can see, so the view hands
+   * over its own list and the walk stays inside the frame. The centre-seeking
+   * start honours it too, or the first press would land off-screen.
+   */
+  allowed?: (i: number) => boolean
 ): number {
+  const ok = allowed ?? (() => true);
   if (centroids.length === 0) return -1;
-  if (from === null || from < 0 || from >= centroids.length) {
+  if (from === null || from < 0 || from >= centroids.length || !ok(from)) {
     let sx = 0;
     let sy = 0;
-    for (const c of centroids) {
-      sx += c[0];
-      sy += c[1];
+    let n = 0;
+    for (let i = 0; i < centroids.length; i++) {
+      if (!ok(i)) continue;
+      sx += centroids[i][0];
+      sy += centroids[i][1];
+      n++;
     }
-    const mx = sx / centroids.length;
-    const my = sy / centroids.length;
-    let best = 0;
+    if (n === 0) return -1;
+    const mx = sx / n;
+    const my = sy / n;
+    let best = -1;
     let bestD = Infinity;
     for (let i = 0; i < centroids.length; i++) {
+      if (!ok(i)) continue;
       const d = Math.hypot(centroids[i][0] - mx, centroids[i][1] - my);
       if (d < bestD) {
         bestD = d;
@@ -445,7 +462,7 @@ export function stepCursor(
   let best = from;
   let bestCost = Infinity;
   for (let i = 0; i < centroids.length; i++) {
-    if (i === from) continue;
+    if (i === from || !ok(i)) continue;
     const dx = centroids[i][0] - p[0];
     const dy = centroids[i][1] - p[1];
     const along = dx * ux + dy * uy;
