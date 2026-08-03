@@ -62,13 +62,19 @@ export const SHORTCUTS: readonly ShortcutGroup[] = [
       { chord: "g", keys: "G", what: "symmetry axes" },
       { chord: "h", keys: "H", what: "the tiling under the paint" },
       { chord: "l", keys: "L", what: "weld — no seam inside a filled row" },
-      { chord: "r", keys: "R", what: "relief — hexagon only" },
+      { chord: "r", keys: "R", what: "relief — the ring under the pointer curves the plate" },
       { chord: "shift+r", keys: "Shift R", what: "flip the relief convex / concave" },
     ],
   },
   {
     title: "view",
     rows: [
+      {
+        chord: "v",
+        keys: "V",
+        what: "frame the whole plate, or one sector — nothing is cleared either way",
+      },
+      { chord: ",", keys: ", / .", what: "step the framed sector round the plate" },
       { chord: "space", keys: "Space (hold)", what: "drag the plate to pan; tap it to paint at the cursor" },
       { chord: "=", keys: "+ / =", what: "zoom in" },
       { chord: "-", keys: "−", what: "zoom out" },

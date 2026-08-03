@@ -344,6 +344,17 @@ export interface ArtworkSpec {
    * written before this existed exports exactly the bytes it did.
    */
   overlay?: readonly ArtOverlayGroup[];
+  /**
+   * The cell indices the picture actually shows, ascending. Absent means all of
+   * them, which is what every export did before a view existed.
+   *
+   * A LIST of indices rather than a shortened `cells` array, because `paint` is
+   * keyed by the cell's index on the model and a renumbered picture would need a
+   * second address space to be written down — the exact thing the sector view
+   * exists to avoid. So the model is whole, the payload is whole, and only the
+   * polygons are framed.
+   */
+  shown?: readonly number[];
 }
 
 export interface ArtOverlayGroup {
@@ -422,9 +433,15 @@ export function artworkSvg(spec: ArtworkSpec): string {
       ? ""
       : ` stroke="${colour}" stroke-width="${fmt(spec.seamWidth)}"`;
 
+  // The ascending index walk the exporter has always done, narrowed to the
+  // framed cells when there is a frame. Ascending either way, so the file's
+  // element order is a function of the drawing and not of a Map's insertion.
+  const shown =
+    spec.shown ?? Array.from({ length: spec.cells.length }, (_, i) => i);
+
   if (spec.unpainted !== null) {
     parts.push(`<g fill="${spec.unpainted}"${seamAttr(spec.tileSeam)}>`);
-    for (let i = 0; i < spec.cells.length; i++) {
+    for (const i of shown) {
       if (spec.paint.has(i)) continue;
       parts.push(`<polygon points="${points(spec.cells[i])}"/>`);
     }
@@ -433,7 +450,7 @@ export function artworkSvg(spec: ArtworkSpec): string {
 
   const weld = spec.weldPaint === true;
   parts.push(`<g${weld ? "" : seamAttr(spec.paintSeam)}>`);
-  for (let i = 0; i < spec.cells.length; i++) {
+  for (const i of shown) {
     const c = spec.paint.get(i);
     if (c === undefined) continue;
     parts.push(

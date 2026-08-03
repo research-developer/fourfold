@@ -472,6 +472,33 @@ export function plateFromArtPayload(
 }
 
 /**
+ * A triangle-keyed plate, read into one sector of the hexagon.
+ *
+ * Every file written before the hexagon became the model declares
+ * `canvas: "triangle"` and a plate keyed by bare words — `"ABX"` — because the
+ * triangle was its own canvas with its own address space. There is one address
+ * space now, and a triangle is a SECTOR of it, so those words are the same words
+ * with a sector tag in front. Sector 0 is the one to use: `buildHexagon` builds
+ * it by applying `rotK(·, 0)` — the identity — to the base figure, so sector 0
+ * and the standalone triangle are the same cells in the same order, and the
+ * migration is a rename rather than a reinterpretation.
+ *
+ * The word is untouched, so ancestry survives: `"AB"` covered `"ABA"` before and
+ * `"s0:AB"` covers `"s0:ABA"` after, by the same plain string prefixing. Nothing
+ * is resolved, summarised or dropped — a plate painted at four depths arrives
+ * with all four.
+ */
+export function plateIntoSector(
+  plate: AddressPlate,
+  sector: number
+): AddressPlate {
+  const tag = sectorTag(((sector % 6) + 6) % 6);
+  const out = new Map<Address, string>();
+  for (const [a, hex] of plate) out.set(tag + a, hex);
+  return out;
+}
+
+/**
  * The address entries a payload should carry, or `undefined` when it need not
  * carry any.
  *

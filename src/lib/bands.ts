@@ -108,6 +108,46 @@ export type BandFamily = "A" | "B" | "C";
 
 export const BAND_FAMILIES: readonly BandFamily[] = ["A", "B", "C"] as const;
 
+/**
+ * The family a 60° rotation carries each family to: A ↦ C ↦ B ↦ A.
+ *
+ * The three families are the three EDGE directions, and a 60° rotation permutes
+ * them cyclically — there is no fourth direction for one to escape into. Which
+ * way round the cycle runs is not obvious and is not guessed: with
+ * `rot(a, b) = (−b, a + b)`, family B is the level set of `a` and its lines run
+ * along e₂; e₂ ↦ e₂ − e₁, which is family A's direction; so B ↦ A, and the cycle
+ * closes as A ↦ C ↦ B. `test/view.test.ts` measures it against the partitions
+ * themselves rather than resting on that sentence.
+ */
+const ROTATED_FAMILY: Readonly<Record<BandFamily, BandFamily>> = {
+  A: "C",
+  C: "B",
+  B: "A",
+};
+
+/**
+ * Which HEXAGON family names, inside sector `s`, the direction the base
+ * triangle's family `f` names.
+ *
+ * Sector s is `R^s` of the base triangle, so the base triangle's family-f rows
+ * arrive in sector s rotated by 60°·s — and a rotation permutes the families.
+ * The sector VIEW turns the sector back apex-up, so a user who picks "band A"
+ * there means the base triangle's family A, the rows parallel to the sector's
+ * outer edge, whichever sector is framed. Without this the letter would name a
+ * different direction in four of the six sectors while the picture looked
+ * identical, which is a control that lies.
+ *
+ * Depends on `s mod 3` only, because `R³` is the point reflection and a line
+ * direction is unsigned. Sectors 0 and 3 are therefore the identity, which is
+ * why the standalone triangle and sector 0 have always agreed about the letters.
+ */
+export function sectorBandFamily(f: BandFamily, sector: number): BandFamily {
+  let out = f;
+  const n = ((sector % 3) + 3) % 3;
+  for (let k = 0; k < n; k++) out = ROTATED_FAMILY[out];
+  return out;
+}
+
 export interface BandIndex {
   family: BandFamily;
   /** Signed integer band coordinate, exact. */
