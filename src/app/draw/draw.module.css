@@ -118,6 +118,53 @@
   overscroll-behavior: contain;
 }
 
+/* The column wrappers exist ONLY for the wide layout below; everywhere else
+   they must not be boxes at all, or they would break the single stacked flow
+   the rail has at every other width. */
+.railCol {
+  display: contents;
+}
+
+.railCol:last-of-type > .section:last-child {
+  border-bottom: 0;
+}
+
+/**
+ * Wide screens: the rail goes to two columns rather than growing a scrollbar.
+ *
+ * The plate column is capped by the HEIGHT budget, not by the width available —
+ * at 1512 the canvas wants 752px and the column offers 1110 — so the extra
+ * 320px was dead space. Spending it on a second rail column is what lets five
+ * new controls arrive without the panel becoming something you have to scroll
+ * to operate. The breakpoint is set where the canvas stops paying for it: below
+ * 1480 the plate would start shrinking, and a smaller drawing is a worse trade
+ * than a scrollbar.
+ */
+@media (min-width: 1480px) {
+  .stage {
+    grid-template-columns: 624px minmax(0, 1fr);
+  }
+  .rail {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+  .railCol {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+  .railCol + .railCol {
+    border-left: 1px solid var(--rule);
+  }
+  .railCol > .section:last-child {
+    border-bottom: 0;
+  }
+  .railFade {
+    grid-column: 1 / -1;
+  }
+}
+
 @media (max-width: 1040px) {
   .stage {
     grid-template-columns: minmax(0, 1fr);
@@ -136,12 +183,8 @@
 /* ---------- rail sections ---------- */
 
 .section {
-  padding: 11px 13px 13px;
+  padding: 9px 12px 11px;
   border-bottom: 1px solid var(--rule);
-}
-
-.section:last-child {
-  border-bottom: 0;
 }
 
 /* The rail scrolls; without this the last section ends on a hard edge and
@@ -161,7 +204,7 @@
   align-items: baseline;
   justify-content: space-between;
   gap: 10px;
-  margin-bottom: 10px;
+  margin-bottom: 8px;
 }
 
 .sectionTitle {
@@ -182,14 +225,35 @@
 
 .hint {
   font-size: 10px;
-  line-height: 1.7;
+  line-height: 1.62;
   color: var(--bone-faint);
-  margin: 9px 0 0;
+  margin: 7px 0 0;
 }
 
 .hint b {
   color: var(--bone-dim);
   font-weight: 500;
+}
+
+/* A second-level heading INSIDE a section. The rail was six sections tall
+   before the band, tool and progression controls arrived; folding scheme and
+   orbit-tape under one COLOUR heading buys back the height they cost without
+   hiding anything behind a tab. */
+.subHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 11px 0 7px;
+  padding-top: 9px;
+  border-top: 1px solid var(--rule);
+}
+
+.subTitle {
+  font-size: 9px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
 }
 
 /* ---------- segmented controls ---------- */
@@ -299,25 +363,31 @@
 
 /* ---------- scheme list ---------- */
 
-.schemeList {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
+/* Two columns of stacked swatch-over-name, rather than seven full-width rows.
+   The chips still show the scheme's ACTUAL hues at the current base, which is
+   the whole point of the control; they just fill the cell instead of sitting in
+   a fixed strip. */
+.schemeGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
 }
 
 .schemeBtn {
   display: flex;
-  align-items: center;
-  gap: 9px;
-  padding: 6px 8px;
-  border: 1px solid transparent;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 5px;
+  padding: 6px 7px 5px;
+  border: 1px solid var(--rule);
   border-radius: 2px;
-  background: transparent;
+  background: var(--plate-2);
   color: var(--bone-dim);
   text-transform: none;
   letter-spacing: 0.04em;
-  font-size: 11px;
+  font-size: 10px;
   text-align: left;
+  min-width: 0;
   transition: background 150ms ease, color 150ms ease, border-color 150ms ease;
 }
 
@@ -334,30 +404,22 @@
 
 .schemeSwatches {
   display: flex;
-  flex: none;
   gap: 2px;
+  height: 15px;
 }
 
 .chip {
-  width: 11px;
-  height: 18px;
+  flex: 1;
+  min-width: 0;
   border-radius: 1px;
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.4);
 }
 
 .schemeName {
-  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.schemeCount {
-  flex: none;
-  font-size: 9px;
-  color: var(--bone-faint);
-  font-variant-numeric: tabular-nums;
 }
 
 /* ---------- colour ---------- */
@@ -549,6 +611,225 @@
   }
 }
 
+/* ---------- progression ---------- */
+
+.progList {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.progBtn {
+  padding: 6px 7px;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  background: var(--plate-2);
+  color: var(--bone-dim);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: none;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: background 150ms ease, color 150ms ease, border-color 150ms ease;
+}
+
+.progBtn:hover:not(:disabled) {
+  border-color: var(--rule-bright);
+  color: var(--bone);
+}
+
+.progBtn[aria-pressed="true"] {
+  background: rgba(236, 230, 220, 0.09);
+  border-color: var(--bone);
+  color: var(--bone);
+  font-weight: 600;
+}
+
+/* Where the base colour is HEADING. A progression the user cannot see the shape
+   of is a switch with a rumour attached; six steps is enough to read the
+   direction and the rate at once. */
+.driftWrap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.drift {
+  display: flex;
+  flex: 1;
+  gap: 2px;
+  height: 16px;
+  min-width: 0;
+}
+
+.driftCell {
+  flex: 1;
+  min-width: 0;
+  border-radius: 1px;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.45);
+  transition: background 220ms ease;
+}
+
+.driftKey {
+  flex: none;
+  font-size: 8.5px;
+  letter-spacing: 0.08em;
+  color: var(--bone-faint);
+}
+
+/* ---------- the bench ---------- */
+
+/* Tools sit on the plate beside undo and export, not in the rail: they act on
+   the ARTWORK, and the plate has the horizontal room that the rail — already at
+   its height budget — does not have vertically. */
+.bench {
+  --tool-accent: var(--bone);
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 10px 16px;
+  padding-bottom: 11px;
+  margin-bottom: 11px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.bench[data-tool="erase"] {
+  --tool-accent: #f0a3a3;
+}
+
+.bench[data-tool="adjust"] {
+  --tool-accent: #7dd3fc;
+}
+
+.benchGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.benchKey {
+  font-size: 8.5px;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+}
+
+.benchWide {
+  flex: 1 1 300px;
+}
+
+.benchEnd {
+  margin-left: auto;
+}
+
+.toolSeg,
+.dragSeg {
+  grid-auto-columns: auto;
+  width: max-content;
+  max-width: 100%;
+}
+
+.toolBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 7px 13px;
+}
+
+.toolGlyph {
+  width: 12px;
+  height: 12px;
+  flex: none;
+}
+
+/* The active tool is the loudest thing in the strip, and it changes colour with
+   the tool — so "which brush am I holding" is answered by hue, by glyph and by
+   the word, and no one of the three has to carry it alone. */
+.toolSeg .segBtn[aria-pressed="true"] {
+  background: var(--tool-accent);
+  color: var(--ink);
+}
+
+.adjustGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(94px, 1fr));
+  gap: 4px;
+}
+
+.adjustBtn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 7px;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  background: var(--plate-2);
+  color: var(--bone-dim);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: none;
+  min-width: 0;
+  transition: background 150ms ease, color 150ms ease, border-color 150ms ease;
+}
+
+.adjustBtn:hover:not(:disabled) {
+  border-color: var(--rule-bright);
+  color: var(--bone);
+}
+
+.adjustBtn[aria-pressed="true"] {
+  border-color: var(--tool-accent);
+  color: var(--bone);
+  background: rgba(125, 211, 252, 0.12);
+}
+
+/* Each chip is the adjustment APPLIED to the current base, so the control shows
+   its own effect rather than naming it. */
+.adjustChip {
+  width: 12px;
+  height: 12px;
+  flex: none;
+  border-radius: 1px;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.5);
+}
+
+.commitRow {
+  display: flex;
+  gap: 6px;
+}
+
+.commitBtn {
+  background: var(--lime);
+  border-color: var(--lime);
+  color: var(--ink);
+  font-weight: 600;
+  animation: commit-pulse 2s ease-in-out infinite;
+}
+
+.commitBtn:hover:not(:disabled) {
+  background: #b6f04a;
+  border-color: #b6f04a;
+}
+
+.commitBtn:disabled {
+  animation: none;
+}
+
+@keyframes commit-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(163, 230, 53, 0);
+  }
+  50% {
+    box-shadow: 0 0 0 4px rgba(163, 230, 53, 0.18);
+  }
+}
+
 /* ---------- toggles ---------- */
 
 .checkRow {
@@ -578,8 +859,9 @@
 
 .plateCol {
   /* Height the canvas is allowed to take. A drawing program whose canvas does
-     not fit on screen is a scroll bar with a hobby. */
-  --d-avail: calc(100dvh - 288px);
+     not fit on screen is a scroll bar with a hobby. The reserve counts the
+     masthead, the plate rule, the tool bench and the legend. */
+  --d-avail: calc(100dvh - 330px);
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -649,8 +931,31 @@
 .readout {
   display: flex;
   flex-wrap: wrap;
+  align-items: center;
   gap: 4px 16px;
   min-width: 0;
+}
+
+/* The active tool, first in the status line and in the tool's own colour. */
+.plateRule {
+  --tool-accent: var(--bone);
+}
+
+.plateRule[data-tool="erase"] {
+  --tool-accent: #f0a3a3;
+}
+
+.plateRule[data-tool="adjust"] {
+  --tool-accent: #7dd3fc;
+}
+
+.toolStatus {
+  padding: 3px 7px;
+  border: 1px solid var(--tool-accent);
+  border-radius: 2px;
+  color: var(--tool-accent);
+  font-weight: 600;
+  letter-spacing: 0.22em;
 }
 
 /* Actions live on the plate, not in the rail: they act on the artwork, and the
@@ -678,12 +983,89 @@
     padding: 11px 4px;
     font-size: 9.5px;
   }
+
+  /* Every bench group takes the full row and every target grows: a phone has
+     one column of room and a thumb, not a pointer. */
+  .benchGroup {
+    flex: 1 1 100%;
+  }
+  .toolSeg,
+  .dragSeg {
+    width: 100%;
+    grid-auto-columns: 1fr;
+  }
+  .toolBtn {
+    padding: 10px 4px;
+  }
+  .dragSeg .segBtn {
+    padding: 10px 4px;
+  }
+  .adjustGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .adjustBtn {
+    padding: 9px 8px;
+    font-size: 9.5px;
+  }
+  .benchEnd {
+    margin-left: 0;
+  }
+  .commitRow button {
+    flex: 1;
+    padding: 11px 8px;
+  }
 }
 
 .canvasHold {
   position: relative;
   display: flex;
   justify-content: center;
+}
+
+/* A destructive or transforming brush must never be a state you can only infer
+   from a control you are not looking at. The flag sits ON the artwork. */
+.modeFlag {
+  position: absolute;
+  top: 5px;
+  left: 5px;
+  z-index: 1;
+  padding: 4px 8px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  background: rgba(10, 9, 8, 0.72);
+  font-size: 8.5px;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+.modeFlag[data-tool="erase"] {
+  color: #f0a3a3;
+}
+
+.modeFlag[data-tool="adjust"] {
+  color: #7dd3fc;
+}
+
+.canvasHold[data-tool="erase"] .canvas {
+  cursor: cell;
+}
+
+.canvasHold[data-tool="adjust"] .canvas {
+  cursor: copy;
+}
+
+/* The standing proposal, told apart from committed paint by TWO channels at
+   once — a quarter-strength fill and a travelling dash — so it survives a
+   monochrome screenshot and a colour-blind viewer alike. */
+.marching {
+  animation: march 900ms linear infinite;
+}
+
+@keyframes march {
+  to {
+    stroke-dashoffset: -24;
+  }
 }
 
 .canvas {
@@ -774,6 +1156,21 @@
 
 /* ---------- footnote ---------- */
 
+/* The keyboard contract, moved out of the rail: it is about the PLATE, and the
+   rail's vertical budget is spent on controls that change what the brush is. */
+.keys {
+  font-size: 10px;
+  line-height: 1.7;
+  color: var(--bone-dim);
+  margin: 0;
+  max-width: 92ch;
+}
+
+.keys b {
+  color: var(--bone);
+  font-weight: 500;
+}
+
 .foot {
   font-size: 10px;
   line-height: 1.8;
@@ -792,12 +1189,15 @@
 
 @media (prefers-reduced-motion: reduce) {
   .tapeCell,
-  .emptyHint {
+  .emptyHint,
+  .marching,
+  .commitBtn {
     animation: none;
   }
   .dialBtn,
   .preset,
-  .schemeRule {
+  .schemeRule,
+  .driftCell {
     transition: none;
   }
 }

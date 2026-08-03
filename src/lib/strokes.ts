@@ -257,7 +257,50 @@ export interface ArtworkSpec {
   paintSeam: string | null;
   seamWidth: number;
   title: string;
+  /**
+   * Weld the paint: stroke every painted cell in ITS OWN fill colour instead of
+   * in `paintSeam`, so a run of same-coloured cells is one shape.
+   *
+   * This is not the same as `paintSeam: null`, and the difference is the whole
+   * reason the flag exists. With no stroke at all, two polygons that share an
+   * edge each cover about half of the boundary pixels, the plate shows through
+   * the other half, and a filled row comes out with a dark hairline every cell —
+   * exactly the "run of triangles" a band brush is trying not to be. Stroking
+   * each cell in its own fill closes that seam at the source, in the file as
+   * well as on screen, and leaves cells of DIFFERENT colours meeting cleanly
+   * because each half of the join is painted in its own colour.
+   *
+   * Optional and absent by default, so a spec written before this existed still
+   * exports exactly the bytes it did.
+   */
+  weldPaint?: boolean;
 }
+
+/**
+ * How much wider than a hairline a weld stroke is.
+ *
+ * The weld exists because dropping the seam is NOT enough — that much was
+ * measured directly: the same exported file, rendered once as written and once
+ * with the per-cell strokes deleted, comes out as a solid band and as a ruled
+ * run of triangles. So the stroke is load-bearing.
+ *
+ * The factor is a margin rather than a measured threshold, and the honest
+ * reason is arithmetic. The seam is a hairline by construction — about 2.2% of
+ * a cell edge — and a board scales its whole viewBox to fit, so at a depth-4
+ * hexagon on a 700px board that hairline is 0.43 of a DEVICE pixel and on a
+ * 350px phone it is 0.2. A stroke thinner than a pixel only ever covers a
+ * fraction of the join it is closing. At three seam widths it is over a pixel
+ * at every depth on both canvases and on both screen sizes, and still under a
+ * tenth of a cell edge — so a join between two DIFFERENT colours does not
+ * visibly move, both sides growing by the same amount about a boundary the
+ * geometry already fixed.
+ *
+ * What is NOT claimed: that 1x is visibly broken at desktop scale. Rendered
+ * side by side at the board's own scale, 1x and 3x were indistinguishable. The
+ * factor buys the small scales, where the arithmetic says the hairline runs
+ * out.
+ */
+export const WELD_WIDTH = 3;
 
 /** Two decimals is under a thousandth of a cell edge at every depth we draw. */
 function fmt(n: number): string {
@@ -311,11 +354,18 @@ export function artworkSvg(spec: ArtworkSpec): string {
     parts.push(`</g>`);
   }
 
-  parts.push(`<g${seamAttr(spec.paintSeam)}>`);
+  const weld = spec.weldPaint === true;
+  parts.push(`<g${weld ? "" : seamAttr(spec.paintSeam)}>`);
   for (let i = 0; i < spec.cells.length; i++) {
     const c = spec.paint.get(i);
     if (c === undefined) continue;
-    parts.push(`<polygon points="${points(spec.cells[i])}" fill="${c}"/>`);
+    parts.push(
+      `<polygon points="${points(spec.cells[i])}" fill="${c}"${
+        weld
+          ? ` stroke="${c}" stroke-width="${fmt(spec.seamWidth * WELD_WIDTH)}"`
+          : ""
+      }/>`
+    );
   }
   parts.push(`</g>`);
 

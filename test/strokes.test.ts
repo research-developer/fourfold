@@ -11,6 +11,7 @@ import {
   planEdits,
   redo,
   undo,
+  WELD_WIDTH,
   type CellEdit,
   type History,
   type Stroke,
@@ -276,5 +277,50 @@ describe("artworkSvg", () => {
     const svg = artworkSvg({ ...spec, paint: new Map(), unpainted: null });
     expect(svg).not.toContain("<polygon");
     expect(svg).toContain('fill="#0a0908"');
+  });
+
+  describe("weldPaint", () => {
+    const many = {
+      ...spec,
+      paint: paintOf([
+        [0, "#ff0000"],
+        [1, "#ff0000"],
+        [2, "#00ff00"],
+      ]),
+    };
+
+    it("is off unless asked for, so an old spec exports the same bytes", () => {
+      expect(artworkSvg(many)).toBe(artworkSvg({ ...many, weldPaint: false }));
+    });
+
+    it("strokes each painted cell in its own fill and drops the group seam", () => {
+      const svg = artworkSvg({ ...many, weldPaint: true });
+      expect(svg).not.toContain('<g stroke="rgba(0,0,0,.3)"');
+      expect(svg).toContain('fill="#ff0000" stroke="#ff0000" stroke-width="1.5"');
+      expect(svg).toContain('fill="#00ff00" stroke="#00ff00" stroke-width="1.5"');
+    });
+
+    /**
+     * The weld is wider than the hairline it replaces, because a sub-pixel
+     * stroke only partly covers the join it is closing — see the note on
+     * WELD_WIDTH for what that is and is not claimed to fix.
+     */
+    it("welds wider than the hairline it replaces", () => {
+      expect(WELD_WIDTH).toBeGreaterThan(1);
+      // 0.7 is a depth-4 hexagon's hairline, to two places.
+      const svg = artworkSvg({ ...many, weldPaint: true, seamWidth: 0.7 });
+      // Written through the same two-place rounding as every other number in
+      // the file — 0.7 * 3 is 2.0999999999999996 in doubles, and the file says
+      // 2.1, which is the whole reason `fmt` exists.
+      expect(WELD_WIDTH).toBe(3);
+      expect(svg).toContain('stroke-width="2.1"');
+      // The tiling's own seam is untouched by the factor.
+      expect(svg).toContain('stroke="rgba(236,230,220,.16)" stroke-width="0.7"');
+    });
+
+    it("leaves the tiling's own seam alone", () => {
+      const svg = artworkSvg({ ...spec, weldPaint: true });
+      expect(svg).toContain('<g fill="#141110" stroke="rgba(236,230,220,.16)"');
+    });
   });
 });

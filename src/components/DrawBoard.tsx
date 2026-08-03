@@ -2,7 +2,7 @@
 
 import { memo, useCallback, useEffect, useRef, type ReactElement } from "react";
 import type { Direction, Guides } from "@/lib/guides";
-import type { PaintMap } from "@/lib/strokes";
+import { WELD_WIDTH, type PaintMap } from "@/lib/strokes";
 
 /**
  * The drawing surface.
@@ -38,6 +38,25 @@ import type { PaintMap } from "@/lib/strokes";
  * target and a drag paints exactly one cell forever. Releasing the capture on
  * pointerdown is the fix, and it is the entire reason drag-to-paint works on a
  * phone.
+ *
+ * ── Two drag behaviours, and why the second one exists ───────────────────
+ *
+ * A finger has no hover. The ghost preview — the thing that TEACHES what a
+ * symmetry brush is about to do — is therefore unreachable on a phone, where it
+ * is needed most, because the first contact with the plate is already a stroke.
+ *
+ * `propose` mode makes the press itself the hover: a drag moves a CANDIDATE and
+ * commits nothing, lifting the finger leaves it standing, and a tap on it lays
+ * the paint. Two consequences fall out for free. The candidate survives a change
+ * of brush, scheme or colour, so the settings can be auditioned against a
+ * real proposal before anything is committed; and a mis-aimed first touch costs
+ * nothing, which on a 390px screen is the difference between a drawing tool and
+ * a guessing game.
+ *
+ * The commit gesture is a TAP ON THE CANDIDATE, not a tap anywhere, so the
+ * "move it" and "keep it" gestures never contend: pressing inside the standing
+ * proposal arms a commit and pressing outside it re-proposes. Dragging away
+ * from an armed press disarms it, because that is a drag and not a tap.
  */
 
 export interface BoardCell {
@@ -56,30 +75,52 @@ export interface BoardGeometry {
 }
 
 export interface PreviewSpec {
-  /** The orbit that would be painted. */
+  /** The cells that would take colour. */
   cells: readonly number[];
-  /** Its colours, aligned to `cells`. */
+  /** Their colours, aligned to `cells`. */
   colours: readonly string[];
+  /**
+   * Cells under the brush that would NOT change — an adjustment landing on a
+   * cell nobody has painted yet. Outlined and not filled, because "the brush
+   * reaches here and will do nothing" is a fact worth showing rather than an
+   * absence worth hiding.
+   */
+  inert: readonly number[];
   /** The cell actually under the pointer. */
   seed: number;
   /** True when the brush would erase rather than paint. */
   erasing: boolean;
 }
 
+/** True when the spec's brush reaches cell `i` at all, inert or not. */
+export const previewCovers = (spec: PreviewSpec, i: number): boolean =>
+  spec.cells.includes(i) || spec.inert.includes(i);
+
+export type DragBehaviour = "paint" | "propose";
+
 interface Props {
   geom: BoardGeometry;
   paint: PaintMap;
   preview: PreviewSpec | null;
+  /** The standing proposal in `propose` mode. Committed by a tap on itself. */
+  candidate: PreviewSpec | null;
   cursor: number | null;
   guides: Guides;
   showGuides: boolean;
   showTiling: boolean;
+  /** Stroke painted cells in their own fill, so a filled row is one shape. */
+  weld: boolean;
+  dragBehaviour: DragBehaviour;
   label: string;
   /** Supplied by the page, which owns the CSS module the class lives in. */
   className: string;
+  /** Ditto: the marching-ants animation on the candidate outline. */
+  candidateClass: string;
   onHover: (i: number | null) => void;
   onPaint: (i: number) => void;
   onStrokeEnd: () => void;
+  onPropose: (i: number) => void;
+  onCommit: () => void;
   onArrow: (dir: Direction) => void;
   onCursorPaint: () => void;
 }
@@ -112,7 +153,13 @@ const TileLayer = memo(function TileLayer({
 }) {
   if (!show) return null;
   return (
-    <g fill={TILE} stroke={SEAM} strokeWidth={geom.seamWidth} pointerEvents="none">
+    <g
+      data-layer="tiling"
+      fill={TILE}
+      stroke={SEAM}
+      strokeWidth={geom.seamWidth}
+      pointerEvents="none"
+    >
       {geom.cells.map((c, i) => (
         <polygon key={i} points={points(c)} />
       ))}
@@ -120,22 +167,46 @@ const TileLayer = memo(function TileLayer({
   );
 });
 
-/** Only the painted cells. Re-renders once per stroke step. */
+/**
+ * Only the painted cells. Re-renders once per stroke step.
+ *
+ * `weld` is what makes a band read as one thick line instead of a run of
+ * triangles. Turning the seam OFF is not enough on its own: two polygons that
+ * share an edge each cover about half of the boundary pixels, and the plate
+ * shows through the rest as a dark hairline at every cell. Stroking each cell in
+ * its own fill closes the join at the source, and cells of different colours
+ * still meet cleanly because each side of the join is painted in its own colour.
+ * `artworkSvg`'s `weldPaint` does the identical thing in the exported file.
+ */
 const PaintLayer = memo(function PaintLayer({
   geom,
   paint,
+  weld,
 }: {
   geom: BoardGeometry;
   paint: PaintMap;
+  weld: boolean;
 }) {
   const out: ReactElement[] = [];
   for (const [i, colour] of paint) {
     const cell = geom.cells[i];
     if (cell === undefined) continue;
-    out.push(<polygon key={i} points={points(cell)} fill={colour} />);
+    out.push(
+      <polygon
+        key={i}
+        points={points(cell)}
+        fill={colour}
+        stroke={weld ? colour : undefined}
+      />
+    );
   }
   return (
-    <g stroke={PAINT_SEAM} strokeWidth={geom.seamWidth} pointerEvents="none">
+    <g
+      data-layer="paint"
+      stroke={weld ? undefined : PAINT_SEAM}
+      strokeWidth={weld ? geom.seamWidth * WELD_WIDTH : geom.seamWidth}
+      pointerEvents="none"
+    >
       {out}
     </g>
   );
@@ -144,7 +215,7 @@ const PaintLayer = memo(function PaintLayer({
 /** Transparent, topmost, and the only thing the pointer ever hits. */
 const HitLayer = memo(function HitLayer({ geom }: { geom: BoardGeometry }) {
   return (
-    <g fill="transparent">
+    <g data-layer="hit" fill="transparent">
       {geom.cells.map((c, i) => (
         <polygon key={i} data-i={i} points={points(c)} />
       ))}
@@ -296,23 +367,122 @@ const GuideLayer = memo(function GuideLayer({
   );
 });
 
+/**
+ * The ghost: the cells that WOULD be touched, in the colours they would take.
+ *
+ * Fill at a third under a full-strength edge, over an ink halo. The halo is not
+ * decoration — the ghost has to be legible both on bare plate and on paint of
+ * any hue the user chose, and a single stroke cannot do both: over a similar
+ * colour it vanishes.
+ *
+ * `standing` is the propose-mode candidate rather than a hover. It reads
+ * DIFFERENTLY on purpose, and by two channels at once, because "this is not
+ * committed yet" has to survive both a colour-blind viewer and a monochrome
+ * screenshot: the fill drops to a quarter and the outline becomes a marching
+ * dash. Colour alone would have said it to nobody.
+ */
+const Ghost = memo(function Ghost({
+  geom,
+  spec,
+  standing,
+  dashClass,
+}: {
+  geom: BoardGeometry;
+  spec: PreviewSpec;
+  standing: boolean;
+  dashClass: string;
+}) {
+  const seed = geom.cells[spec.seed];
+  return (
+    <g pointerEvents="none">
+      {spec.cells.map((i, k) => {
+        const cell = geom.cells[i];
+        if (cell === undefined) return null;
+        const colour = spec.erasing ? "#ece6dc" : spec.colours[k] ?? "#ece6dc";
+        return (
+          <g key={i}>
+            <polygon
+              points={points(cell)}
+              fill="none"
+              stroke="rgba(10,9,8,.85)"
+              strokeWidth={5}
+              strokeLinejoin="round"
+            />
+            <polygon
+              className={standing ? dashClass : undefined}
+              points={points(cell)}
+              fill={spec.erasing ? "none" : colour}
+              fillOpacity={standing ? 0.26 : 0.55}
+              stroke={colour}
+              strokeWidth={standing ? 2.2 : 2.6}
+              strokeDasharray={
+                standing ? "7 5" : spec.erasing ? "5 4" : undefined
+              }
+              strokeLinejoin="round"
+            />
+          </g>
+        );
+      })}
+
+      {/* Reached, and nothing to do here. */}
+      {spec.inert.map((i) => {
+        const cell = geom.cells[i];
+        if (cell === undefined) return null;
+        return (
+          <polygon
+            key={`inert-${i}`}
+            points={points(cell)}
+            fill="none"
+            stroke="rgba(236,230,220,.42)"
+            strokeWidth={1.2}
+            strokeDasharray="2 5"
+            strokeLinejoin="round"
+          />
+        );
+      })}
+
+      {seed && (
+        <circle
+          cx={seed.centroid[0]}
+          cy={seed.centroid[1]}
+          r={Math.max(3, geom.seamWidth * 5)}
+          fill="none"
+          stroke="#ece6dc"
+          strokeWidth={standing ? 2.6 : 2}
+          opacity={0.9}
+        />
+      )}
+    </g>
+  );
+});
+
 export default function DrawBoard({
   geom,
   paint,
   preview,
+  candidate,
   cursor,
   guides,
   showGuides,
   showTiling,
+  weld,
+  dragBehaviour,
   label,
   className,
+  candidateClass,
   onHover,
   onPaint,
   onStrokeEnd,
+  onPropose,
+  onCommit,
   onArrow,
   onCursorPaint,
 }: Props) {
   const drawing = useRef(false);
+  const proposing = useRef(false);
+  /** A press that landed inside the standing candidate: a tap here commits. */
+  const armed = useRef(false);
+  const moved = useRef(false);
   const last = useRef<number | null>(null);
 
   const indexOf = (target: EventTarget | null): number | null => {
@@ -323,11 +493,20 @@ export default function DrawBoard({
   };
 
   const end = useCallback(() => {
+    if (proposing.current) {
+      const commitNow = armed.current && !moved.current;
+      proposing.current = false;
+      armed.current = false;
+      moved.current = false;
+      last.current = null;
+      if (commitNow) onCommit();
+      return;
+    }
     if (!drawing.current) return;
     drawing.current = false;
     last.current = null;
     onStrokeEnd();
-  }, [onStrokeEnd]);
+  }, [onStrokeEnd, onCommit]);
 
   // A gesture can finish anywhere — off the plate, off the window, or by the
   // browser cancelling the pointer. Every one of those has to close the stroke,
@@ -346,6 +525,20 @@ export default function DrawBoard({
     if (i === null) return;
     const el = e.target as Element;
     if (el.hasPointerCapture?.(e.pointerId)) el.releasePointerCapture(e.pointerId);
+
+    if (dragBehaviour === "propose") {
+      proposing.current = true;
+      moved.current = false;
+      last.current = i;
+      // Inside the standing proposal this press is a commit, and must NOT also
+      // move the candidate: the plate would jump under the finger and then be
+      // painted somewhere the user did not aim.
+      const onCandidate = candidate !== null && previewCovers(candidate, i);
+      armed.current = onCandidate;
+      if (!onCandidate) onPropose(i);
+      return;
+    }
+
     drawing.current = true;
     last.current = i;
     onHover(i);
@@ -354,6 +547,21 @@ export default function DrawBoard({
 
   const move = (e: React.PointerEvent<SVGSVGElement>) => {
     const i = indexOf(e.target);
+
+    if (dragBehaviour === "propose") {
+      if (!proposing.current) {
+        onHover(i);
+        return;
+      }
+      if (i === null || i === last.current) return;
+      last.current = i;
+      moved.current = true;
+      // Dragged off the tap it started as, so it is a drag: re-propose.
+      armed.current = false;
+      onPropose(i);
+      return;
+    }
+
     if (!drawing.current) {
       onHover(i);
       return;
@@ -407,7 +615,7 @@ export default function DrawBoard({
       <rect width={geom.width} height={geom.height} fill="url(#draw-vignette)" />
 
       <TileLayer geom={geom} show={showTiling} />
-      <PaintLayer geom={geom} paint={paint} />
+      <PaintLayer geom={geom} paint={paint} weld={weld} />
 
       <polygon
         points={geom.outline.map((v) => `${v[0]},${v[1]}`).join(" ")}
@@ -419,53 +627,21 @@ export default function DrawBoard({
 
       <GuideLayer guides={guides} show={showGuides} />
 
-      {/* The ghost: the orbit that WOULD be painted, in the colours it would
-          take. Fill at a third and a full-strength edge, so it reads over both
-          bare plate and finished paint. */}
       {preview && (
-        <g pointerEvents="none">
-          {preview.cells.map((i, k) => {
-            const cell = geom.cells[i];
-            if (cell === undefined) return null;
-            const colour = preview.erasing
-              ? "#ece6dc"
-              : preview.colours[k] ?? "#ece6dc";
-            return (
-              <g key={i}>
-                {/* An ink halo first. The ghost has to be legible both on bare
-                    plate and on paint of any hue the user chose, and a single
-                    stroke cannot do both — over a similar colour it vanishes. */}
-                <polygon
-                  points={points(cell)}
-                  fill="none"
-                  stroke="rgba(10,9,8,.85)"
-                  strokeWidth={5}
-                  strokeLinejoin="round"
-                />
-                <polygon
-                  points={points(cell)}
-                  fill={preview.erasing ? "none" : colour}
-                  fillOpacity={0.55}
-                  stroke={colour}
-                  strokeWidth={2.6}
-                  strokeDasharray={preview.erasing ? "5 4" : undefined}
-                  strokeLinejoin="round"
-                />
-              </g>
-            );
-          })}
-          {geom.cells[preview.seed] && (
-            <circle
-              cx={geom.cells[preview.seed].centroid[0]}
-              cy={geom.cells[preview.seed].centroid[1]}
-              r={Math.max(3, geom.seamWidth * 5)}
-              fill="none"
-              stroke="#ece6dc"
-              strokeWidth={2}
-              opacity={0.9}
-            />
-          )}
-        </g>
+        <Ghost
+          geom={geom}
+          spec={preview}
+          standing={false}
+          dashClass={candidateClass}
+        />
+      )}
+      {candidate && (
+        <Ghost
+          geom={geom}
+          spec={candidate}
+          standing
+          dashClass={candidateClass}
+        />
       )}
 
       {cursorCell && (
