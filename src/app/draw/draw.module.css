@@ -859,6 +859,257 @@
   }
 }
 
+/* ---------- presets ---------- */
+
+/* Four buttons, two by two, sized like the scheme grid they sit under so the
+   rail reads as one column of controls rather than a stack of dialects. */
+.presetGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 4px;
+}
+
+.presetBtn {
+  padding: 8px 7px;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  background: var(--plate-2);
+  color: var(--bone-dim);
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: none;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: background 150ms ease, color 150ms ease, border-color 150ms ease;
+}
+
+.presetBtn:hover:not(:disabled) {
+  border-color: var(--rule-bright);
+  color: var(--bone);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+/* ---------- the destructive control ---------- */
+
+/**
+ * NEW is the only button on the page that empties the plate, and it is the only
+ * one wearing a warm accent — so "this one destroys" is carried by hue, by the
+ * word, and by the fact that it asks twice, and no one of the three has to carry
+ * it alone.
+ */
+.newBtn {
+  position: relative;
+  overflow: hidden;
+  border-color: rgba(240, 163, 163, 0.5);
+  color: #f0a3a3;
+}
+
+.newBtn:hover:not(:disabled) {
+  border-color: #f0a3a3;
+  background: rgba(240, 163, 163, 0.1);
+}
+
+/* Armed: the button has REPLACED itself, so the second click lands on the same
+   pixels as the first. That is the property that makes this a guard rather than
+   a game of chase-the-button. */
+.armedBtn {
+  background: #f0a3a3;
+  border-color: #f0a3a3;
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.armedBtn:hover:not(:disabled) {
+  background: #f6bcbc;
+  border-color: #f6bcbc;
+  color: var(--ink);
+}
+
+/* The fuse: how long the arming lasts, shown rather than guessed at. Its
+   duration is set inline from the same constant the timer uses. */
+.armFuse {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  width: 100%;
+  background: rgba(10, 9, 8, 0.55);
+  transform-origin: left;
+  animation: fuse linear both;
+}
+
+@keyframes fuse {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+
+.zoomGroup {
+  display: inline-flex;
+  gap: 2px;
+}
+
+.zoomGroup button {
+  font-variant-numeric: tabular-nums;
+  min-width: 26px;
+}
+
+/* ---------- the shortcut panel ---------- */
+
+.helpScrim {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(10px, 3vw, 40px);
+  background: rgba(6, 5, 5, 0.78);
+  backdrop-filter: blur(3px);
+  animation: scrim-in 160ms ease both;
+}
+
+@keyframes scrim-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.helpPanel {
+  width: min(880px, 100%);
+  max-height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: clamp(14px, 2vw, 22px);
+  background: var(--plate);
+  border: 1px solid var(--rule-bright);
+  border-radius: 3px;
+  box-shadow: 0 30px 90px -30px rgba(0, 0, 0, 0.95);
+  animation: panel-in 220ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes panel-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.99);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.helpHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding-bottom: 10px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--rule);
+}
+
+.helpTitle {
+  font-family: var(--font-display), Georgia, serif;
+  font-size: 30px;
+  line-height: 1;
+  margin: 0;
+  color: var(--bone);
+}
+
+.helpClose {
+  font-size: 9px;
+  letter-spacing: 0.16em;
+  padding: 6px 11px;
+}
+
+.helpCols {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 14px 26px;
+}
+
+.helpGroup {
+  min-width: 0;
+}
+
+.helpGroupTitle {
+  font-size: 9px;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+  margin: 0 0 7px;
+  font-weight: 500;
+}
+
+.helpList {
+  margin: 0;
+}
+
+.helpRow {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+  padding: 3px 0;
+}
+
+.helpKeys {
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  color: var(--bone);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.helpWhat {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--bone-faint);
+}
+
+.helpFoot {
+  margin: 16px 0 0;
+  padding-top: 11px;
+  border-top: 1px solid var(--rule);
+  font-size: 10px;
+  line-height: 1.75;
+  color: var(--bone-faint);
+  max-width: 92ch;
+}
+
+.helpFoot b {
+  color: var(--bone-dim);
+  font-weight: 500;
+}
+
+@media (max-width: 700px) {
+  /* One column, so the chord stacks over what it does. Side by side at 390px
+     the key column had to be 78px and `Space (hold)` and `Option / Alt` were
+     both ellipsised — a shortcut panel that cannot print the shortcut. */
+  .helpRow {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1px;
+    padding: 5px 0;
+  }
+  .helpKeys {
+    white-space: normal;
+  }
+  .helpClose {
+    padding: 10px 14px;
+  }
+}
+
 /* ---------- toggles ---------- */
 
 .checkRow {
@@ -1022,12 +1273,25 @@
 /* Touch: the toolbar drops onto its own row anyway, so spend the space on
    targets a thumb can actually hit. */
 @media (max-width: 700px) {
+  /* Ten controls do not fit one 390px row, and squeezing them clipped the last
+     one — measured: NEW lost its last two letters. So the row WRAPS, and the
+     zoom trio is kept together as one unit rather than being stretched like the
+     rest, because "−  1×  +" only reads as a control when the three are
+     adjacent. */
   .tools {
     width: 100%;
+    flex-wrap: wrap;
   }
-  .tools button {
-    flex: 1;
+  .tools > button {
+    flex: 1 1 60px;
     padding: 11px 4px;
+    font-size: 9.5px;
+  }
+  .zoomGroup {
+    flex: 0 0 auto;
+  }
+  .zoomGroup button {
+    padding: 11px 8px;
     font-size: 9.5px;
   }
 
@@ -1099,6 +1363,21 @@
 
 .canvasHold[data-tool="adjust"] .canvas {
   cursor: copy;
+}
+
+/* The cursor states the gesture. Space wins over the tool, because it overrides
+   the tool. */
+.canvas[data-gesture="line"],
+.canvas[data-gesture="ring"] {
+  cursor: crosshair;
+}
+
+.canvas[data-gesture="pan"] {
+  cursor: grab;
+}
+
+.canvas[data-gesture="pan"]:active {
+  cursor: grabbing;
 }
 
 /* The standing proposal, told apart from committed paint by TWO channels at
@@ -1309,11 +1588,17 @@
   .tapeCell,
   .emptyHint,
   .marching,
-  .commitBtn {
+  .commitBtn,
+  .helpScrim,
+  .helpPanel {
     animation: none;
   }
+  /* The fuse keeps its animation: it is not decoration, it is the only display
+     of how long the armed button has left, and a still bar would state a
+     deadline that is not there. */
   .dialBtn,
   .preset,
+  .presetBtn,
   .schemeRule,
   .driftCell {
     transition: none;

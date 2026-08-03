@@ -36,24 +36,57 @@ import type { BrushMode } from "./orbit";
 /** Cell index → `#rrggbb`. Absent means unpainted. */
 export type PaintMap = ReadonlyMap<number, string>;
 
-export interface CellEdit {
-  cell: number;
+/**
+ * What may NAME a cell in a stroke.
+ *
+ * It was `number` — an index into the canvas as it currently stands — and that
+ * is still the default, so every existing caller and every existing test means
+ * exactly what it always meant. The parameter exists because an index is only
+ * meaningful next to the canvas that issued it: change the depth and index 4 is
+ * a different triangle, so a history recorded against the old numbering can no
+ * longer be undone. `plate.ts` names cells by ADDRESS instead, which survives a
+ * depth change, and it wants the same undo machinery rather than a second copy
+ * of it that can drift. Nothing in this module reads the key except to order
+ * and compare it, so widening it costs nothing.
+ */
+export type EditKey = number | string;
+
+export interface CellEdit<K extends EditKey = number> {
+  cell: K;
   /** The colour that was there. `null` = the cell was unpainted. */
   from: string | null;
   /** The colour to put there. `null` = erase. */
   to: string | null;
 }
 
-export interface Stroke {
-  edits: CellEdit[];
+export interface Stroke<K extends EditKey = number> {
+  edits: CellEdit<K>[];
 }
 
-export interface History {
-  past: Stroke[];
-  future: Stroke[];
+export interface History<K extends EditKey = number> {
+  past: Stroke<K>[];
+  future: Stroke<K>[];
 }
 
-export const EMPTY_HISTORY: History = { past: [], future: [] };
+/**
+ * The order edits are held in.
+ *
+ * `a - b` on the index form and lexicographic on the address form. The two
+ * agree wherever both apply, and the only property anything downstream relies
+ * on is that it is TOTAL and deterministic: a stroke's edit order has to be a
+ * fact about the canvas rather than an artefact of the path the pointer took.
+ */
+function byKey<K extends EditKey>(a: K, b: K): number {
+  return a === b ? 0 : a < b ? -1 : 1;
+}
+
+/**
+ * `never` rather than `number`, so the one shared empty value seeds a history
+ * of either key form. `never` is the bottom type, so `History<never>` is
+ * assignable to `History<number>` and to `History<string>` alike, and the
+ * constant stays a constant instead of becoming a factory.
+ */
+export const EMPTY_HISTORY: History<never> = { past: [], future: [] };
 
 /**
  * How many gestures are held.
@@ -79,12 +112,12 @@ export const HISTORY_LIMIT = 256;
  * `colours` is read positionally against `cells`, which is exactly the shape
  * `paintOrbit` returns, so the two compose without an intermediate.
  */
-export function planEdits(
-  paint: PaintMap,
-  cells: readonly number[],
+export function planEdits<K extends EditKey>(
+  paint: ReadonlyMap<K, string>,
+  cells: readonly K[],
   colours: readonly (string | null)[]
-): CellEdit[] {
-  const out: CellEdit[] = [];
+): CellEdit<K>[] {
+  const out: CellEdit<K>[] = [];
   for (let k = 0; k < cells.length; k++) {
     const cell = cells[k];
     const from = paint.get(cell) ?? null;
@@ -108,15 +141,15 @@ export function planEdits(
  * that ends where it started leaves an empty stroke, which the caller declines
  * to commit, so the undo stack never grows a rung that does nothing.
  */
-export function mergeEdits(
-  base: readonly CellEdit[],
-  next: readonly CellEdit[]
-): CellEdit[] {
-  const byCell = new Map<number, CellEdit>();
+export function mergeEdits<K extends EditKey>(
+  base: readonly CellEdit<K>[],
+  next: readonly CellEdit<K>[]
+): CellEdit<K>[] {
+  const byCell = new Map<K, CellEdit<K>>();
   for (const e of base) byCell.set(e.cell, e);
   for (const e of next) {
     const prior = byCell.get(e.cell);
-    const merged: CellEdit = prior
+    const merged: CellEdit<K> = prior
       ? { cell: e.cell, from: prior.from, to: e.to }
       : e;
     if (merged.from === merged.to) byCell.delete(e.cell);
@@ -124,13 +157,17 @@ export function mergeEdits(
   }
   // Ascending, so a stroke's edit order is a fact about the canvas rather than
   // an artefact of the path the pointer happened to take across it.
-  return [...byCell.values()].sort((a, b) => a.cell - b.cell);
+  return [...byCell.values()].sort((a, b) => byKey(a.cell, b.cell));
 }
 
 /** Every painted cell erased, as one ordinary undoable gesture. */
-export function clearStroke(paint: PaintMap): Stroke {
-  const edits: CellEdit[] = [];
-  for (const [cell, from] of [...paint.entries()].sort((a, b) => a[0] - b[0])) {
+export function clearStroke<K extends EditKey>(
+  paint: ReadonlyMap<K, string>
+): Stroke<K> {
+  const edits: CellEdit<K>[] = [];
+  for (const [cell, from] of [...paint.entries()].sort((a, b) =>
+    byKey(a[0], b[0])
+  )) {
     edits.push({ cell, from, to: null });
   }
   return { edits };
@@ -141,11 +178,11 @@ export function clearStroke(paint: PaintMap): Stroke {
 export type EditDirection = "do" | "undo";
 
 /** A new paint map with `edits` applied forwards or backwards. */
-export function applyEdits(
-  paint: PaintMap,
-  edits: readonly CellEdit[],
+export function applyEdits<K extends EditKey>(
+  paint: ReadonlyMap<K, string>,
+  edits: readonly CellEdit<K>[],
   direction: EditDirection
-): Map<number, string> {
+): Map<K, string> {
   const out = new Map(paint);
   for (const e of edits) {
     const v = direction === "do" ? e.to : e.from;
@@ -163,7 +200,10 @@ export function applyEdits(
  * reach, and pretending otherwise produces a redo that lands on a canvas it was
  * never recorded against.
  */
-export function commit(history: History, stroke: Stroke): History {
+export function commit<K extends EditKey>(
+  history: History<K>,
+  stroke: Stroke<K>
+): History<K> {
   if (stroke.edits.length === 0) return history;
   const past = [...history.past, stroke];
   return {
@@ -172,13 +212,13 @@ export function commit(history: History, stroke: Stroke): History {
   };
 }
 
-export interface Step {
-  history: History;
+export interface Step<K extends EditKey = number> {
+  history: History<K>;
   /** The gesture that moved, or `null` when there was nothing to move. */
-  stroke: Stroke | null;
+  stroke: Stroke<K> | null;
 }
 
-export function undo(history: History): Step {
+export function undo<K extends EditKey>(history: History<K>): Step<K> {
   if (history.past.length === 0) return { history, stroke: null };
   const stroke = history.past[history.past.length - 1];
   return {
@@ -190,7 +230,7 @@ export function undo(history: History): Step {
   };
 }
 
-export function redo(history: History): Step {
+export function redo<K extends EditKey>(history: History<K>): Step<K> {
   if (history.future.length === 0) return { history, stroke: null };
   const [stroke, ...rest] = history.future;
   return {
