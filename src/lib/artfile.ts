@@ -80,6 +80,29 @@ export interface ArtPayload {
    * plain drawing exports the same bytes it always did.
    */
   relief?: ArtRelief;
+  /**
+   * The plate keyed by ADDRESS, at every depth it was painted at.
+   *
+   * `cells` states the drawing as indices into the canvas at ONE depth, which is
+   * everything a file needed to say while a depth change cleared the plate. It
+   * no longer does: a plate may carry paint above and below the depth it was
+   * exported at, and an index list cannot name any of it. See `plate.ts` for the
+   * address scheme — a word over `{A,B,C,X}`, with an `s0:`…`s5:` sector tag on
+   * the hexagon.
+   *
+   * Optional, and NOT versioned, on exactly the argument the relief field makes:
+   * a reader that predates it treats its absence as "the plate is entirely at
+   * the declared depth", and that is what every file written before it existed
+   * meant and what `cells` still says. Bumping would have made every one of
+   * those files unreadable to gain nothing.
+   *
+   * OMITTED whenever every painted address sits at the exported depth, so a
+   * drawing made the ordinary way — one depth, start to finish — exports byte
+   * for byte the file it always did. When present it is AUTHORITATIVE and
+   * `cells` is the depth-d rendering of it, written so that a reader without
+   * this field still sees the drawing.
+   */
+  plate?: [string, string][];
 }
 
 /**
@@ -172,8 +195,10 @@ export function encodeArt(p: ArtPayload): string {
       convention: p.convention,
       cells: p.cells,
       // `JSON.stringify` drops an undefined value, so a payload with no relief
-      // writes exactly the bytes it wrote before this field existed.
+      // and no address plate writes exactly the bytes it wrote before either
+      // field existed.
       relief: p.relief,
+      plate: p.plate,
     })
   );
   const line = `<!-- ${ART_MARKER}:${p.version} ${body} -->`;
@@ -269,7 +294,18 @@ function validate(version: number, raw: unknown): ArtPayload | null {
   const relief = validateRelief(o.relief);
   if (relief === REJECT) return null;
 
-  return { version, canvas, depth, convention, cells: out, ...(relief ?? {}) };
+  const plate = validatePlate(o.plate, canvas);
+  if (plate === REJECT) return null;
+
+  return {
+    version,
+    canvas,
+    depth,
+    convention,
+    cells: out,
+    ...(relief ?? {}),
+    ...(plate ?? {}),
+  };
 }
 
 /** Distinguishable from `undefined`, which is the legitimate "absent" answer. */
@@ -293,6 +329,65 @@ function validateRelief(
   const reading = r.reading as Reading;
   if (!READINGS.includes(reading)) return REJECT;
   return { relief: { on: r.on, reading } };
+}
+
+/**
+ * The address a plate entry may name, per canvas.
+ *
+ * Anchored at both ends and bounded by the depth this build can DRAW, on the
+ * same principle as the depth check above: an address of length 9 names a cell
+ * no control here can select, so accepting it would mean loading paint nobody
+ * can see or edit. The hexagon's tag is one digit because there are six
+ * sectors, and `s` and `:` are outside `{A,B,C,X}` so the tag can never be
+ * mistaken for a cut. See `plate.ts`.
+ */
+const ADDRESS = (canvas: CanvasKind): RegExp =>
+  canvas === "hexagon"
+    ? new RegExp(`^s[0-5]:[ABCX]{1,${MAX_DEPTH[canvas]}}$`)
+    : new RegExp(`^[ABCX]{1,${MAX_DEPTH[canvas]}}$`);
+
+/**
+ * How many addresses a canvas has, over every depth it can be drawn at.
+ *
+ * The ceiling on the plate field, for the same reason `cells.length > n` is a
+ * rejection: a file that names more cells than exist at any depth is not a
+ * plate to clamp, it is a declaration that disagrees with itself.
+ */
+const addressCount = (canvas: CanvasKind): number => {
+  let n = 0;
+  for (let d = MIN_DEPTH; d <= MAX_DEPTH[canvas]; d++) n += cellCount(canvas, d);
+  return n;
+};
+
+/**
+ * `undefined` for a file that says nothing about the address plate — which is
+ * every file written before the field existed, and every drawing that never
+ * left the depth it was started at.
+ *
+ * Present and malformed is rejected outright, like every other field here.
+ */
+function validatePlate(
+  raw: unknown,
+  canvas: CanvasKind
+): { plate: [string, string][] } | undefined | typeof REJECT {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) return REJECT;
+  if (raw.length > addressCount(canvas)) return REJECT;
+
+  const form = ADDRESS(canvas);
+  const out: [string, string][] = [];
+  const seen = new Set<string>();
+  for (const entry of raw) {
+    if (!Array.isArray(entry) || entry.length !== 2) return REJECT;
+    const addr: unknown = entry[0];
+    const hex: unknown = entry[1];
+    if (typeof addr !== "string" || !form.test(addr)) return REJECT;
+    if (typeof hex !== "string" || !HEX6.test(hex)) return REJECT;
+    if (seen.has(addr)) return REJECT;
+    seen.add(addr);
+    out.push([addr, hex]);
+  }
+  return { plate: out };
 }
 
 // ── plate ↔ payload ──────────────────────────────────────────────────────
@@ -337,7 +432,13 @@ export function payloadFromPaint(
   depth: number,
   convention: Convention,
   paint: ReadonlyMap<number, string>,
-  relief?: ArtRelief
+  relief?: ArtRelief,
+  /**
+   * The address plate, when it says more than `cells` can. Pass `undefined` —
+   * which is what `plateEntries` returns for a drawing that never left one
+   * depth — and the field is omitted and the bytes are unchanged.
+   */
+  plate?: readonly (readonly [string, string])[]
 ): ArtPayload {
   const n = cellCount(canvas, depth);
   const cells: [number, string][] = [];
@@ -348,6 +449,21 @@ export function payloadFromPaint(
     cells.push([i, hex]);
   }
   cells.sort((a, b) => a[0] - b[0]);
+
+  let addressed: [string, string][] | undefined;
+  if (plate !== undefined) {
+    const form = ADDRESS(canvas);
+    addressed = [];
+    // Dropped rather than thrown, on the rule the cell list already follows:
+    // an export is the one moment where refusing to write is worse than
+    // writing less. Neither drop is reachable from this program.
+    for (const [addr, colour] of plate) {
+      const hex = normalizeHex(colour);
+      if (hex === null || !form.test(addr)) continue;
+      addressed.push([addr, hex]);
+    }
+  }
+
   return {
     version: ART_VERSION,
     canvas,
@@ -355,6 +471,7 @@ export function payloadFromPaint(
     convention,
     cells,
     ...(relief === undefined ? {} : { relief }),
+    ...(addressed === undefined ? {} : { plate: addressed }),
   };
 }
 

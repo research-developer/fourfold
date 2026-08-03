@@ -16,8 +16,17 @@ import DrawBoard, {
   type BoardGeometry,
   type PreviewSpec,
   type ReliefView,
+  type ShapeTool,
+  type ViewWindow,
 } from "@/components/DrawBoard";
 import { ADJUSTMENTS, ADJUST_NAMES, type AdjustName } from "@/lib/adjust";
+import {
+  ARMS,
+  armCensus,
+  armMask,
+  clipStamp,
+  type Isolation,
+} from "@/lib/arms";
 import {
   cellCount,
   extractArt,
@@ -25,9 +34,19 @@ import {
   MAX_ART_BYTES,
   MAX_DEPTH,
   MIN_DEPTH,
-  paintFromPayload,
   payloadFromPaint,
 } from "@/lib/artfile";
+import {
+  addressBook,
+  applyPlateEdits,
+  planPlateEdits,
+  plateEntries,
+  plateFromArtPayload,
+  resolvePlate,
+  type Address,
+  type AddressPlate,
+  type PlateEdit,
+} from "@/lib/plate";
 import {
   BAND_FAMILIES,
   bandSizes,
@@ -56,6 +75,26 @@ import {
 } from "@/lib/brush";
 import { buildFigure, type Convention, type Figure } from "@/lib/figure";
 import { buildHexagon, type Hexagon } from "@/lib/hexagon";
+import {
+  clipToRegion,
+  imageStamp,
+  latticeView,
+  lineCells,
+  orbitStamp,
+  ringCells,
+  RING_DIRS,
+  RING_KEY,
+  type LatticeView,
+  type Radial,
+  type RingDir,
+} from "@/lib/lattice";
+import {
+  presetColours,
+  PRESETS,
+  PRESET_NAMES,
+  type PresetName,
+} from "@/lib/presets";
+import { SHORTCUTS } from "@/lib/shortcuts";
 import {
   hexagonSurface,
   triangleSurface,
@@ -96,17 +135,13 @@ import {
 } from "@/lib/guides";
 import type { ArtOverlayGroup } from "@/lib/strokes";
 import {
-  applyEdits,
   artworkSvg,
-  clearStroke,
   commit,
   EMPTY_HISTORY,
   exportName,
   mergeEdits,
-  planEdits,
   redo,
   undo,
-  type CellEdit,
   type History,
 } from "@/lib/strokes";
 import BrushDial from "./BrushDial";
@@ -209,6 +244,28 @@ const PLATE_BG = "#0a0908";
 const DRIFT_AHEAD = 6;
 
 /**
+ * How long an armed destructive button stays armed.
+ *
+ * Long enough to be a deliberate second click and short enough that a person
+ * who walked away does not come back to a loaded gun. It is also the animation
+ * duration of the countdown bar under the button, so the two cannot drift: the
+ * bar is told this number.
+ */
+const CONFIRM_MS = 4000;
+
+/** Zoom stops. Powers of two, so the plate lands on the same pixels each time. */
+const ZOOM_MAX = 8;
+
+/**
+ * The seven schemes and the five brush slots, as the number row addresses them.
+ *
+ * `event.code` rather than `event.key`, because Shift+1 reports `!` on a US
+ * layout, `"` on a UK one and `&` on AZERTY — the printed digit is not something
+ * a shortcut can be keyed on once a modifier is involved. The physical key is.
+ */
+const DIGIT = ["Digit1", "Digit2", "Digit3", "Digit4", "Digit5", "Digit6", "Digit7"];
+
+/**
  * Does this pointer hover?
  *
  * Subscribed rather than sampled once, and read through `useSyncExternalStore`
@@ -234,6 +291,12 @@ interface Canvas {
   surface: SymmetrySurface;
   bands: BandSurface;
   /**
+   * The exact lattice: neighbour steps for the keyboard, and the two figures a
+   * line and a ring are. Built alongside the others because it is a function of
+   * the same figure and is invalidated at the same moment. See `lattice.ts`.
+   */
+  lattice: LatticeView;
+  /**
    * The built figure itself, kept so a load can match a foreign file's polygons
    * against the cells' own vertices. `geom.cells` is the same geometry already
    * flattened for the board, but the importer's signature is stated in terms of
@@ -242,6 +305,8 @@ interface Canvas {
   fig: Figure | Hexagon;
   /** The hexagon, when this is one. `null` on the triangle. */
   hex: Hexagon | null;
+  /** The triangle, when this is one. `null` on the hexagon. */
+  tri: Figure | null;
 }
 
 const TOOL_LABEL: Record<Tool, string> = {
@@ -304,6 +369,14 @@ export default function DrawPage() {
   const [scope, setScope] = useState<BrushScope>("hexagon");
   /** The sector the pointer was last in — what a SECTOR brush is scoped to. */
   const [sector, setSector] = useState(0);
+  /**
+   * The triangle's answer to the hexagon's scope: one ftype ARM at a time.
+   *
+   * `null` is off. Only the triangle offers it — a hexagon sector already IS a
+   * triangle, and stacking an arm inside a sector would be a control whose two
+   * halves nobody can hold in mind at once.
+   */
+  const [isolation, setIsolation] = useState<Isolation>(null);
   const [reliefOn, setReliefOn] = useState(false);
   const [reading, setReading] = useState<Reading>("convex");
   const [schemeName, setSchemeName] = useState<SchemeName>("hexad");
@@ -319,8 +392,15 @@ export default function DrawPage() {
   const [dragChoice, setDragChoice] = useState<DragMode | null>(null);
   const [candidate, setCandidate] = useState<number | null>(null);
 
-  const [paint, setPaint] = useState<ReadonlyMap<number, string>>(new Map());
-  const [history, setHistory] = useState<History>(EMPTY_HISTORY);
+  /**
+   * The drawing, keyed by ADDRESS and held at every depth it was painted at.
+   *
+   * This is the whole of the drawing's state. The index-keyed map the board
+   * renders is derived from it below and is never stored, because an index only
+   * means something next to the depth that issued it. See `plate.ts`.
+   */
+  const [plate, setPlate] = useState<AddressPlate>(new Map());
+  const [history, setHistory] = useState<History<Address>>(EMPTY_HISTORY);
   const [events, setEvents] = useState<EventLog>(EMPTY_EVENTS);
   const [hover, setHover] = useState<number | null>(null);
   const [cursor, setCursor] = useState<number | null>(null);
@@ -328,6 +408,55 @@ export default function DrawPage() {
   const [showTiling, setShowTiling] = useState(true);
   const [weld, setWeld] = useState(false);
   const [announce, setAnnounce] = useState("");
+
+  /**
+   * The anchored tool, beside the paint/erase/adjust one rather than inside it.
+   *
+   * They are two different questions and folding them into one control would
+   * have made six buttons for four ideas. `tool` says what colour a cell ends
+   * up; `shape` says which cells. So LINE composes with ERASE — a straight
+   * rubbing-out — for free, and neither control has to know the other exists.
+   */
+  const [shapeTool, setShapeTool] = useState<ShapeTool>("free");
+  /** The anchored gesture in progress: where it started, where it is, and Alt. */
+  const [shapeDrag, setShapeDrag] = useState<{
+    anchor: number;
+    at: number;
+    alt: boolean;
+  } | null>(null);
+
+  /**
+   * The one destructive control that is armed, or `null`.
+   *
+   * Confirm-in-place rather than a dialog: a modal would take the focus off the
+   * canvas to ask a question the button could ask where it stands, and
+   * `window.confirm` cannot be styled, cannot be dismissed by Escape in every
+   * browser, and blocks the paint loop. The armed button REPLACES itself, so the
+   * second click lands on the same pixels as the first — which is the property
+   * that makes it a guard and not a lottery.
+   */
+  const [armed, setArmed] = useState<"new" | CanvasKind | null>(null);
+  const disarmAt = useRef<number | null>(null);
+
+  const [helpOpen, setHelpOpen] = useState(false);
+  const helpClose = useRef<HTMLButtonElement>(null);
+  const helpOpener = useRef<HTMLElement | null>(null);
+
+  /**
+   * The view: a zoom factor and a centre, both display-only.
+   *
+   * Space-to-pan was asked for, and on a board that always scaled its whole
+   * figure to fit there was nothing to pan — the honest options were a no-op or
+   * a zoom, and a no-op modifier is worse than no modifier. So the board gained
+   * a `viewBox` window. Nothing in the model moves: the plate, the orbits, the
+   * addresses and the exported file are identical at every zoom, and the hit
+   * layer scales with everything else, so a click still lands where it looks.
+   */
+  const [zoom, setZoom] = useState(1);
+  const [centre, setCentre] = useState<{ x: number; y: number } | null>(null);
+  /** Space is down. A ref as well, because the key handler reads it. */
+  const [spaceHeld, setSpaceHeld] = useState(false);
+  const panned = useRef(false);
   /**
    * Why the last load did not happen.
    *
@@ -350,8 +479,8 @@ export default function DrawPage() {
    */
   const dragDepth = useRef(0);
 
-  const paintRef = useRef<ReadonlyMap<number, string>>(new Map());
-  const pending = useRef<CellEdit[]>([]);
+  const plateRef = useRef<AddressPlate>(new Map());
+  const pending = useRef<PlateEdit[]>([]);
   /**
    * Colouring events spent by the gesture in progress.
    *
@@ -392,8 +521,10 @@ export default function DrawPage() {
         centroids: f.cells.map((c) => c.centroid),
         surface: triangleSurface(f),
         bands: buildBandSurface(f),
+        lattice: latticeView(f),
         fig: f,
         hex: null,
+        tri: f,
       };
     }
     const h = buildHexagon(depth, convention);
@@ -410,10 +541,69 @@ export default function DrawPage() {
       centroids: h.cells.map((c) => c.centroid),
       surface: hexagonSurface(h, scope),
       bands: buildBandSurface(h),
+      lattice: latticeView(h),
       fig: h,
       hex: h,
+      tri: null,
     };
   }, [kind, depth, convention, scope]);
+
+  /**
+   * The canvas's addresses, and the plate resolved onto them.
+   *
+   * `plate` is the state; `paint` is a VIEW of it at the depth on screen, which
+   * is what the board draws, what the ghost is computed against and what the
+   * export writes. Deriving it rather than storing it is the whole reason a
+   * depth change no longer clears the drawing: there is nothing indexed by the
+   * old numbering to throw away. `resolvePlate` is memoised on plate identity,
+   * so this costs one lookup on a re-render that changed neither.
+   */
+  const book = useMemo(() => addressBook(canvas.fig), [canvas]);
+  const paint = useMemo(() => resolvePlate(plate, book), [plate, book]);
+
+  /**
+   * The window the board draws, clamped so the figure never leaves the frame.
+   *
+   * `null` at zoom 1, which is the state the board has always been in, so the
+   * common case emits exactly the `viewBox` it always did. The clamp is what
+   * stops a pan from sliding the plate off the edge and leaving bare page: the
+   * window's centre is held within the half-window inset of the figure, so the
+   * figure always covers the frame.
+   */
+  const view = useMemo<ViewWindow | null>(() => {
+    if (zoom <= 1) return null;
+    const w = canvas.geom.width / zoom;
+    const h = canvas.geom.height / zoom;
+    const cx = centre?.x ?? canvas.geom.width / 2;
+    const cy = centre?.y ?? canvas.geom.height / 2;
+    const clamp = (v: number, half: number, whole: number) =>
+      Math.min(Math.max(v, half), whole - half);
+    return {
+      x: clamp(cx, w / 2, canvas.geom.width) - w / 2,
+      y: clamp(cy, h / 2, canvas.geom.height) - h / 2,
+      w,
+      h,
+    };
+  }, [zoom, centre, canvas]);
+
+  /**
+   * Which cells the brush may touch — the ISOLATE control, triangle only.
+   *
+   * The hexagon already has a scope; the triangle's answer is the three ftype
+   * arms, which are a genuine partition of the board minus the hub rather than a
+   * mask. See `arms.ts`, including why the hub is excluded and what clipping
+   * costs the 3- and 6-fold brushes.
+   */
+  const keepCell = useMemo(
+    () => (canvas.tri === null ? () => true : armMask(canvas.tri, isolation)),
+    [canvas, isolation]
+  );
+
+  /** `(4^d − 1)/3` — the size §D predicts, read off the figure rather than retyped. */
+  const armSize = useMemo(
+    () => (canvas.tri === null ? 0 : armCensus(canvas.tri).predicted),
+    [canvas]
+  );
 
   /**
    * Which sectors the axis overlay draws in.
@@ -576,10 +766,8 @@ export default function DrawPage() {
    * here and will do nothing" is the rule that stops it behaving as a fill, and
    * it is worth seeing.
    */
-  const specFor = useCallback(
-    (seed: number | null): PreviewSpec | null => {
-      if (seed === null || seed >= canvas.geom.cells.length) return null;
-      const stamp = brushStamp(canvas.surface, canvas.bands, seed, shape);
+  const specFromStamp = useCallback(
+    (stamp: ReturnType<typeof brushStamp>, seed: number): PreviewSpec => {
       const all = stamp.cells;
       if (tool === "erase") {
         return { cells: all, colours: [], inert: [], seed, erasing: true };
@@ -611,21 +799,104 @@ export default function DrawPage() {
       });
       return { cells, colours: hex, inert, seed, erasing: false };
     },
-    // The plate is read from STATE here, not from `paintRef`: this runs during
+    // The plate is read from STATE here, not from `plateRef`: this runs during
     // render, and the adjust ghost is a function of the plate as rendered.
-    [canvas, shape, tool, scheme, effectiveBase, adjust, paint]
+    [tool, scheme, effectiveBase, adjust, paint]
   );
 
+  /** The free brush at a seed: one stamp, clipped to the isolated arm. */
+  const specFor = useCallback(
+    (seed: number | null): PreviewSpec | null => {
+      if (seed === null || seed >= canvas.geom.cells.length) return null;
+      // Clipped, so the ghost promises exactly what the stroke will lay. A
+      // preview that reached outside the isolated arm would be teaching the
+      // wrong brush.
+      return specFromStamp(
+        clipStamp(
+          brushStamp(canvas.surface, canvas.bands, seed, shape),
+          keepCell
+        ),
+        seed
+      );
+    },
+    [canvas, shape, keepCell, specFromStamp]
+  );
+
+  /**
+   * The anchored figure, as a brush stamp.
+   *
+   * Both tools reach the plate through the SAME stamp/colour/plan pipeline the
+   * free brush uses, so a line honours the band setting, the isolated arm, the
+   * sector scope, the eraser and the adjustment brush without any of them
+   * learning that a line exists. What differs is only which cells the source is
+   * and how the scheme is indexed over the images — see `lattice.ts`.
+   */
+  const shapeStampFor = useCallback(
+    (anchor: number, at: number, alt: boolean) => {
+      const n = canvas.geom.cells.length;
+      if (anchor >= n || at >= n) return null;
+      if (shapeTool === "line") {
+        const line = lineCells(canvas.lattice, canvas.bands, anchor, at, alt);
+        const src = clipToRegion(canvas.surface, anchor, line.cells).filter(
+          keepCell
+        );
+        return {
+          stamp: clipStamp(imageStamp(canvas.surface, mode, src), keepCell),
+          said: `line · band ${line.family} · ${line.cells.length} cell${
+            line.cells.length === 1 ? "" : "s"
+          }${alt ? " · symmetric about the anchor" : ""}`,
+        };
+      }
+      const spec = ringCells(
+        canvas.lattice,
+        canvas.lattice.ringOf(anchor),
+        canvas.lattice.ringOf(at),
+        alt
+      );
+      const src = clipToRegion(canvas.surface, anchor, spec.cells).filter(
+        keepCell
+      );
+      return {
+        // Orbit position, not image index: a figure-centred ring is fixed by the
+        // whole group, so grouping by image would collapse it onto one hue.
+        stamp: clipStamp(orbitStamp(canvas.surface, mode, src), keepCell),
+        said: `ring ${spec.from}${spec.to === spec.from ? "" : `…${spec.to}`} · ${
+          spec.cells.length
+        } cell${spec.cells.length === 1 ? "" : "s"}${
+          spec.clipped ? " · clipped by the triangle's edges" : ""
+        }${alt ? " · symmetric about the anchor ring" : ""}`,
+      };
+    },
+    [canvas, shapeTool, mode, keepCell]
+  );
+
+  const dragSpec = useMemo(() => {
+    if (shapeDrag === null) return null;
+    const built = shapeStampFor(shapeDrag.anchor, shapeDrag.at, shapeDrag.alt);
+    if (built === null) return null;
+    return {
+      spec: specFromStamp(built.stamp, shapeDrag.anchor),
+      said: built.said,
+    };
+  }, [shapeDrag, shapeStampFor, specFromStamp]);
+
   const candidateSpec = useMemo(
-    () => (dragMode === "propose" ? specFor(candidate) : null),
-    [dragMode, specFor, candidate]
+    () =>
+      shapeTool === "free" && dragMode === "propose" ? specFor(candidate) : null,
+    [shapeTool, dragMode, specFor, candidate]
   );
 
   // A hover ghost and a standing proposal at once is two answers to one
-  // question. The proposal wins: it is the one that can be committed.
+  // question. The proposal wins: it is the one that can be committed. An
+  // anchored drag outranks both — it is the thing under the finger.
   const preview = useMemo(
-    () => (candidateSpec === null ? specFor(hover) : null),
-    [candidateSpec, specFor, hover]
+    () =>
+      dragSpec !== null
+        ? dragSpec.spec
+        : candidateSpec === null && shapeTool === "free"
+        ? specFor(hover)
+        : null,
+    [dragSpec, candidateSpec, shapeTool, specFor, hover]
   );
 
   // ── the canvas is a different set of cells now ──────────────────────────
@@ -639,13 +910,18 @@ export default function DrawPage() {
    * colours to cells that mean something else, so the stacks are emptied rather
    * than carried: after this the loaded plate is the single restorable state,
    * and undo says there is nothing to undo, which is true.
+   *
+   * A DEPTH CHANGE is no longer one of those moments, and that is the point of
+   * the address plate: the cells did not change underneath anybody, they were
+   * only cut finer or coarser, and every stroke in the history still names the
+   * addresses it named. See `pickDepth`.
    */
-  const reset = useCallback((plate: Map<number, string>, why: string) => {
-    paintRef.current = plate;
+  const reset = useCallback((next: AddressPlate, why: string) => {
+    plateRef.current = next;
     pending.current = [];
     pendingEvents.current = 0;
     setLiveEvents(0);
-    setPaint(paintRef.current);
+    setPlate(plateRef.current);
     setHistory(EMPTY_HISTORY);
     setEvents(EMPTY_EVENTS);
     setProgOrigin(0);
@@ -664,13 +940,109 @@ export default function DrawPage() {
     [reset]
   );
 
+  /**
+   * Arm a destructive control, and disarm it again after a few seconds.
+   *
+   * The timer is what makes confirm-in-place safe to leave lying around: an
+   * armed NEW that stayed armed would be a landmine under the pointer for the
+   * rest of the session. Escape and a blur disarm it too, so the three ways a
+   * person abandons an action all work.
+   */
+  const arm = useCallback((what: "new" | CanvasKind, said: string) => {
+    if (disarmAt.current !== null) window.clearTimeout(disarmAt.current);
+    setArmed(what);
+    disarmAt.current = window.setTimeout(() => {
+      setArmed(null);
+      disarmAt.current = null;
+      // The timeout SAYS so. A live region still reading "armed" after the
+      // button had quietly gone back to normal was the one state in this guard
+      // where the screen and the announcement disagreed.
+      setAnnounce("the confirm expired — nothing was cleared");
+    }, CONFIRM_MS);
+    setAnnounce(said);
+  }, []);
+
+  const disarm = useCallback((why?: string) => {
+    if (disarmAt.current !== null) {
+      window.clearTimeout(disarmAt.current);
+      disarmAt.current = null;
+    }
+    setArmed((a) => {
+      if (a !== null && why !== undefined) setAnnounce(why);
+      return null;
+    });
+  }, []);
+
+  useEffect(
+    () => () => {
+      if (disarmAt.current !== null) window.clearTimeout(disarmAt.current);
+    },
+    []
+  );
+
+  /**
+   * NEW: the one control that wipes, and the only one.
+   *
+   * CLEAR used to sit beside undo and redo and did most of this, undoably. It
+   * has gone, and the reason is the one the user gave: a plate can be destroyed
+   * by exactly one button, that button is coloured like a warning, and it asks
+   * twice. Two controls that both empty the plate — one undoable, one not — is
+   * two answers to "how do I start again", and the safer one was the one nobody
+   * could tell apart from the other.
+   */
+  const doNew = () => {
+    if (armed !== "new") {
+      arm(
+        "new",
+        `NEW is armed — click it again to wipe ${
+          plateRef.current.size
+        } painted address${
+          plateRef.current.size === 1 ? "" : "es"
+        } and the whole undo history, or press Escape`
+      );
+      return;
+    }
+    disarm();
+    wipe("new plate — every address cleared, and the undo history with it");
+  };
+
+  /**
+   * The canvas still clears, and the depth no longer does.
+   *
+   * The difference is what the address space IS. A depth change refines or
+   * coarsens the same words, so every address a stroke named is still an
+   * address. A canvas change swaps the alphabet — the hexagon's addresses carry
+   * a sector tag and the triangle's do not — so nothing painted on one names
+   * anything on the other, and carrying the plate across would be inventing a
+   * correspondence the geometry does not have.
+   *
+   * So it stays destructive, and it goes behind the SAME guard as NEW: on a
+   * plate with paint on it the shape button arms first and switches second. On
+   * an empty plate there is nothing to lose and it switches immediately, because
+   * a guard that fires when there is no risk teaches people to click through
+   * guards.
+   */
   const pickKind = (next: CanvasKind) => {
     if (next === kind) return;
+    if (plateRef.current.size > 0 && armed !== next) {
+      arm(
+        next,
+        `switching to the ${next} would clear ${plateRef.current.size} painted address${
+          plateRef.current.size === 1 ? "" : "es"
+        } — the two canvases do not share addresses. Click again to confirm, or press Escape`
+      );
+      return;
+    }
+    disarm();
     const d = Math.min(depth, Math.max(...DEPTHS[next]));
     const m = next === "triangle" && mode === 12 ? 6 : mode;
     setKind(next);
     setDepth(d);
     setMode(m);
+    setZoom(1);
+    setCentre(null);
+    // An arm is a triangle object; the hexagon has scopes instead.
+    if (next !== "triangle") setIsolation(null);
     wipe(`canvas set to ${next}, depth ${d}, ${cellCount(next, d)} cells — plate cleared`);
   };
 
@@ -696,51 +1068,113 @@ export default function DrawPage() {
     );
   };
 
-  const pickRelief = (on: boolean) => {
-    setReliefOn(on);
+  const pickRelief = useCallback(
+    (on: boolean) => {
+      setReliefOn(on);
+      setAnnounce(
+        on
+          ? `relief on — ${READING_LABEL[reading]}; the ring under the pointer is the template`
+          : "relief off — the plate is flat again"
+      );
+    },
+    [reading]
+  );
+
+  const pickReading = useCallback(
+    (next: Reading) => {
+      if (next === reading) return;
+      setReading(next);
+      setAnnounce(`relief ${next} — ${READING_LABEL[next]}`);
+    },
+    [reading]
+  );
+
+  /**
+   * Changing the depth KEEPS the drawing, and keeps the undo stack with it.
+   *
+   * It used to clear both, and the reason was sound while the plate was keyed by
+   * cell index: index 4 is a different triangle at every depth, so both the paint
+   * and the history were statements about a numbering that had just stopped
+   * existing. Keyed by address neither is. Going deeper, a cell with no paint of
+   * its own inherits its nearest painted ancestor exactly; going shallower, a
+   * parent shows what its painted descendants agree on and shows nothing where
+   * they disagree — and the deeper addresses stay in the plate either way, so
+   * coming back restores it cell for cell.
+   *
+   * The depth change is NOT an undoable event and is deliberately outside the
+   * history. Undo takes back a change to the DRAWING, and this changes none: the
+   * plate is the same object before and after, and there is nothing to put back.
+   * Making it a rung would mean the undo stack held two kinds of thing, and a
+   * user pressing undo after a stroke would get their zoom level back instead of
+   * their paint. The cursor and any standing candidate are dropped, because those
+   * really are indices into the numbering that just changed.
+   */
+  const pickDepth = useCallback(
+    (d: number) => {
+      if (d === depth) return;
+      setDepth(d);
+      setHover(null);
+      setCursor(null);
+      setCandidate(null);
+      setShapeDrag(null);
+      setAnnounce(
+        `depth ${d}, ${cellCount(kind, d)} cells — plate carried across, ${
+          plateRef.current.size
+        } address${plateRef.current.size === 1 ? "" : "es"} held`
+      );
+    },
+    [depth, kind]
+  );
+
+  const pickIsolation = (next: Isolation) => {
+    if (next === isolation) return;
+    setIsolation(next);
+    setCandidate(null);
     setAnnounce(
-      on
-        ? `relief on — ${READING_LABEL[reading]}; the ring under the pointer is the template`
-        : "relief off — the plate is flat again"
+      next === null
+        ? "isolation off — the whole triangle"
+        : `isolated to arm ${next} — the ftype-${next} triskelion arm, ${armSize} cells; the hub belongs to no arm and is out of reach`
     );
-  };
-
-  const pickReading = (next: Reading) => {
-    if (next === reading) return;
-    setReading(next);
-    setAnnounce(`relief ${next} — ${READING_LABEL[next]}`);
-  };
-
-  const pickDepth = (d: number) => {
-    if (d === depth) return;
-    setDepth(d);
-    wipe(`depth ${d}, ${cellCount(kind, d)} cells — plate cleared`);
   };
 
   // ── painting ────────────────────────────────────────────────────────────
 
   const paintAt = useCallback(
     (i: number) => {
-      const stamp = brushStamp(canvas.surface, canvas.bands, i, shape);
+      const stamp = clipStamp(
+        brushStamp(canvas.surface, canvas.bands, i, shape),
+        keepCell
+      );
+      if (stamp.cells.length === 0) return;
       // Recomputed per application rather than taken from `effectiveBase`, so a
       // drag lays a gradient along its own path instead of one flat colour.
       const n = progressionIndex(events, progOrigin, pendingEvents.current);
+      // The colours are decided against the plate AS SHOWN — the adjustment
+      // brush transforms the colour a cell is displaying, including one it is
+      // displaying because an ancestor holds it. Memoised on plate identity, so
+      // this is a lookup on every application after the first.
+      const view = resolvePlate(plateRef.current, book);
       const colours = stampColours(
         { tool, scheme, base: prog.at(base, n), adjust },
-        paintRef.current,
+        view,
         stamp
       );
-      const edits = planEdits(paintRef.current, stamp.cells, colours);
+      const edits = planPlateEdits(
+        plateRef.current,
+        book,
+        stamp.cells.map((c) => book.addr[c]),
+        colours
+      );
       if (edits.length === 0) return;
       if (tool === "paint") {
         pendingEvents.current += 1;
         setLiveEvents(pendingEvents.current);
       }
-      paintRef.current = applyEdits(paintRef.current, edits, "do");
+      plateRef.current = applyPlateEdits(plateRef.current, edits, "do");
       pending.current = mergeEdits(pending.current, edits);
-      setPaint(paintRef.current);
+      setPlate(plateRef.current);
     },
-    [canvas, shape, tool, scheme, adjust, prog, base, events, progOrigin]
+    [canvas, book, keepCell, shape, tool, scheme, adjust, prog, base, events, progOrigin]
   );
 
   const endStroke = useCallback(
@@ -770,21 +1204,23 @@ export default function DrawPage() {
       setAnnounce(
         `${how === "commit" ? "committed — " : ""}${verb} ${edits.length} cell${
           edits.length === 1 ? "" : "s"
-        } with the ${mode}-fold brush${band === null ? "" : `, band ${band}`} — ${
-          paintRef.current.size
-        } on the plate`
+        } with the ${mode}-fold brush${band === null ? "" : `, band ${band}`}${
+          isolation === null ? "" : `, arm ${isolation}`
+        } — ${resolvePlate(plateRef.current, book).size} on the plate`
       );
     },
-    [tool, adjustName, mode, band]
+    [tool, adjustName, mode, band, isolation, book]
   );
 
   const applyStroke = useCallback(
-    (edits: readonly CellEdit[], direction: "do" | "undo", said: string) => {
-      paintRef.current = applyEdits(paintRef.current, edits, direction);
-      setPaint(paintRef.current);
-      setAnnounce(`${said} — ${paintRef.current.size} cells on the plate`);
+    (edits: readonly PlateEdit[], direction: "do" | "undo", said: string) => {
+      plateRef.current = applyPlateEdits(plateRef.current, edits, direction);
+      setPlate(plateRef.current);
+      setAnnounce(
+        `${said} — ${resolvePlate(plateRef.current, book).size} cells on the plate`
+      );
     },
-    []
+    [book]
   );
 
   const doUndo = useCallback(() => {
@@ -809,18 +1245,116 @@ export default function DrawPage() {
     applyStroke(step.stroke.edits, "do", `redid ${step.stroke.edits.length} cells`);
   }, [history, events, applyStroke]);
 
-  const doClear = useCallback(() => {
-    const stroke = clearStroke(paintRef.current);
-    if (stroke.edits.length === 0) {
-      setAnnounce("the plate is already empty");
+  /**
+   * Lay a whole plate down as ONE gesture.
+   *
+   * Both the presets and the anchored tools arrive here. Nothing about it is
+   * special: the edits are planned against the address plate exactly as a brush
+   * stroke's are, so a preset survives a depth change, an undo takes the whole
+   * figure back in one press, and the event log gains the rung that keeps it
+   * shadowing the history.
+   */
+  const layStroke = useCallback(
+    (
+      cells: readonly number[],
+      colours: readonly (string | null)[],
+      spent: number,
+      said: (n: number) => string,
+      nothing: string
+    ) => {
+      const edits = planPlateEdits(
+        plateRef.current,
+        book,
+        cells.map((c) => book.addr[c]),
+        colours
+      );
+      if (edits.length === 0) {
+        setAnnounce(nothing);
+        return;
+      }
+      plateRef.current = applyPlateEdits(plateRef.current, edits, "do");
+      setPlate(plateRef.current);
+      setHistory((h) => commit(h, { edits }));
+      setEvents((e) => pushEvents(e, spent));
+      setAnnounce(said(edits.length));
+    },
+    [book]
+  );
+
+  /**
+   * The anchored figure, committed.
+   *
+   * One application, so ONE colouring event — a line is a gesture, not a run of
+   * them, and undoing it must take the progression back by exactly one step.
+   */
+  const commitShape = useCallback(() => {
+    const d = shapeDrag;
+    setShapeDrag(null);
+    if (d === null) return;
+    const built = shapeStampFor(d.anchor, d.at, d.alt);
+    if (built === null || built.stamp.cells.length === 0) {
+      setAnnounce("nothing changed — the figure reached no cell the brush may touch");
       return;
     }
-    setHistory((h) => commit(h, stroke));
-    // A clear is a gesture and spends no colouring events, but it still takes a
-    // rung, or the log stops shadowing the history.
-    setEvents((e) => pushEvents(e, 0));
-    applyStroke(stroke.edits, "do", `cleared ${stroke.edits.length} cells`);
-  }, [applyStroke]);
+    const n = progressionIndex(events, progOrigin, 0);
+    const shown = resolvePlate(plateRef.current, book);
+    const colours = stampColours(
+      { tool, scheme, base: prog.at(base, n), adjust },
+      shown,
+      built.stamp
+    );
+    const verb =
+      tool === "erase" ? "erased" : tool === "adjust" ? adjustName : "painted";
+    layStroke(
+      built.stamp.cells,
+      colours,
+      tool === "paint" ? 1 : 0,
+      (k) =>
+        `${built.said} — ${k} cell${k === 1 ? "" : "s"} ${verb} with the ${mode}-fold brush`,
+      tool === "adjust"
+        ? "nothing adjusted — the figure found no paint under it"
+        : "nothing changed"
+    );
+  }, [
+    shapeDrag,
+    shapeStampFor,
+    events,
+    progOrigin,
+    book,
+    tool,
+    scheme,
+    prog,
+    base,
+    adjust,
+    adjustName,
+    mode,
+    layStroke,
+  ]);
+
+  /**
+   * A preset: the figure's own structure, laid down as one undoable stroke.
+   *
+   * Every address of the current depth is named, so the preset REPLACES whatever
+   * was there rather than sitting on top of it — and because it goes through the
+   * address plate, changing the depth afterwards refines or summarises it exactly
+   * like any other paint. See `presets.ts` for where each colour comes from.
+   */
+  const applyPreset = useCallback(
+    (name: PresetName) => {
+      const colours = presetColours(name, canvas.fig, effectiveBase.hex);
+      layStroke(
+        colours.map((_, i) => i),
+        colours,
+        0,
+        (k) =>
+          `${PRESETS[name].label} — ${PRESETS[name].note}; ${k} cell${
+            k === 1 ? "" : "s"
+          } changed, one undoable stroke`,
+        `${PRESETS[name].label} — the plate already shows it`
+      );
+    },
+    [canvas, effectiveBase, layStroke]
+  );
 
   // ── propose and commit ──────────────────────────────────────────────────
 
@@ -858,11 +1392,14 @@ export default function DrawPage() {
     );
   };
 
-  const pickTool = (next: Tool) => {
-    if (next === tool) return;
-    setTool(next);
-    setAnnounce(`${next} tool — ${TOOL_LABEL[next]}`);
-  };
+  const pickTool = useCallback(
+    (next: Tool) => {
+      if (next === tool) return;
+      setTool(next);
+      setAnnounce(`${next} tool — ${TOOL_LABEL[next]}`);
+    },
+    [tool]
+  );
 
   /**
    * Selecting a band does exactly one thing: select a band.
@@ -880,19 +1417,22 @@ export default function DrawPage() {
    * hint under this control names weld and says what it is for. A default is
    * fine; a default that reaches across the panel to set itself is not.
    */
-  const pickBand = (next: BandFamily | null) => {
-    if (next === band) return;
-    setBand(next);
-    setAnnounce(
-      next === null
-        ? "band brush off"
-        : `band ${next} — ${BAND_NOTE[kind][next]}; ${brushSpan(
-            canvas.surface,
-            canvas.bands,
-            { mode, band: next }
-          )} rows under the ${mode}-fold brush`
-    );
-  };
+  const pickBand = useCallback(
+    (next: BandFamily | null) => {
+      if (next === band) return;
+      setBand(next);
+      setAnnounce(
+        next === null
+          ? "band brush off"
+          : `band ${next} — ${BAND_NOTE[kind][next]}; ${brushSpan(
+              canvas.surface,
+              canvas.bands,
+              { mode, band: next }
+            )} rows under the ${mode}-fold brush`
+      );
+    },
+    [band, kind, canvas, mode]
+  );
 
   const pickProgression = (next: ProgressionName) => {
     if (next === progName) return;
@@ -912,16 +1452,92 @@ export default function DrawPage() {
 
   // ── keyboard ────────────────────────────────────────────────────────────
 
+  /** Where the cursor is, put somewhere, with the ghost following it. */
+  const putCursor = useCallback(
+    (next: number, said: string | null) => {
+      noteSector(next);
+      setCursor(next);
+      // A standing anchored figure follows the cursor, so the whole line/ring
+      // gesture is reachable from the keyboard: Enter anchors, the cluster
+      // stretches, Enter lays it.
+      setShapeDrag((d) => (d === null ? null : { ...d, at: next }));
+      if (shapeTool === "free" && dragMode === "propose") setCandidate(next);
+      else setHover(next);
+      if (said !== null) setAnnounce(said);
+    },
+    [dragMode, noteSector, shapeTool]
+  );
+
   const onArrow = useCallback(
     (dir: Direction) => {
       const next = stepCursor(canvas.centroids, cursor, dir);
       if (next < 0) return;
-      noteSector(next);
-      setCursor(next);
-      if (dragMode === "propose") setCandidate(next);
-      else setHover(next);
+      putCursor(next, null);
     },
-    [canvas, cursor, dragMode, noteSector]
+    [canvas, cursor, putCursor]
+  );
+
+  /** Where the cursor sits, in the words the canvas has for it. */
+  const placeOf = useCallback(
+    (i: number) =>
+      canvas.kind === "triangle"
+        ? `row ${canvas.lattice.rowOf(i)} from the apex, ring ${canvas.lattice.ringOf(i)}`
+        : `sector ${canvas.hex?.cells[i].sector ?? 0}, ring ${canvas.lattice.ringOf(i)}`,
+    [canvas]
+  );
+
+  /**
+   * One step on the exact lattice, in one of the six directions the cluster
+   * names. Off the canvas is SAID rather than wrapped: a cursor that reappears
+   * on the far side has told the user something false about the figure.
+   */
+  const onRing = useCallback(
+    (dir: RingDir) => {
+      if (cursor === null) {
+        const start = stepCursor(canvas.centroids, null, "up");
+        if (start < 0) return;
+        putCursor(start, `cursor at cell ${start} — ${placeOf(start)}`);
+        return;
+      }
+      const next = canvas.lattice.step(cursor, dir);
+      if (next < 0) {
+        setAnnounce(`${dir} — the canvas ends here; the cursor did not move`);
+        return;
+      }
+      putCursor(next, `${dir} — cell ${next}, ${placeOf(next)}`);
+    },
+    [canvas, cursor, putCursor, placeOf]
+  );
+
+  const onRadial = useCallback(
+    (way: Radial) => {
+      if (cursor === null) {
+        const start = stepCursor(canvas.centroids, null, "up");
+        if (start < 0) return;
+        putCursor(start, `cursor at cell ${start} — ${placeOf(start)}`);
+        return;
+      }
+      const next = canvas.lattice.radial(cursor, way);
+      if (next < 0) {
+        setAnnounce(
+          `${way === "out" ? "outward" : "inward"} — the ${
+            canvas.kind === "triangle"
+              ? way === "out"
+                ? "base"
+                : "apex"
+              : way === "out"
+              ? "rim"
+              : "centre"
+          } is here; the cursor did not move`
+        );
+        return;
+      }
+      putCursor(
+        next,
+        `${way === "out" ? "outward" : "inward"} — cell ${next}, ${placeOf(next)}`
+      );
+    },
+    [canvas, cursor, putCursor, placeOf]
   );
 
   const onCursorPaint = useCallback(() => {
@@ -932,6 +1548,17 @@ export default function DrawPage() {
       setCursor(start);
       if (dragMode === "propose") setCandidate(start);
       else setHover(start);
+      return;
+    }
+    if (shapeTool !== "free") {
+      if (shapeDrag === null) {
+        setShapeDrag({ anchor: cursor, at: cursor, alt: false });
+        setAnnounce(
+          `${shapeTool} anchored at cell ${cursor} — move with Q W E A D Z X C and press Enter again to lay it, Escape to cancel`
+        );
+        return;
+      }
+      commitShape();
       return;
     }
     if (dragMode === "propose") {
@@ -951,25 +1578,343 @@ export default function DrawPage() {
     propose,
     paintAt,
     endStroke,
+    shapeTool,
+    shapeDrag,
+    commitShape,
   ]);
 
+  const pickShapeTool = useCallback(
+    (next: ShapeTool) => {
+      setShapeTool(next);
+      setShapeDrag(null);
+      setCandidate(null);
+      setAnnounce(
+        next === "free"
+          ? "free brush — every cell the pointer crosses is an application"
+          : next === "line"
+          ? "line — press, drag along a lattice row and release; the row snaps to one of the three band families, and Option centres it on the anchor"
+          : `ring — press, drag outward and release; the ring is a level set of the exact hexagonal norm about the ${
+              kind === "triangle" ? "centroid, clipped by the three edges" : "centre"
+            }, and Option centres the annulus on the anchor`
+      );
+    },
+    [kind]
+  );
+
+  const openHelp = useCallback(() => {
+    helpOpener.current = document.activeElement as HTMLElement | null;
+    setHelpOpen(true);
+  }, []);
+
+  const closeHelp = useCallback(() => {
+    setHelpOpen(false);
+    // Focus goes back where it came from, or the panel has stranded the
+    // keyboard at the top of the document.
+    helpOpener.current?.focus?.();
+  }, []);
+
+  useEffect(() => {
+    if (helpOpen) helpClose.current?.focus();
+  }, [helpOpen]);
+
+  const setZoomTo = useCallback(
+    (z: number) => {
+      const next = Math.min(ZOOM_MAX, Math.max(1, z));
+      setZoom(next);
+      if (next === 1) setCentre(null);
+      setAnnounce(
+        next === 1
+          ? "zoom 1× — the whole figure"
+          : `zoom ${next}× — hold Space and drag to pan`
+      );
+    },
+    []
+  );
+
+  /**
+   * A pan, in canvas units. The clamp lives in the `view` memo, so a drag that
+   * pushes past the rim simply stops rather than being refused mid-gesture.
+   */
+  const onPan = useCallback(
+    (dx: number, dy: number) => {
+      panned.current = true;
+      setCentre((c) => ({
+        x: (c?.x ?? canvas.geom.width / 2) - dx,
+        y: (c?.y ?? canvas.geom.height / 2) - dy,
+      }));
+    },
+    [canvas]
+  );
+
+  /**
+   * Every shortcut, in one listener on the window.
+   *
+   * On the window rather than on the canvas, so a shortcut works while the hand
+   * is on a rail control — which is where it is most of the time. The arrows and
+   * Enter stay on the board, because those are about the CURSOR and the board is
+   * the thing that owns a cursor; putting them here as well would fire them
+   * twice when the canvas has focus.
+   *
+   * Three guards, and each one is a bug that was reachable without it: a text
+   * field swallows everything, because the hex input has to be typeable; a
+   * focused button keeps Space and Enter, because that is how a button is
+   * pressed without a mouse; and the help panel swallows everything but its own
+   * two keys, because a panel that is over the plate must not let the plate be
+   * edited underneath it.
+   */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      // The hex field is a text input; undo there belongs to the browser.
       const el = document.activeElement;
-      if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return;
+      if (
+        el instanceof HTMLInputElement ||
+        el instanceof HTMLTextAreaElement ||
+        (el instanceof HTMLElement && el.isContentEditable)
+      ) {
+        return;
+      }
+      const onControl =
+        el instanceof HTMLButtonElement ||
+        el instanceof HTMLAnchorElement ||
+        el instanceof HTMLSelectElement;
+      if (onControl && (e.key === " " || e.key === "Enter")) return;
+
       if (e.key === "Escape") {
+        if (helpOpen) {
+          closeHelp();
+          return;
+        }
+        if (armed !== null) {
+          disarm("cancelled — nothing was cleared");
+          return;
+        }
+        if (shapeDrag !== null) {
+          setShapeDrag(null);
+          setAnnounce(`${shapeTool} cancelled`);
+          return;
+        }
         dropCandidate();
         return;
       }
-      if (!(e.metaKey || e.ctrlKey) || e.key.toLowerCase() !== "z") return;
-      e.preventDefault();
-      if (e.shiftKey) doRedo();
-      else doUndo();
+
+      if (e.metaKey || e.ctrlKey) {
+        if (e.key.toLowerCase() === "z") {
+          e.preventDefault();
+          if (e.shiftKey) doRedo();
+          else doUndo();
+        }
+        return;
+      }
+      // Option is the shape modifier, read off the pointer event. It is never a
+      // shortcut prefix, so a stray Alt must not fire a letter.
+      if (e.altKey) return;
+
+      // `?` is Shift and the slash key on a US layout, and browsers disagree
+      // about whether the shifted `key` arrives as `?` or as `/` — Playwright's
+      // synthetic Shift+/ reports `/`, a real keyboard reports `?`. Accepting
+      // both, and the physical key as well, is what makes this reachable
+      // everywhere rather than only where it happened to be tested.
+      if (e.key === "?" || (e.shiftKey && e.code === "Slash")) {
+        e.preventDefault();
+        if (helpOpen) closeHelp();
+        else openHelp();
+        return;
+      }
+      if (helpOpen) return;
+
+      if (e.key === " ") {
+        e.preventDefault();
+        if (e.repeat) return;
+        panned.current = false;
+        setSpaceHeld(true);
+        return;
+      }
+
+      if (e.key === "Enter") {
+        e.preventDefault();
+        onCursorPaint();
+        return;
+      }
+
+      const digit = DIGIT.indexOf(e.code);
+
+      if (e.shiftKey) {
+        if (digit >= 0 && digit < SCHEME_NAMES.length) {
+          e.preventDefault();
+          const name = SCHEME_NAMES[digit];
+          setSchemeName(name);
+          setAnnounce(`scheme ${name} — ${SCHEMES[name].label}`);
+        } else if (e.key.toLowerCase() === "r") {
+          e.preventDefault();
+          if (canvas.hex === null) {
+            setAnnounce("the relief is a hexagon effect; this canvas is flat");
+          } else {
+            pickReading(reading === "convex" ? "concave" : "convex");
+          }
+        }
+        return;
+      }
+
+      if (digit >= 0) {
+        if (digit < modes.length) {
+          e.preventDefault();
+          setMode(modes[digit]);
+          setAnnounce(`brush ${modes[digit]}-fold`);
+        } else {
+          setAnnounce(`this canvas has ${modes.length} brush modes`);
+        }
+        return;
+      }
+
+      const k = e.key.toLowerCase();
+
+      for (const dir of RING_DIRS) {
+        if (k === RING_KEY[dir]) {
+          e.preventDefault();
+          onRing(dir);
+          return;
+        }
+      }
+      if (k === "w" || k === "x") {
+        e.preventDefault();
+        onRadial(k === "w" ? "out" : "in");
+        return;
+      }
+
+      if (k === "b") {
+        const order: (BandFamily | null)[] = [null, "A", "B", "C"];
+        pickBand(order[(order.indexOf(band) + 1) % order.length]);
+        return;
+      }
+      if (k === "t") {
+        pickTool(TOOLS[(TOOLS.indexOf(tool) + 1) % TOOLS.length]);
+        return;
+      }
+      if (k === "f") {
+        const order: ShapeTool[] = ["free", "line", "ring"];
+        pickShapeTool(order[(order.indexOf(shapeTool) + 1) % order.length]);
+        return;
+      }
+      if (k === "g") {
+        setShowGuides((v) => {
+          setAnnounce(v ? "symmetry axes off" : "symmetry axes on");
+          return !v;
+        });
+        return;
+      }
+      if (k === "h") {
+        setShowTiling((v) => {
+          setAnnounce(v ? "tiling hidden" : "tiling shown under the paint");
+          return !v;
+        });
+        return;
+      }
+      if (k === "l") {
+        setWeld((v) => {
+          setAnnounce(v ? "weld off — every cell keeps its seam" : "weld on — no seam inside a filled row");
+          return !v;
+        });
+        return;
+      }
+      if (k === "r") {
+        if (canvas.hex === null) {
+          setAnnounce("the relief is a hexagon effect; this canvas is flat");
+          return;
+        }
+        pickRelief(!reliefOn);
+        return;
+      }
+      if (e.key === "[") {
+        const d = DEPTHS[kind];
+        if (depth <= d[0]) setAnnounce(`depth ${depth} is the shallowest`);
+        else pickDepth(depth - 1);
+        return;
+      }
+      if (e.key === "]") {
+        const d = DEPTHS[kind];
+        if (depth >= d[d.length - 1]) setAnnounce(`depth ${depth} is the deepest`);
+        else pickDepth(depth + 1);
+        return;
+      }
+      if (e.key === "+" || e.key === "=") {
+        setZoomTo(zoom * 2);
+        return;
+      }
+      if (e.key === "-" || e.key === "_") {
+        setZoomTo(zoom / 2);
+        return;
+      }
+      if (e.key === "0") setZoomTo(1);
     };
+
+    /**
+     * Space, on the way UP.
+     *
+     * The brief asked for Space to paint at the cursor AND to be hold-to-pan,
+     * and those cannot both happen on the way down. They can both happen if the
+     * key paints on RELEASE and only when the pan never started, which is what a
+     * hold-to-pan modifier means anyway: tap it and nothing was dragged, so the
+     * tap was the paint. Nothing was given up.
+     */
+    const onUp = (e: KeyboardEvent) => {
+      if (e.key !== " ") return;
+      const el = document.activeElement;
+      if (
+        el instanceof HTMLInputElement ||
+        el instanceof HTMLTextAreaElement ||
+        el instanceof HTMLButtonElement ||
+        el instanceof HTMLAnchorElement
+      ) {
+        setSpaceHeld(false);
+        return;
+      }
+      setSpaceHeld(false);
+      if (helpOpen) return;
+      if (!panned.current) onCursorPaint();
+      panned.current = false;
+    };
+
+    // A window that loses focus mid-hold would keep Space down forever.
+    const onBlur = () => setSpaceHeld(false);
+
     window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [doUndo, doRedo, dropCandidate]);
+    window.addEventListener("keyup", onUp);
+    window.addEventListener("blur", onBlur);
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      window.removeEventListener("keyup", onUp);
+      window.removeEventListener("blur", onBlur);
+    };
+  }, [
+    doUndo,
+    doRedo,
+    dropCandidate,
+    helpOpen,
+    closeHelp,
+    openHelp,
+    armed,
+    disarm,
+    shapeDrag,
+    shapeTool,
+    pickShapeTool,
+    modes,
+    canvas,
+    reading,
+    reliefOn,
+    band,
+    tool,
+    kind,
+    depth,
+    zoom,
+    setZoomTo,
+    onRing,
+    onRadial,
+    onCursorPaint,
+    pickBand,
+    pickTool,
+    pickRelief,
+    pickReading,
+    pickDepth,
+  ]);
 
   // ── export ──────────────────────────────────────────────────────────────
 
@@ -1004,7 +1949,10 @@ export default function DrawPage() {
       width: canvas.geom.width,
       height: canvas.geom.height,
       cells,
-      paint: paintRef.current,
+      // The polygons are the plate AS SHOWN, at this depth; the payload below
+      // carries the addresses so a load gets back the depths this view cannot
+      // draw. A viewer that only looks at the picture sees exactly the screen.
+      paint: resolvePlate(plateRef.current, book),
       background: PLATE_BG,
       unpainted: showTiling ? TILE : null,
       tileSeam: SEAM,
@@ -1020,13 +1968,18 @@ export default function DrawPage() {
         kind,
         depth,
         convention,
-        paintRef.current,
-        baked === null ? undefined : { on: true, reading }
+        resolvePlate(plateRef.current, book),
+        baked === null ? undefined : { on: true, reading },
+        // `undefined` — so the field is omitted and the bytes are unchanged —
+        // whenever every painted address is at the exported depth, which is
+        // every drawing that never left the depth it was started at.
+        plateEntries(plateRef.current, book)
       ),
       overlay,
     });
   }, [
     canvas,
+    book,
     showTiling,
     weld,
     kind,
@@ -1161,12 +2114,23 @@ export default function DrawPage() {
         // which is what every file written before the field existed meant.
         setReliefOn(payload.relief?.on ?? false);
         if (payload.relief !== undefined) setReading(payload.relief.reading);
+        // The file's OWN canvas, not the one on screen: the addresses in the
+        // payload are words of the depth it declares, and the book that turns
+        // its `cells` indices into addresses has to be that canvas's book.
+        const loaded = plateFromArtPayload(
+          payload,
+          addressBook(
+            payload.canvas === "triangle"
+              ? buildFigure(payload.depth, payload.convention)
+              : buildHexagon(payload.depth, payload.convention)
+          )
+        );
         reset(
-          paintFromPayload(payload),
-          `loaded ${payload.cells.length} cell${
-            payload.cells.length === 1 ? "" : "s"
-          } — ${payload.canvas}, depth ${payload.depth}, ${
-            payload.convention
+          loaded,
+          `loaded ${loaded.size} cell${loaded.size === 1 ? "" : "s"} — ${
+            payload.canvas
+          }, depth ${payload.depth}, ${payload.convention}${
+            payload.plate === undefined ? "" : ", addressed"
           } · history reset to the loaded plate`
         );
         return;
@@ -1187,16 +2151,18 @@ export default function DrawPage() {
         return;
       }
       setLoadError(null);
-      const plate = new Map<number, string>();
-      for (const [i, s] of got.matched) plate.set(i, s.hex);
+      // Matched against the canvas AS IT STANDS, so the addresses are this
+      // depth's addresses. A foreign file has no depths but this one.
+      const imported = new Map<Address, string>();
+      for (const [i, s] of got.matched) imported.set(book.addr[i], s.hex);
       reset(
-        plate,
+        imported,
         `imported ${got.matched.size} of ${got.total} cells — this file was not made here${
           got.unmatched === 0 ? "" : `, ${got.unmatched} shapes matched no cell`
         }`
       );
     },
-    [refuse, reset, canvas, kind, mode]
+    [refuse, reset, canvas, book, kind, mode]
   );
 
   const openPicker = () => {
@@ -1259,7 +2225,9 @@ export default function DrawPage() {
    * candidate.
    */
   const said =
-    candidateSpec === null
+    dragSpec !== null
+      ? `${dragSpec.said} — release to lay it, Escape to cancel`
+      : candidateSpec === null
       ? announce
       : `candidate proposed at cell ${candidateSpec.seed} — ${
           candidateSpec.cells.length + candidateSpec.inert.length
@@ -1370,11 +2338,25 @@ export default function DrawPage() {
                 <button
                   key={k}
                   type="button"
-                  className={styles.segBtn}
+                  className={`${styles.segBtn} ${
+                    armed === k ? styles.armedBtn : ""
+                  }`}
                   aria-pressed={kind === k}
+                  aria-label={
+                    armed === k
+                      ? `confirm — switching to the ${k} clears the plate`
+                      : `canvas ${k}${
+                          kind === k || paint.size === 0
+                            ? ""
+                            : " — this clears the plate, and asks first"
+                        }`
+                  }
                   onClick={() => pickKind(k)}
+                  onBlur={() => {
+                    if (armed === k) disarm();
+                  }}
                 >
-                  {k}
+                  {armed === k ? "sure?" : k}
                 </button>
               ))}
             </div>
@@ -1402,13 +2384,73 @@ export default function DrawPage() {
             <div className={styles.sectionHead}>
               <h2 className={styles.sectionTitle}>Brush symmetry</h2>
               <span className={styles.sectionMeta}>
-                {kind === "triangle" || scope === "hexagon"
-                  ? `${kind === "triangle" ? "D₃" : "D₆"} subgroups`
+                {kind === "triangle"
+                  ? isolation === null
+                    ? "D₃ subgroups"
+                    : `arm ${isolation} · ⟨m_${isolation}⟩`
+                  : scope === "hexagon"
+                  ? "D₆ subgroups"
                   : scope === "sector"
                   ? `sector ${sector} · D₃`
                   : "C₆ × D₃"}
               </span>
             </div>
+            {/* The triangle's answer to the hexagon's SCOPE. Placed in the same
+                slot as the scope segment, because it is the same question — which
+                part of the plate is the brush allowed to reach — asked of a
+                figure whose parts are not sectors. */}
+            {kind === "triangle" && (
+              <>
+                <div
+                  className={`${styles.seg} ${styles.scopeSeg}`}
+                  role="group"
+                  aria-label="isolate one ftype arm"
+                >
+                  <button
+                    type="button"
+                    className={styles.segBtn}
+                    aria-pressed={isolation === null}
+                    aria-label="isolation off — paint the whole triangle"
+                    onClick={() => pickIsolation(null)}
+                  >
+                    off
+                  </button>
+                  {ARMS.map((a) => (
+                    <button
+                      key={a}
+                      type="button"
+                      className={styles.segBtn}
+                      aria-pressed={isolation === a}
+                      aria-label={`isolate arm ${a} — the ftype-${a} arm, one third of the board`}
+                      onClick={() => pickIsolation(a)}
+                    >
+                      {a}
+                    </button>
+                  ))}
+                </div>
+                <p className={styles.hint}>
+                  {isolation === null ? (
+                    <>
+                      <b>Isolate one arm.</b> The three <i>ftype</i> arms{" "}
+                      <code>S_D = {"{ Xʲ D u }"}</code> are congruent, tile the
+                      board minus the hub, and the rotation permutes them
+                      cyclically — a genuine partition, not a mask.
+                    </>
+                  ) : (
+                    <>
+                      <b>
+                        Arm {isolation} — {armSize} cells
+                      </b>{" "}
+                      of {total}, (4<sup>d</sup>−1)/3. The hub <code>Xᵈ</code> is
+                      in <i>no</i> arm and is out of reach until this is off. Only{" "}
+                      <b>m_{isolation}</b> fixes the arm, so a clipped 3-fold brush
+                      paints one cell and a 6-fold brush two — the induced action,
+                      not a broken one.
+                    </>
+                  )}
+                </p>
+              </>
+            )}
             {kind === "hexagon" && (
               <>
                 <div
@@ -1756,6 +2798,42 @@ export default function DrawPage() {
             </p>
           </section>
 
+          {/* The figure's own structure, offered as a drawing. Every colour here
+              is read out of `palette.ts` at a charge the model computed; nothing
+              is placed by hand. Applying one is an ordinary stroke, so undo takes
+              it back in one press and a depth change carries it across. */}
+          <section className={styles.section}>
+            <div className={styles.sectionHead}>
+              <h2 className={styles.sectionTitle}>Presets</h2>
+              <span className={styles.sectionMeta}>{total} cells</span>
+            </div>
+            <div className={styles.presetGrid} role="group" aria-label="preset plates">
+              {PRESET_NAMES.map((name) => (
+                <button
+                  key={name}
+                  type="button"
+                  className={styles.presetBtn}
+                  aria-label={`${PRESETS[name].label} — ${PRESETS[name].note}`}
+                  onClick={() => applyPreset(name)}
+                >
+                  {PRESETS[name].label}
+                </button>
+              ))}
+            </div>
+            <p className={styles.hint}>
+              <b>V₄ apex</b> and <b>V₄ ifs</b> are the same tiling under the two
+              conventions — identical at depth 1, and different from depth 2, where
+              the recursion starts handing the four children out in a different
+              order. <b>Coset</b> collapses the four charges onto the H /
+              not-H partition. <b>Gasket</b> paints the{" "}
+              <code>
+                {kind === "hexagon" ? "6·" : ""}3<sup>{depth}</sup>
+              </code>{" "}
+              addresses with <i>no X</i> in the colour you are holding, and leaves
+              the other {total - (kind === "hexagon" ? 6 : 1) * 3 ** depth} bare.
+            </p>
+          </section>
+
           </div>
 
           <div className={styles.railFade} aria-hidden="true" />
@@ -1832,6 +2910,39 @@ export default function DrawPage() {
                   </div>
                 </div>
 
+                {/* WHICH cells, beside WHAT colour. Two questions, two
+                    controls: LINE composes with ERASE without either of them
+                    knowing the other exists. */}
+                <div className={styles.benchGroup}>
+                  <span className={styles.benchKey} id="shape-key">
+                    shape
+                  </span>
+                  <div
+                    className={`${styles.seg} ${styles.dragSeg}`}
+                    role="group"
+                    aria-labelledby="shape-key"
+                  >
+                    {(["free", "line", "ring"] as ShapeTool[]).map((s) => (
+                      <button
+                        key={s}
+                        type="button"
+                        className={styles.segBtn}
+                        aria-pressed={shapeTool === s}
+                        aria-label={
+                          s === "free"
+                            ? "free brush — every cell the pointer crosses"
+                            : s === "line"
+                            ? "line — press and drag along a lattice row; it snaps to one of the three band families"
+                            : "ring — press and drag outward; the ring is a level set of the exact hexagonal norm"
+                        }
+                        onClick={() => pickShapeTool(s)}
+                      >
+                        {s}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
                 <div className={styles.benchGroup}>
                   <span className={styles.benchKey} id="drag-key">
                     drag
@@ -1879,14 +2990,35 @@ export default function DrawPage() {
                 >
                   redo
                 </button>
-                <button
-                  type="button"
-                  onClick={doClear}
-                  disabled={paint.size === 0}
-                  aria-label="clear the plate"
-                >
-                  clear
-                </button>
+                {/* Zoom, so Space-to-pan has something to pan. Buttons rather
+                    than keys alone: a modifier nobody can reach without a
+                    keyboard is a feature half the users do not have. */}
+                <span className={styles.zoomGroup} role="group" aria-label="zoom">
+                  <button
+                    type="button"
+                    onClick={() => setZoomTo(zoom / 2)}
+                    disabled={zoom <= 1}
+                    aria-label="zoom out"
+                  >
+                    −
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setZoomTo(1)}
+                    disabled={zoom === 1}
+                    aria-label={`zoom ${zoom} times — click to fit the whole figure`}
+                  >
+                    {zoom}×
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setZoomTo(zoom * 2)}
+                    disabled={zoom >= ZOOM_MAX}
+                    aria-label="zoom in"
+                  >
+                    +
+                  </button>
+                </span>
                 <button
                   type="button"
                   onClick={exportSvg}
@@ -1922,6 +3054,40 @@ export default function DrawPage() {
                   tabIndex={-1}
                   aria-hidden="true"
                 />
+                <button
+                  type="button"
+                  onClick={() => (helpOpen ? closeHelp() : openHelp())}
+                  aria-expanded={helpOpen}
+                  aria-label="keyboard shortcuts"
+                >
+                  ?
+                </button>
+                {/* The one control that wipes, and the only one. Warm, apart
+                    from the neutral chrome, and it asks twice. */}
+                <button
+                  type="button"
+                  className={`${styles.newBtn} ${
+                    armed === "new" ? styles.armedBtn : ""
+                  }`}
+                  onClick={doNew}
+                  onBlur={() => {
+                    if (armed === "new") disarm();
+                  }}
+                  aria-label={
+                    armed === "new"
+                      ? "confirm — wipe the plate and the whole undo history"
+                      : "new plate — wipes everything, and asks first"
+                  }
+                >
+                  {armed === "new" ? "new — sure?" : "new"}
+                  {armed === "new" && (
+                    <span
+                      className={styles.armFuse}
+                      style={{ animationDuration: `${CONFIRM_MS}ms` }}
+                      aria-hidden="true"
+                    />
+                  )}
+                </button>
               </span>
             </div>
 
@@ -1998,20 +3164,29 @@ export default function DrawPage() {
                 showTiling={showTiling}
                 weld={weld}
                 dragBehaviour={dragMode}
+                shape={shapeTool}
+                panning={spaceHeld}
+                view={view}
                 className={styles.canvas}
                 candidateClass={styles.marching}
-                label={`${kind} drawing canvas, depth ${depth}, ${total} cells, ${mode}-fold symmetry brush, ${tool} tool${
+                label={`${kind} drawing canvas, depth ${depth}, ${total} cells, ${mode}-fold symmetry brush, ${tool} tool, ${shapeTool} shape${
                   band === null ? "" : `, band ${band}`
-                }. Arrow keys move the cursor, Enter or Space ${
-                  dragMode === "propose" ? "proposes then commits" : "paints"
-                }.`}
+                }. Q W E A D Z X C step the cursor on the lattice, W and X move a ring outward and inward, arrow keys walk it by screen direction, Enter ${
+                  shapeTool === "free"
+                    ? dragMode === "propose"
+                      ? "proposes then commits"
+                      : "paints"
+                    : "anchors then lays the figure"
+                }. Press question mark for every shortcut.`}
                 onHover={onHover}
                 onPaint={paintAt}
                 onStrokeEnd={endStroke}
                 onPropose={propose}
                 onCommit={commitCandidate}
                 onArrow={onArrow}
-                onCursorPaint={onCursorPaint}
+                onShapeDrag={(anchor, at, alt) => setShapeDrag({ anchor, at, alt })}
+                onShapeEnd={commitShape}
+                onPan={onPan}
               />
               {tool !== "paint" && (
                 <span className={styles.modeFlag} data-tool={tool} aria-hidden="true">
@@ -2105,8 +3280,10 @@ export default function DrawPage() {
           </div>
 
           <p className={styles.keys}>
-            <b>⌘Z / Ctrl+Z</b> undoes a whole gesture, not a cell. Arrow keys move
-            a cursor on the plate.{" "}
+            <b>Q W E / A D / Z X C</b> walk the cursor on the exact lattice — the
+            six ring keys are the six same-orientation steps, at 0°, 60°, 120°,
+            180°, 240° and 300°, and <b>W</b> / <b>X</b> cross the radial axis.
+            Press <b>?</b> for every shortcut.{" "}
             {dragMode === "propose" ? (
               <>
                 Drag moves a candidate; <b>tap it</b> or press <b>Enter</b> to
@@ -2114,8 +3291,7 @@ export default function DrawPage() {
               </>
             ) : (
               <>
-                Drag paints continuously; <b>Enter</b> or <b>Space</b> paints at the
-                cursor.
+                Drag paints continuously; <b>Enter</b> paints at the cursor.
               </>
             )}
           </p>
@@ -2142,6 +3318,67 @@ export default function DrawPage() {
           </p>
         </div>
       </div>
+
+      {/* The shortcut panel.
+          A panel and not a page: it is over the plate, it is dismissed by Escape
+          and by its own button, focus moves into it on open and back to whatever
+          opened it on close. The rows come from `shortcuts.ts`, which is the same
+          table the collision test reads — a help panel maintained by hand beside
+          the handler is how a program comes to be described by a document about
+          a program that no longer exists. */}
+      {helpOpen && (
+        <div
+          className={styles.helpScrim}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="help-title"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) closeHelp();
+          }}
+        >
+          <div className={styles.helpPanel}>
+            <div className={styles.helpHead}>
+              <h2 className={styles.helpTitle} id="help-title">
+                Keys
+              </h2>
+              <button
+                ref={helpClose}
+                type="button"
+                className={styles.helpClose}
+                onClick={closeHelp}
+                aria-label="close the shortcut panel"
+              >
+                close
+              </button>
+            </div>
+            <div className={styles.helpCols}>
+              {SHORTCUTS.map((group) => (
+                <section key={group.title} className={styles.helpGroup}>
+                  <h3 className={styles.helpGroupTitle}>{group.title}</h3>
+                  <dl className={styles.helpList}>
+                    {group.rows.map((row) => (
+                      <div key={row.chord} className={styles.helpRow}>
+                        <dt className={styles.helpKeys}>{row.keys}</dt>
+                        <dd className={styles.helpWhat}>{row.what}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                </section>
+              ))}
+            </div>
+            <p className={styles.helpFoot}>
+              The six ring keys are the six <b>same-orientation</b> lattice steps
+              — one cell edge each, at 0°, 60°, 120°, 180°, 240° and 300°, and
+              identical whichever way up the cell is. The three <i>edge</i>{" "}
+              neighbours are not those: an upright cell reaches 30°, 150° and 270°
+              and an inverted one 90°, 210° and 330°, so the two orientations have
+              disjoint edge sets and a cluster mapped to them would mean two
+              different things under one finger. <b>W</b> and <b>X</b> are what
+              cross between the two, so the eight together reach every cell.
+            </p>
+          </div>
+        </div>
+      )}
 
       <p className="sr-only" role="status" aria-live="polite">
         {said}

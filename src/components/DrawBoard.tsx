@@ -106,6 +106,33 @@ export const previewCovers = (spec: PreviewSpec, i: number): boolean =>
 export type DragBehaviour = "paint" | "propose";
 
 /**
+ * What a press-drag-release lays down.
+ *
+ * `free` is the brush: every cell the pointer crosses is an application. The
+ * other two are ANCHORED — the press names a cell and the drag names a second,
+ * and nothing is painted until the release, so the whole figure is a single
+ * gesture and a single rung of the undo stack. See `lattice.ts` for what each
+ * one is on the lattice.
+ */
+export type ShapeTool = "free" | "line" | "ring";
+
+/**
+ * The visible window, in canvas units.
+ *
+ * `null` is the whole figure, which is what the board always showed. Anything
+ * else is a zoom: the SVG's own `viewBox` is narrowed, so every layer, every
+ * guide and — crucially — the transparent hit layer scale together and a click
+ * still lands on the cell under the finger. Nothing about the model moves, so an
+ * export taken while zoomed is the same file as one taken while not.
+ */
+export interface ViewWindow {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/**
  * The relief, as the board needs it: the plate's polygons already deformed.
  *
  * Everything here is a DISPLAY substitution — the same cells, in the same order,
@@ -144,6 +171,19 @@ interface Props {
   /** Stroke painted cells in their own fill, so a filled row is one shape. */
   weld: boolean;
   dragBehaviour: DragBehaviour;
+  /** The anchored tool in hand. `free` is the ordinary brush. */
+  shape: ShapeTool;
+  /**
+   * Space is held, so the pointer drags the PLATE rather than paint.
+   *
+   * A modifier and not a mode: it is reported by the page, which owns the key
+   * state, and it overrides every other gesture while it is true. Only useful
+   * while `view` is narrowed — see the note in `page.tsx` on why zoom had to
+   * arrive with it.
+   */
+  panning: boolean;
+  /** `null` shows the whole figure, exactly as the board always did. */
+  view: ViewWindow | null;
   label: string;
   /** Supplied by the page, which owns the CSS module the class lives in. */
   className: string;
@@ -155,7 +195,17 @@ interface Props {
   onPropose: (i: number) => void;
   onCommit: () => void;
   onArrow: (dir: Direction) => void;
-  onCursorPaint: () => void;
+  /**
+   * The anchored drag moved. `anchor` never changes during one gesture, `at` is
+   * the cell under the pointer now, and `alt` is Option/Alt as it stands at this
+   * instant — read off every event rather than once at the press, so letting go
+   * of the modifier mid-drag changes the figure under the finger.
+   */
+  onShapeDrag: (anchor: number, at: number, alt: boolean) => void;
+  /** The anchored drag ended. The page turns the standing figure into a stroke. */
+  onShapeEnd: () => void;
+  /** A pan, in CANVAS units — the board converts, the page only translates. */
+  onPan: (dx: number, dy: number) => void;
 }
 
 /**
@@ -581,6 +631,9 @@ export default function DrawBoard({
   showTiling,
   weld,
   dragBehaviour,
+  shape,
+  panning,
+  view,
   label,
   className,
   candidateClass,
@@ -590,7 +643,9 @@ export default function DrawBoard({
   onPropose,
   onCommit,
   onArrow,
-  onCursorPaint,
+  onShapeDrag,
+  onShapeEnd,
+  onPan,
 }: Props) {
   /**
    * The plate's polygons, from whichever source is in force.
@@ -611,6 +666,11 @@ export default function DrawBoard({
   const armed = useRef(false);
   const moved = useRef(false);
   const last = useRef<number | null>(null);
+  /** The cell an anchored gesture started at, or `null` when none is running. */
+  const anchor = useRef<number | null>(null);
+  /** The last client point of a pan drag, or `null` when none is running. */
+  const panFrom = useRef<{ x: number; y: number } | null>(null);
+  const svg = useRef<SVGSVGElement | null>(null);
 
   const indexOf = (target: EventTarget | null): number | null => {
     const raw = (target as SVGElement | null)?.dataset?.i;
@@ -620,6 +680,15 @@ export default function DrawBoard({
   };
 
   const end = useCallback(() => {
+    if (panFrom.current !== null) {
+      panFrom.current = null;
+      return;
+    }
+    if (anchor.current !== null) {
+      anchor.current = null;
+      onShapeEnd();
+      return;
+    }
     if (proposing.current) {
       const commitNow = armed.current && !moved.current;
       proposing.current = false;
@@ -633,7 +702,7 @@ export default function DrawBoard({
     drawing.current = false;
     last.current = null;
     onStrokeEnd();
-  }, [onStrokeEnd, onCommit]);
+  }, [onStrokeEnd, onCommit, onShapeEnd]);
 
   // A gesture can finish anywhere — off the plate, off the window, or by the
   // browser cancelling the pointer. Every one of those has to close the stroke,
@@ -647,11 +716,42 @@ export default function DrawBoard({
     };
   }, [end]);
 
+  /**
+   * Client pixels to canvas units.
+   *
+   * FLOAT, and legitimately: this converts a mouse delta into a scroll offset.
+   * It never chooses a cell — the hit layer does that, by `data-i`, and it does
+   * it under whatever `viewBox` is in force without knowing there is one.
+   */
+  const toUnits = (dx: number, dy: number): [number, number] => {
+    const el = svg.current;
+    if (el === null) return [0, 0];
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return [0, 0];
+    const w = view === null ? geom.width : view.w;
+    const h = view === null ? geom.height : view.h;
+    return [(dx * w) / rect.width, (dy * h) / rect.height];
+  };
+
   const down = (e: React.PointerEvent<SVGSVGElement>) => {
+    // Space wins over everything. A pan that only worked when the press landed
+    // on a cell would fail exactly at the rim, where a pan is most wanted.
+    if (panning) {
+      panFrom.current = { x: e.clientX, y: e.clientY };
+      e.currentTarget.setPointerCapture?.(e.pointerId);
+      return;
+    }
+
     const i = indexOf(e.target);
     if (i === null) return;
     const el = e.target as Element;
     if (el.hasPointerCapture?.(e.pointerId)) el.releasePointerCapture(e.pointerId);
+
+    if (shape !== "free") {
+      anchor.current = i;
+      onShapeDrag(i, i, e.altKey);
+      return;
+    }
 
     if (dragBehaviour === "propose") {
       proposing.current = true;
@@ -673,7 +773,30 @@ export default function DrawBoard({
   };
 
   const move = (e: React.PointerEvent<SVGSVGElement>) => {
+    if (panFrom.current !== null) {
+      const [dx, dy] = toUnits(
+        e.clientX - panFrom.current.x,
+        e.clientY - panFrom.current.y
+      );
+      panFrom.current = { x: e.clientX, y: e.clientY };
+      onPan(dx, dy);
+      return;
+    }
+
     const i = indexOf(e.target);
+
+    if (anchor.current !== null) {
+      // `alt` is read HERE and not at the press: releasing Option mid-drag has
+      // to turn a symmetric figure back into a one-sided one under the finger,
+      // or the modifier is a mode with no indicator.
+      if (i !== null) onShapeDrag(anchor.current, i, e.altKey);
+      return;
+    }
+
+    if (shape !== "free" && !panning) {
+      onHover(i);
+      return;
+    }
 
     if (dragBehaviour === "propose") {
       if (!proposing.current) {
@@ -712,18 +835,27 @@ export default function DrawBoard({
       onArrow(d);
       return;
     }
-    if (e.key === "Enter" || e.key === " ") {
-      e.preventDefault();
-      onCursorPaint();
-    }
+    // The ARROWS only. Enter and Space have both moved to the page's window
+    // listener, and for the same reason: they have to work while the hand is on
+    // a rail control, or the anchored tools have no keyboard path at all —
+    // measured, by pressing Enter with the body focused and watching nothing
+    // happen. The arrows stay because they are a walk by SCREEN direction and
+    // the plate is the thing that has a screen; binding ↑ and ↓ globally would
+    // also take the page's own scrolling away.
   };
 
   const cursorPoints = cursor === null ? undefined : pts[cursor];
 
   return (
     <svg
-      viewBox={`0 0 ${geom.width} ${geom.height}`}
+      ref={svg}
+      viewBox={
+        view === null
+          ? `0 0 ${geom.width} ${geom.height}`
+          : `${view.x} ${view.y} ${view.w} ${view.h}`
+      }
       className={className}
+      data-gesture={panning ? "pan" : shape === "free" ? undefined : shape}
       role="application"
       aria-label={label}
       tabIndex={0}
