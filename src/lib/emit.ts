@@ -110,6 +110,72 @@
  * A file that is smaller and draws a different picture is not smaller, and one
  * its own loader cannot read is not a file.
  *
+ * ── Six rotations of one sector: measured, and NOT taken ────────────────
+ *
+ * The hexagon is C₆-symmetric whatever the user drew, so a sector could be
+ * written once and instanced six times:
+ *
+ *   <defs><g id="sec"> …one sector's cells… </g></defs>
+ *   <use href="#sec"/>   <use href="#sec" transform="rotate(-60 CX CY)"/>   …
+ *
+ * Two of the obvious objections do NOT apply, and were checked rather than
+ * argued. The six sectors PARTITION the figure, so unlike an orbit — which can
+ * be short — nothing double-draws and nothing is left out. And the transform is
+ * a true isometry, so there is none of the stroke distortion the matrix above
+ * would have caused: Chrome resolves each instance to det = 1, a =
+ * 0.49999999999999994, b = −0.8660254037844387. It is also worth real bytes,
+ * because the tiling is 95% of a sparse depth-5 file: that file goes to 42% of
+ * its raw size and 50% of its gzipped size.
+ *
+ * IT IS NOT TAKEN, because ROTATING A TWO-DECIMAL COORDINATE DOES NOT LAND ON A
+ * TWO-DECIMAL COORDINATE. Cells of the five rotated sectors whose vertices come
+ * out a full 0.01 from where the explicit form puts them, using the coordinates
+ * and the centre this file can actually state:
+ *
+ *   depth 3   115 / 320      depth 4   399 / 1280      depth 5   1555 / 5120
+ *
+ * About 30% at every depth. That is the matrix form's failure again — bounded
+ * here rather than growing with the row index, but a cell that lands a quantum
+ * away is a cell `importByGeometry` and `resolvedShapes` miss.
+ *
+ * It can be bought back, and the price is this module's own invariant. The
+ * instanced sector has to state its geometry at EIGHT decimals and its rotation
+ * centre at full double precision — the centre is (512√3 + 120)/2, and stating
+ * it at the two decimals everything else here is stated at is by itself enough
+ * to put 127 of 5120 cells in the wrong hundredth at depth 5. With both, a
+ * reader that follows `<use>` into a `<g>` does reproduce every cell exactly: 0
+ * of 1536 wrong at depth 4. So the file would state one sixth of its geometry
+ * at eight decimals and five sixths at two, and inside its own `<defs>` it
+ * would have to write full polygons rather than `<use>` of a prototype, the
+ * prototypes being stated at two decimals — the format arguing against itself
+ * in its own defs block.
+ *
+ * And it still would not RENDER exactly. Blink keeps a rotation centre as a
+ * float32: hand it 503.40500673763256 and `getScreenCTM` reports the rotation
+ * taken about 503.40499877929688, which moves 90 of 1536 cells into a different
+ * hundredth. Invisible — 1.6·10⁻⁵ of a user unit is thousands of times below a
+ * device pixel — but it is a floor no amount of precision in the file can lift.
+ *
+ * Three more, all measured. The saving is ZERO where a drawing is dense and
+ * asymmetric — 96% of raw at depth 5, and 103% of gzipped at depth 3, a LOSS —
+ * because the tiling is `shown` minus the painted cells and is therefore
+ * C₆-symmetric only when the paint is; "unconditional" is not available. A
+ * relieved plate IS C₆-symmetric (1280 of 1280 rotations exact at depth 4), so
+ * the one drawing that must fall back to plain polygons is the one a symmetry
+ * test fires on, and the fallback would have to be gated on `factored` rather
+ * than on symmetry. And `parse` cannot recover which cell a shape belongs to:
+ * it pairs the k-th shape in a group with the k-th cell the payload lists, the
+ * instanced order is not that order, and THIS MODULE KNOWS NOTHING ABOUT
+ * SECTORS — `hexagon.ts` owns the index law — so the split would have to become
+ * a new kind of statement in the markup. Today `parse` returns `null` for such
+ * a file and `resolvedShapes` reads 0 of its 1536 shapes.
+ *
+ * A TRANSLATE has none of this. Every hexagon x is an exact integer, so the
+ * horizontal offset between two cells of one row is an exact integer at every
+ * depth — 6144 of 6144 at depth 5 — and `<use x>` reproduces the coordinate to
+ * the bit, with no centre to state and no second precision. Whatever this file
+ * factors next should be factored along a row and not around the eye.
+ *
  * ── The markup is indented, and that is nearly free ─────────────────────
  *
  * One element per line, two-space indent. It costs 11% of the raw bytes and
