@@ -835,7 +835,7 @@
  * not want, and centred the 2px difference is invisible.
  */
 .deck {
-  --deck-row: 25px;
+  --deck-row: 30px;
   display: flex;
   flex-wrap: wrap;
   align-items: center;
@@ -931,15 +931,26 @@
 /**
  * The icon, at ONE size everywhere.
  *
- * 13px on a 16-unit grid puts the family's 1.6-unit stroke at 1.3 device
- * pixels, which is the weight the console's hairlines are already drawn at, so
- * the glyphs sit ON the type rather than in front of it. `currentColor` in the
- * markup means the pressed, hover, disabled and focus states the buttons
- * already have are the glyph's states too, with no second set of rules.
+ * 18px, up from 13. A reviewer read the deck as too small to aim at, and the
+ * measurement agrees: 13px squares in a 25px row are a 3px margin of error for
+ * a finger. 18px in a 30px row is 92% more glyph and a target a thumb can find
+ * without looking, and it is paid for by the status line leaving the plate rule
+ * — the band is SHORTER than it was even with the bigger icons in it.
+ *
+ * The stroke moved with it, and not by the same factor. See `Glyph` in
+ * `page.tsx`: 1.5 grid units at 18px is 1.69 device pixels against the 1.3 the
+ * 13px glyphs carried, so the family got heavier in absolute terms — which is
+ * what a bigger glyph needs, since the same absolute weight over more area
+ * reads thinner — while staying at the 12:1 size-to-stroke ratio a line-icon
+ * family holds before it starts to look like signage.
+ *
+ * `currentColor` in the markup means the pressed, hover, disabled and focus
+ * states the buttons already have are the glyph's states too, with no second
+ * set of rules.
  */
 .icon {
-  width: 13px;
-  height: 13px;
+  width: 18px;
+  height: 18px;
   flex: none;
   display: block;
 }
@@ -981,18 +992,16 @@
 }
 
 /**
- * MEMORY, as two columns of two.
+ * MEMORY, one column of two: REPLAY over HISTORY.
  *
- * Reading DOWN a column: undo/redo, then replay/history. Reading ACROSS a row:
- * what changes the drawing, then what only looks at it. The reviewer asked for
- * undo over redo on the right, and that is the left column of this verbatim;
- * the second column is where REPLAY and HISTORY landed, because they are the
- * same faculty — the drawing's memory — and the only two controls in the deck
- * that change nothing at all.
+ * It was two columns of four — undo/redo beside replay/history, "what changes
+ * the drawing" beside "what only looks at it". Undo and redo have moved onto
+ * the canvas, so the column that is left is the one that changes nothing at
+ * all, and it now reads like every other stacked pair in the deck.
  */
 .deckMemory {
   display: grid;
-  grid-template-columns: repeat(2, auto);
+  grid-auto-rows: auto;
   gap: 3px;
 }
 
@@ -1036,7 +1045,7 @@
   height: var(--deck-row);
   padding: 0;
   border-radius: 50%;
-  font-size: 11px;
+  font-size: 13px;
   letter-spacing: 0;
   line-height: 1;
   color: var(--bone-dim);
@@ -1057,9 +1066,11 @@
   padding: 0 3px 0 4px;
 }
 
+/* It grew with the tray it hangs off — 7px beside an 18px glyph read as a
+   speck, and it is the only mark saying there is a list under this button. */
 .caret {
-  width: 7px;
-  height: 7px;
+  width: 9px;
+  height: 9px;
   flex: none;
   opacity: 0.75;
 }
@@ -1667,9 +1678,13 @@
   border-right: 1px solid var(--rule-bright);
   border-radius: 0;
   padding: 0;
-  min-width: 22px;
+  /* `−`, `1×` and `+` are the only glyphs in the deck that are TYPE rather than
+     SVG, and they had to grow with the rest of it or the one group with no icon
+     would have been the one group you cannot read. 22 → 27px wide, 10.5 →
+     12.5px set. */
+  min-width: 27px;
   height: calc(var(--deck-row) - 2px);
-  font-size: 10.5px;
+  font-size: 12.5px;
   letter-spacing: 0;
   line-height: 1;
   color: var(--bone-dim);
@@ -1684,7 +1699,7 @@
    one click away. Disabled at 1×, which is exactly when there is nothing to
    reset — and it still reads `1×`, so the group never goes blank. */
 .zoomStepper .zoomNow {
-  min-width: 27px;
+  min-width: 34px;
   color: var(--bone);
   background: rgba(255, 255, 255, 0.045);
 }
@@ -1788,21 +1803,21 @@
   margin: 0;
 }
 
+/* 92px → 100px: the chord is a chip now and a chip has walls. Measured, not
+   guessed — the widest chip in the table is `⌘⇧Z / Ctrl ⇧Z` at 95px, so 100
+   prints every chord whole with five to spare and gives the rest back to the
+   description. Nothing in this panel ellipsises. */
 .helpRow {
   display: grid;
-  grid-template-columns: 92px minmax(0, 1fr);
+  grid-template-columns: 100px minmax(0, 1fr);
   gap: 8px;
   align-items: baseline;
   padding: 3px 0;
 }
 
 .helpKeys {
-  font-size: 9.5px;
-  letter-spacing: 0.1em;
-  color: var(--bone);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  display: flex;
+  min-width: 0;
 }
 
 .helpWhat {
@@ -1850,8 +1865,8 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
+  width: 28px;
+  height: 28px;
   flex: none;
   border: 1px solid var(--rule);
   border-radius: 2px;
@@ -1880,11 +1895,11 @@
      both ellipsised — a shortcut panel that cannot print the shortcut. */
   .helpRow {
     grid-template-columns: minmax(0, 1fr);
-    gap: 1px;
+    gap: 3px;
     padding: 5px 0;
   }
   .helpKeys {
-    white-space: normal;
+    justify-content: flex-start;
   }
   .helpClose {
     padding: 10px 14px;
@@ -1935,8 +1950,14 @@
    * plate rule down to 95. The 35px is the canvas's, by the same rule that gave
    * it the 51: the plate is not allowed to keep height the controls stopped
    * needing.
+   *
+   * 244 → 242, and this time the two halves nearly cancel. The status line left
+   * the plate rule for the strip under the canvas: the rule went 95 → 73 even
+   * with 18px icons in it, and the strip went 46 → 66 taking the status in. Two
+   * pixels net, and they are the canvas's for the same reason as the 35 and
+   * the 51.
    */
-  --d-avail: calc(100dvh - 244px);
+  --d-avail: calc(100dvh - 242px);
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -1984,14 +2005,24 @@
 }
 
 /**
- * The plate rule: status, bench and actions in ONE wrapping row.
+ * The plate rule: CONTROLS, and nothing else.
  *
- * `space-between` is deliberately not used any more. With three groups on two
- * lines it pushed the bench and the actions to opposite ends of an otherwise
- * empty line, which read as two unrelated toolbars; packed from the start with
- * the actions pushed right by `margin-left: auto`, the second line reads as one
- * strip of controls with the destructive and export buttons kept at the far
- * end, away from the tool the pointer is about to reach for.
+ * It carried the status line as a row above the deck until a second review sent
+ * that down to the strip under the canvas, and what is left is a band that says
+ * only what the hand can DO. That is the point of the move as much as the
+ * height it gave back: a reader looking for a fact and a hand looking for a
+ * button were being served by the same 95px of chrome, and now the band above
+ * the artwork is entirely the one and the band below it entirely the other.
+ *
+ * `space-between` is deliberately not used. With groups on two lines it pushed
+ * them to opposite ends of an otherwise empty line, which read as two unrelated
+ * toolbars; packed from the start with the right-hand groups pushed over by
+ * `margin-left: auto`, the deck reads as one strip with the destructive and
+ * export buttons kept at the far end, away from the tool the pointer is about
+ * to reach for.
+ *
+ * The type here is now only the group KEYS — drag, tool, shape, zoom — so the
+ * 0.18em tracking is a micro-caption's, not a sentence's.
  */
 .plateRule {
   display: flex;
@@ -2007,39 +2038,11 @@
   border-bottom: 1px solid var(--rule);
 }
 
-.plateRule b {
-  color: var(--bone-dim);
-  font-weight: 500;
-}
-
-/**
- * The status line, and the one control that belongs on it.
- *
- * Two children and one rule between them: the readout may wrap to as many
- * lines as the sentence needs, and ZOOM is pinned to the far end of the FIRST
- * of them and never moves. That is the whole reason this row exists rather
- * than the zoom group simply being another item in `.readout` — as one flex
- * child among four it wrapped onto a line of its own the moment the sentence
- * to its left grew, and cost the canvas a third row of the plate rule.
- */
-.statusRow {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 10px 18px;
-  flex: 1 1 100%;
-  min-width: 0;
-}
-
-.readout {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px 16px;
-  min-width: 0;
-}
-
-/* The active tool, first in the status line and in the tool's own colour. */
+/* The tool's colour, read by the pressed TOOL button in the deck below and by
+   the flag that floats on the artwork. It used to also colour a `PAINT` chip at
+   the head of the status line; that chip is gone — see the plate rule in
+   `page.tsx` for why a bordered word restating a pressed button was one
+   statement too many. */
 .plateRule {
   --tool-accent: var(--bone);
 }
@@ -2052,18 +2055,9 @@
   --tool-accent: #7dd3fc;
 }
 
-.toolStatus {
-  padding: 3px 7px;
-  border: 1px solid var(--tool-accent);
-  border-radius: 2px;
-  color: var(--tool-accent);
-  font-weight: 600;
-  letter-spacing: 0.22em;
-}
-
-/* The deck takes the rest of the line, and its right-hand groups are pushed to
-   the far end of it — so the control that WIPES is never adjacent to the tool
-   the pointer is about to reach for. */
+/* The deck's right-hand groups are pushed to the far end of the band — so the
+   control that WIPES is never adjacent to the tool the pointer is about to
+   reach for. */
 .deckMemory {
   margin-left: auto;
 }
@@ -2079,9 +2073,14 @@
    * is now five blocks that each hold together.
    */
   .deck {
-    --deck-row: 38px;
+    --deck-row: 44px;
     width: 100%;
     gap: 10px 12px;
+  }
+  /* A thumb sees the glyph from further away than a pointer does. */
+  .icon {
+    width: 21px;
+    height: 21px;
   }
   .deckRows {
     flex: 1 1 190px;
@@ -2152,20 +2151,119 @@
   justify-content: center;
 }
 
-/* A destructive or transforming brush must never be a state you can only infer
-   from a control you are not looking at. The flag sits ON the artwork. */
-.modeFlag {
+/**
+ * THE CANVAS HUD — undo, redo and the brush flag, floated on the artwork at the
+ * top left, in one row.
+ *
+ * POINTER EVENTS, which is the whole of the risk in putting buttons on a
+ * drawing surface. Three layers of defence, and each one is doing something the
+ * others cannot:
+ *
+ *  1. The ROW is inert. `pointer-events: none` here, taken back only by the
+ *     buttons, so the gap between them, the padding around them and the flag
+ *     beside them are all transparent — a press there lands on the cell
+ *     underneath, and the HUD's footprint is exactly the two 30px squares.
+ *
+ *  2. While a press is LIVE on the canvas the buttons drop out too. `:active`
+ *     stays on the element the press landed on until it is released, so a
+ *     stroke that begins anywhere on the plate turns the whole HUD inert for
+ *     the duration and drags straight through it. This is not a nicety: the
+ *     board releases pointer capture on press (it has to — it reads the cell
+ *     off `event.target`), so without this a drag across undo would stop
+ *     firing moves and skip every cell under the button.
+ *
+ *  3. And they are at the TOP LEFT, where the plate's own vignette is darkest
+ *     and the figure — apex-up in sector view, centred in hexagon view — has
+ *     the least ink. The candidate bar already owns the top right, so the two
+ *     floating things on this surface are in opposite corners.
+ */
+.canvasHud {
   position: absolute;
   top: 5px;
   left: 5px;
-  z-index: 1;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  pointer-events: none;
+}
+
+.canvasHud button {
+  pointer-events: auto;
+}
+
+.canvasHold:has(.canvas:active) .canvasHud button {
+  pointer-events: none;
+}
+
+/**
+ * A button that has to be legible over whatever has been painted under it.
+ *
+ * The deck's icon buttons sit on the plate and can borrow its background; these
+ * sit on the ARTWORK, so they carry their own — the same near-opaque ink and
+ * hairline the flag beside them wears, so the row reads as one piece of
+ * furniture rather than as two buttons that happen to be near a chip.
+ */
+.hudBtn {
+  /* Its own size: `--deck-row` belongs to the deck and this is not on it. The
+     same 30px, because it is the same button in a different place. */
+  width: 30px;
+  height: 30px;
+  border: 1px solid var(--rule-bright);
+  background: rgba(10, 9, 8, 0.78);
+  backdrop-filter: blur(2px);
+  color: var(--bone-dim);
+}
+
+.hudBtn:hover:not(:disabled) {
+  color: var(--bone);
+  border-color: var(--bone-faint);
+  background: rgba(10, 9, 8, 0.92);
+}
+
+/**
+ * Dimmed rather than hidden. A control that vanishes when it has nothing to do
+ * is a control nobody learns is there, and floated over the plate it costs no
+ * layout either way.
+ *
+ * And INERT while it is dim. A disabled button still hit-tests, and Chrome
+ * dispatches nothing when a press lands on one — not even to its ancestors —
+ * so on a fresh plate these two squares would have been a pair of holes in the
+ * drawing surface that swallow a stroke and give nothing back. A control with
+ * no action has no business taking a press.
+ */
+.hudBtn:disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+/* A thumb, not a pointer. Declared HERE rather than in the phone block further
+   up the sheet: these two rules and the ones above them have equal specificity,
+   so the one that wins is the one that comes last, and a media query 100 lines
+   too early is a media query that does nothing. */
+@media (max-width: 700px) {
+  .canvasHud {
+    gap: 5px;
+  }
+  .hudBtn {
+    width: 38px;
+    height: 38px;
+  }
+}
+
+/* A destructive or transforming brush must never be a state you can only infer
+   from a control you are not looking at. The flag sits ON the artwork, in the
+   HUD row beside undo and redo. */
+.modeFlag {
+  flex: none;
   padding: 4px 8px;
   border: 1px solid currentColor;
   border-radius: 2px;
-  background: rgba(10, 9, 8, 0.72);
+  background: rgba(10, 9, 8, 0.78);
   font-size: 8.5px;
   letter-spacing: 0.3em;
   text-transform: uppercase;
+  white-space: nowrap;
   pointer-events: none;
 }
 
@@ -2173,18 +2271,16 @@
    the preview's violet, and it REPLACES the tool flag rather than sitting
    beside it — the brush is switched off while this is up. */
 .previewFlag {
-  position: absolute;
-  top: 5px;
-  left: 5px;
-  z-index: 1;
+  flex: none;
   padding: 4px 8px;
   border: 1px solid currentColor;
   border-radius: 2px;
-  background: rgba(10, 9, 8, 0.72);
+  background: rgba(10, 9, 8, 0.78);
   font-size: 8.5px;
   letter-spacing: 0.3em;
   text-transform: uppercase;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
   color: var(--d-rot);
   pointer-events: none;
 }
@@ -2354,19 +2450,88 @@
   pointer-events: none;
 }
 
-/* ---------- legend ---------- */
+/* ---------- the baseline: status and legend, under the artwork ---------- */
+
+/**
+ * ONE band under the plate, holding the two readings this program takes.
+ *
+ * On the left, what is true of the DRAWING — frame, depth, cells, brush, reach,
+ * scheme, count. On the right, what is true of its SYMMETRY — the axes and the
+ * rotation the legend is a key to. The status half used to be the top row of
+ * the plate rule, above the artwork; a reviewer noticed that the two are the
+ * same kind of sentence and asked for them together, which is right: the reader
+ * who wants one usually wants the other, and the artwork was standing between
+ * them.
+ *
+ * ONE ROW ON A DESKTOP, TWO ON A PHONE — as asked, and with one honest
+ * departure. A row is not a line here. Measured at 1512 the plate is 766px wide
+ * and these two readings come to roughly 1330px of small caps; the legend on
+ * its own already wrapped to two lines in that space. So the band is two
+ * COLUMNS, divided by a hairline, each wrapping inside its own width — the two
+ * texts genuinely beside each other, which is what was asked for, rather than
+ * one line bought by ellipsising a fact or by shrinking the type past reading.
+ */
+.baseline {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px 20px;
+  padding-top: 10px;
+  margin-top: 10px;
+  border-top: 1px solid var(--rule);
+}
+
+/**
+ * The status half. It keeps the plate rule's small caps but loses its 0.18em
+ * tracking for the legend's 0.1em, because it is now sitting NEXT TO the legend
+ * and two tracking values in one band read as two bands.
+ */
+.readout {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 14px;
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+}
+
+.readout b {
+  color: var(--bone-dim);
+  font-weight: 500;
+}
 
 .legend {
   display: flex;
   flex-wrap: wrap;
+  align-items: baseline;
   gap: 6px 16px;
-  padding-top: 10px;
-  margin-top: 10px;
-  border-top: 1px solid var(--rule);
+  flex: 1 1 auto;
+  min-width: 0;
+  padding-left: 20px;
+  border-left: 1px solid var(--rule);
   font-size: 9.5px;
   letter-spacing: 0.1em;
   color: var(--bone-faint);
   text-transform: uppercase;
+}
+
+/* A phone gets the two rows the reviewer asked for, and the divider turns from
+   a wall between columns into a seam between them. */
+@media (max-width: 700px) {
+  .baseline {
+    flex-direction: column;
+    gap: 9px;
+  }
+  .legend {
+    padding-left: 0;
+    padding-top: 9px;
+    border-left: 0;
+    border-top: 1px solid var(--rule);
+    width: 100%;
+  }
 }
 
 .legendItem {
@@ -2393,19 +2558,95 @@
 
 /* ---------- footnote ---------- */
 
-/* The keyboard contract, moved out of the rail: it is about the PLATE, and the
-   rail's vertical budget is spent on controls that change what the brush is. */
-.keys {
-  font-size: 10px;
-  line-height: 1.7;
-  color: var(--bone-dim);
+/**
+ * THE KEY CHIP, drawn once and used in both places a chord is printed.
+ *
+ * A doubled bottom border and nothing else: it is the cheapest mark that says
+ * "this is a thing you press" — the front edge of a keycap seen slightly from
+ * above — and it survives at the 9.5px this console prints everything else in,
+ * which an inset shadow or a gradient would not.
+ *
+ * Monospace inherited from the page, so `W` and `.` occupy the same cell and a
+ * row of chips is a row rather than a ragged fence.
+ */
+.kbd {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  padding: 3px 5px 2px;
+  border: 1px solid var(--rule-bright);
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  background: var(--plate-2);
+  color: var(--bone);
+  font-family: inherit;
+  font-size: 9.5px;
+  line-height: 1;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+}
+
+/**
+ * The keyboard contract, as lines.
+ *
+ * It was a paragraph — four sentences, the key names bolded inside the prose —
+ * and the complaint was that it had to be read to be used. One idea per row
+ * now, the chips in a column of their own so the eye can run down them, and the
+ * rows in two columns on a wide screen so six lines cost about the height four
+ * lines of prose did.
+ */
+.keyLines {
+  list-style: none;
   margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(330px, 1fr));
+  gap: 7px 30px;
   max-width: 92ch;
 }
 
-.keys b {
-  color: var(--bone);
-  font-weight: 500;
+/* A fixed chip gutter, so every sentence in the list starts on the same x and
+   the chips read as a column rather than as decorations at the head of a line.
+   96px holds the widest pair that shares the grid (`,` `.`) with room over. */
+.keyLines li {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 4px 10px;
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--bone-dim);
+}
+
+/* The two rows whose chips will not fit a gutter: they take the whole width and
+   size their own. */
+.keyLines li[data-span] {
+  grid-column: 1 / -1;
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+/* The chips wrap as a block of their own rather than reflowing into the
+   sentence: the eight lattice keys are ONE answer to one question, and split
+   across a line break with prose between them they stop looking like a set. */
+.keyChips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+
+@media (max-width: 700px) {
+  /* One column, and the chips take a row above what they do — at 390px the
+     eight lattice keys are wider than the half of the line a side-by-side
+     layout could give them. */
+  .keyLines {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 11px;
+  }
+  .keyLines li,
+  .keyLines li[data-span] {
+    grid-template-columns: minmax(0, 1fr);
+  }
 }
 
 .foot {

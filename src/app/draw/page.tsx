@@ -470,18 +470,37 @@ const TOOL_LABEL: Record<Tool, string> = {
  * text colour, and a glyph that inherits it keeps all four for free rather than
  * needing a second set of rules.
  *
- * 16 rather than 24 so the numbers below are the same numbers a reader sees:
- * the plate rule renders these at 13px, and a 16-unit grid at 13px puts a
- * 1.6-unit stroke at 1.3 device pixels, which is the weight of the hairlines
- * the console is already drawn in. A 24-grid would have needed 2.4.
+ * 16 rather than 24 so the numbers below are the same numbers a reader sees.
+ *
+ * THE SIZE, and why the weight moved with it. The strip rendered at 13px, where
+ * the family's 1.6-unit stroke lands on 1.3 device pixels — the console's own
+ * hairline — and a reviewer read the whole deck as too small to aim at. It is
+ * 18px now, which is 92% more glyph area and a 30px row a thumb can find.
+ *
+ * A stroke measured on the GRID scales with the glyph, so 1.6 at 18px would
+ * have been 1.8 device pixels: not "the same weight bigger" but a third
+ * heavier, and beside 1px rules the family stopped looking drawn and started
+ * looking bold. 1.5 at 18px is 1.69 device pixels — still visibly heavier than
+ * the 1.3 it was, because a bigger glyph at the SAME absolute weight reads
+ * thinner, and at a 12:1 size-to-stroke ratio, which is where a line-icon
+ * family sits before it turns into a logo. Judged against the screenshot, not
+ * against the arithmetic.
+ *
+ * `weight` is the one exception, for the two DRAG glyphs: they are the same
+ * triangle told apart by nothing but solid ink against dotted, and a dotted
+ * stroke reads lighter than a solid one of the same width, so both had to go up
+ * for the dotted one to survive at all.
  */
 function Glyph({
   children,
   filled,
+  weight = 1.5,
 }: {
   children: React.ReactNode;
   /** Some glyphs are solid shapes; those set their own `fill` and clear stroke. */
   filled?: boolean;
+  /** Grid units. Only DRAG departs from the family's 1.5. */
+  weight?: number;
 }) {
   return (
     <svg
@@ -491,7 +510,7 @@ function Glyph({
       focusable="false"
       fill={filled ? "currentColor" : "none"}
       stroke={filled ? "none" : "currentColor"}
-      strokeWidth={1.6}
+      strokeWidth={weight}
       strokeLinecap="round"
       strokeLinejoin="round"
     >
@@ -503,10 +522,19 @@ function Glyph({
 /**
  * The three brushes.
  *
- * The triangle is the figure's own atom, so PAINT is a filled one; ERASE is the
- * same triangle drawn as an outline that is no longer there, struck through;
- * ADJUST is a disc half-turned, which is what an adjustment does to a colour
- * that is already down — it does not add and it does not remove.
+ * The triangle is the figure's own atom, so PAINT is a filled one; ADJUST is a
+ * disc half-turned, which is what an adjustment does to a colour that is
+ * already down — it does not add and it does not remove.
+ *
+ * ERASE is an ERASER, and it took a review to get there. It was a dashed
+ * triangle struck through, which is a picture of "no triangle" — the negation
+ * of the paint glyph rather than the tool that performs it, and next to a
+ * filled triangle and a half disc it read as a third statement about triangles.
+ * A block eraser is the thing itself: an oblong tilted on the diagonal the rest
+ * of the family already leans on, its nib filled because a used rubber is
+ * darker than its holder and because fill is a word this family already speaks
+ * (PAINT is filled, ADJUST is half filled), resting on the line it is clearing.
+ * Nothing here is a metaphor for erasing; it is a drawing of an eraser.
  */
 function ToolGlyph({ tool }: { tool: Tool }) {
   if (tool === "paint") {
@@ -519,8 +547,10 @@ function ToolGlyph({ tool }: { tool: Tool }) {
   if (tool === "erase") {
     return (
       <Glyph>
-        <polygon points="8,2.5 14.5,13.5 1.5,13.5" strokeDasharray="3 2.4" />
-        <line x1={3.2} y1={12.8} x2={12.8} y2={3.2} />
+        <polygon points="3.29,9.49 5.55,7.23 8.87,10.56 6.61,12.82" fill="currentColor" stroke="none" />
+        <polygon points="9.79,2.99 13.12,6.31 6.61,12.82 3.29,9.49" />
+        <line x1={5.55} y1={7.23} x2={8.87} y2={10.56} />
+        <line x1={2.6} y1={14.1} x2={13.4} y2={14.1} />
       </Glyph>
     );
   }
@@ -567,23 +597,28 @@ function ShapeGlyph({ shape }: { shape: ShapeTool }) {
 }
 
 /**
- * What a DRAG does, as the reviewer asked for it: one solid stroke, one dotted.
+ * What a DRAG does: one solid stroke, one dotted — and both of them the
+ * TRIANGLE, as the second review asked.
  *
  * The geometry is identical and only the ink differs, which is the whole of the
- * distinction — PROPOSE draws the same cells PAINT would, and holds them as a
- * ghost until they are tapped. Drawn on the diagonal so it reads as a gesture
- * rather than as a minus sign, and dotted with round caps so the dots are dots.
+ * distinction: PROPOSE lays the same cells PAINT would and holds them as a
+ * ghost until they are tapped. It was a bare diagonal, and a bare diagonal is a
+ * mark rather than a thing — the triangle is the figure's own atom, the same
+ * outline PAINT fills in, so a dotted one says "these cells, not yet" in the
+ * page's own vocabulary instead of in a private one.
+ *
+ * 1.9 against the family's 1.5. Round caps and a period the 36.28-unit
+ * perimeter divides into almost exactly fourteen, so the dots are dots, the
+ * seam where the pattern closes does not land as a gap at a corner, and there
+ * are enough of them that the eye joins them into a triangle rather than
+ * reading a scatter. Eleven dots was the first try and it read as confetti.
  */
 function DragGlyph({ mode }: { mode: DragMode }) {
   return (
-    <Glyph>
-      <line
-        x1={3}
-        y1={12.4}
-        x2={13}
-        y2={3.6}
-        strokeWidth={1.8}
-        strokeDasharray={mode === "propose" ? "0.1 3.2" : undefined}
+    <Glyph weight={1.9}>
+      <polygon
+        points="8,3 14.2,13.2 1.8,13.2"
+        strokeDasharray={mode === "propose" ? "0.1 2.49" : undefined}
       />
     </Glyph>
   );
@@ -671,6 +706,21 @@ function MenuCaret() {
       <polyline points="3.5,6 8,10.5 12.5,6" />
     </svg>
   );
+}
+
+/**
+ * A key, drawn as a key.
+ *
+ * ONE chip, used in both places the program prints a chord: the lines under the
+ * plate and the `?` panel's key column. The panel used to print its chords as
+ * bare letter-spaced text and the footnote used `<b>`, which is two dialects for
+ * one idea and neither of them a keycap — a reader scanning for "which key" had
+ * to read the sentence to find out. A `<kbd>` with a doubled bottom border is
+ * the whole trick: it reads as a thing that can be pressed at a glance, and it
+ * is the SAME chip in both, so the panel and the footnote cannot drift apart.
+ */
+function Kbd({ children }: { children: React.ReactNode }) {
+  return <kbd className={styles.kbd}>{children}</kbd>;
 }
 
 /**
@@ -4075,41 +4125,23 @@ export default function DrawPage() {
         >
           <div className={styles.plate}>
             <div className={styles.plateRule} data-tool={tool}>
-              {/* The status line and the frame it is a status OF. The readout
-                  wraps inside this row; ZOOM is pinned to the far end of it and
-                  does not, so the one control on this line stays where it was
-                  put however long the sentence to its left runs. */}
-              <div className={styles.statusRow}>
-              <span className={styles.readout}>
-                {/* The tool leads the status line, in its own colour. A brush
-                    that destroys or transforms must never be a state the reader
-                    has to infer from a control they are not looking at. */}
-                <span className={styles.toolStatus}>{tool}</span>
-                <span>
-                  {viewMode === "sector" ? `sector ${sector}` : "hexagon"} · d
-                  {depth} · <b>{total} cells</b>
-                  {viewMode === "sector" && <> of {modelTotal}</>}
-                </span>
-                <span>
-                  brush <b>{mode}-fold</b>
-                  {band !== null && (
-                    <>
-                      {" "}
-                      · band <b>{band}</b>
-                    </>
-                  )}{" "}
-                  ·{" "}
-                  {reach === null ? (
-                    <b>{dragMode === "propose" ? "drag to propose" : "hover to preview"}</b>
-                  ) : (
-                    <b>reach {reach}</b>
-                  )}
-                </span>
-                <span>
-                  {schemeName} · <b>{paint.size} painted</b>
-                </span>
-              </span>
-              </div>
+              {/* THE STATUS LINE IS NOT HERE ANY MORE.
+                  It was the top row of this rule, above the icons, and a second
+                  review moved it below the canvas to sit beside the symmetry
+                  legend — see `.baseline`. Two bands of small caps saying what
+                  is true of the drawing, one above the artwork and one below it,
+                  were one band's worth of fact split by the artwork itself; the
+                  rule keeps the CONTROLS and the strip under the plate keeps the
+                  READINGS. What that buys is measured: the plate rule lost a
+                  22px row and a 10px gap, which is most of what the deck's
+                  bigger icons cost, so the canvas came out ahead.
+
+                  The tool chip went with it — and then went entirely. It was
+                  `PAINT` in a bordered box, restating the pressed button three
+                  centimetres to its right for the harmless default; for the two
+                  tools where the state actually matters the page already floats
+                  a loud chip in that tool's hue ON THE ARTWORK, which is where a
+                  warning about a destructive brush belongs. */}
 
               {/* The control deck: TWO ROWS, and every row is read the same way
                   — what the hand is holding on the left, what has been done to
@@ -4289,23 +4321,18 @@ export default function DrawPage() {
                   </span>
                 </div>
 
-                {/* MEMORY: two columns of two, and the column is the
-                    distinction. On the left, the two that CHANGE the drawing;
-                    on the right, the two that only look at it. They are one
-                    faculty — what this drawing has been — so they are one
-                    block, and the reviewer's `undo` over `redo` is the left
-                    half of it verbatim. */}
+                {/* MEMORY, now one column of two: the two controls that only
+                    LOOK at the drawing.
+
+                    It was two columns of four — what changes the drawing beside
+                    what only watches it. UNDO and REDO have left the deck for
+                    the canvas itself (see `.canvasHud`), because they are the
+                    two buttons in this program that get pressed mid-gesture and
+                    the deck is the far end of a pointer's journey from the
+                    artwork. What is left is the pair that opens a preview, and
+                    a preview is a thing you go and get rather than something you
+                    reach for without looking. */}
                 <div className={styles.deckMemory} role="group" aria-label="memory">
-                  <button
-                    type="button"
-                    className={styles.iconBtn}
-                    onClick={doUndo}
-                    disabled={history.past.length === 0 || previewing}
-                    title="undo the last gesture (⌘Z)"
-                    aria-label="undo the last gesture"
-                  >
-                    <ActionGlyph name="undo" />
-                  </button>
                   <button
                     type="button"
                     className={`${styles.iconBtn} ${
@@ -4324,16 +4351,6 @@ export default function DrawPage() {
                     } — a preview; nothing is changed`}
                   >
                     <ActionGlyph name="replay" />
-                  </button>
-                  <button
-                    type="button"
-                    className={styles.iconBtn}
-                    onClick={doRedo}
-                    disabled={history.future.length === 0 || previewing}
-                    title="redo the last undone gesture (⌘⇧Z)"
-                    aria-label="redo the last undone gesture"
-                  >
-                    <ActionGlyph name="redo" />
                   </button>
                   <button
                     type="button"
@@ -4838,20 +4855,63 @@ export default function DrawPage() {
                 onShapeEnd={previewing ? NOTHING : commitShape}
                 onPan={onPan}
               />
-              {/* One flag, and the preview outranks the tool: while a preview
-                  stands the brush is switched off, so naming it would be
-                  telling the reader about a control that is not connected. */}
-              {rewind !== null ? (
-                <span className={styles.previewFlag} aria-hidden="true">
-                  {rewind.kind} · {rewind.index}/{steps}
-                </span>
-              ) : (
-                tool !== "paint" && (
-                  <span className={styles.modeFlag} data-tool={tool} aria-hidden="true">
-                    {tool}
+              {/* The canvas HUD: UNDO, REDO, and the flag that says what the
+                  brush is — top left, ON the artwork, in one row.
+
+                  WHY HERE. Undo is the control a drawing program's hand reaches
+                  for most and never looks at, and it was 700px away at the far
+                  end of a deck above the plate. On the canvas it is where the
+                  pointer already is.
+
+                  WHY IT DOES NOT EAT THE DRAWING. The row is `pointer-events:
+                  none` and only the two buttons take them back, so the strip
+                  between and around them is transparent to the brush. And while
+                  a press is live on the canvas the buttons drop out too — the
+                  stylesheet turns the whole HUD inert on `:has(.canvas:active)`
+                  — so a stroke dragged straight across undo keeps painting the
+                  cells underneath instead of skipping them. That mattered
+                  because the board releases pointer capture on press, so it only
+                  sees moves over its own element.
+
+                  The flag rides in the same row rather than under the buttons:
+                  it is the same kind of statement, it was already at this
+                  corner, and one 30px band of furniture is cheaper than two.
+                  The preview flag outranks the tool flag, because while a
+                  preview stands the brush is switched off and naming it would
+                  describe a control that is not connected. */}
+              <div className={styles.canvasHud}>
+                <button
+                  type="button"
+                  className={`${styles.iconBtn} ${styles.hudBtn}`}
+                  onClick={doUndo}
+                  disabled={history.past.length === 0 || previewing}
+                  title="undo the last gesture (⌘Z)"
+                  aria-label="undo the last gesture"
+                >
+                  <ActionGlyph name="undo" />
+                </button>
+                <button
+                  type="button"
+                  className={`${styles.iconBtn} ${styles.hudBtn}`}
+                  onClick={doRedo}
+                  disabled={history.future.length === 0 || previewing}
+                  title="redo the last undone gesture (⌘⇧Z)"
+                  aria-label="redo the last undone gesture"
+                >
+                  <ActionGlyph name="redo" />
+                </button>
+                {rewind !== null ? (
+                  <span className={styles.previewFlag} aria-hidden="true">
+                    {rewind.kind} · {rewind.index}/{steps}
                   </span>
-                )
-              )}
+                ) : (
+                  tool !== "paint" && (
+                    <span className={styles.modeFlag} data-tool={tool} aria-hidden="true">
+                      {tool}
+                    </span>
+                  )
+                )}
+              </div>
               {/* Commit rides ON the plate, opposite the tool flag.
                   It used to sit in the tool strip, and from there it was a
                   control that ARRIVED: a standing candidate pushed the strip to
@@ -4907,7 +4967,50 @@ export default function DrawPage() {
               )}
             </div>
 
-            <div className={styles.legend}>
+            {/* THE BASELINE: what is true of the drawing, and what is true of
+                its symmetry, side by side under the artwork.
+
+                The status used to be the top row of the plate rule and the
+                legend the strip under the canvas, and the reviewer's note was
+                simply that they are the same kind of sentence and were being
+                read in two different places. They are one band now — one row on
+                a desktop, two on a phone.
+
+                One ROW is not one LINE, and the difference is measured: at
+                1512 the plate is 766px wide and these two readings come to
+                about 1330px of small caps between them. The legend alone
+                already wrapped to two lines there. So the band is two COLUMNS
+                that each wrap inside their own, divided by a hairline —
+                genuinely beside each other, which is what was asked, without
+                ellipsising a fact to prove it. */}
+            <div className={styles.baseline}>
+              <div className={styles.readout}>
+                <span>
+                  {viewMode === "sector" ? `sector ${sector}` : "hexagon"} · d
+                  {depth} · <b>{total} cells</b>
+                  {viewMode === "sector" && <> of {modelTotal}</>}
+                </span>
+                <span>
+                  brush <b>{mode}-fold</b>
+                  {band !== null && (
+                    <>
+                      {" "}
+                      · band <b>{band}</b>
+                    </>
+                  )}{" "}
+                  ·{" "}
+                  {reach === null ? (
+                    <b>{dragMode === "propose" ? "drag to propose" : "hover to preview"}</b>
+                  ) : (
+                    <b>reach {reach}</b>
+                  )}
+                </span>
+                <span>
+                  {schemeName} · <b>{paint.size} painted</b>
+                </span>
+              </div>
+
+              <div className={styles.legend}>
               {legend.length === 0 ? (
                 <span className={styles.legendItem}>
                   trivial subgroup · no axis, no rotation
@@ -4935,26 +5038,93 @@ export default function DrawPage() {
                   </span>
                 ))
               )}
+              </div>
             </div>
           </div>
 
-          <p className={styles.keys}>
-            <b>Q W E / A D / Z X C</b> walk the cursor on the exact lattice — the
-            six ring keys are the six same-orientation steps, at 0°, 60°, 120°,
-            180°, 240° and 300°, and <b>W</b> / <b>X</b> cross the radial axis.{" "}
-            <b>V</b> flips the frame and <b>,</b> / <b>.</b> step the sector —
-            neither clears anything. Press <b>?</b> for every shortcut.{" "}
+          {/* The keyboard contract, as LINES.
+              It was one paragraph of four sentences with the key names bolded
+              inside the prose, and the reviewer's complaint was that it had to
+              be read rather than scanned: the letters that matter were the same
+              size, the same font and nearly the same colour as the sentence
+              carrying them. One idea per row now, every key a `<kbd>` chip — the
+              same chip the `?` panel prints its chords in — and the chips are
+              the column the eye lands in. Every fact from the paragraph is still
+              here, in the same order; only the shape changed. */}
+          <ul className={styles.keyLines}>
+            {/* Two rows run the FULL width rather than sharing the two-column
+                grid: the eight lattice keys and the drag sentence are the only
+                two entries whose chips are wider than a column's chip gutter,
+                and squeezed into one they pushed their own prose into a 150px
+                ravine five lines deep. */}
+            <li data-span="1">
+              <span className={styles.keyChips}>
+                <Kbd>Q</Kbd>
+                <Kbd>W</Kbd>
+                <Kbd>E</Kbd>
+                <Kbd>A</Kbd>
+                <Kbd>D</Kbd>
+                <Kbd>Z</Kbd>
+                <Kbd>X</Kbd>
+                <Kbd>C</Kbd>
+              </span>
+              <span>
+                walk the cursor on the exact lattice — the six ring keys are the
+                six same-orientation steps, at 0°, 60°, 120°, 180°, 240° and
+                300°
+              </span>
+            </li>
+            <li>
+              <span className={styles.keyChips}>
+                <Kbd>W</Kbd>
+                <Kbd>X</Kbd>
+              </span>
+              <span>cross the radial axis — outward, and inward</span>
+            </li>
+            <li>
+              <span className={styles.keyChips}>
+                <Kbd>V</Kbd>
+              </span>
+              <span>flips the frame — the whole plate, or one sector; nothing is cleared</span>
+            </li>
+            <li>
+              <span className={styles.keyChips}>
+                <Kbd>,</Kbd>
+                <Kbd>.</Kbd>
+              </span>
+              <span>step the framed sector round the plate; nothing is cleared</span>
+            </li>
+            <li>
+              <span className={styles.keyChips}>
+                <Kbd>?</Kbd>
+              </span>
+              <span>every shortcut</span>
+            </li>
             {dragMode === "propose" ? (
-              <>
-                Drag moves a candidate; <b>tap it</b> or press <b>Enter</b> to
-                commit it, <b>Esc</b> to drop it.
-              </>
+              <li data-span="1">
+                <span className={styles.keyChips}>
+                  <Kbd>drag</Kbd>
+                  <Kbd>tap</Kbd>
+                  <Kbd>Enter</Kbd>
+                  <Kbd>Esc</Kbd>
+                </span>
+                <span>
+                  drag moves a candidate; tap it or press Enter to commit it, Esc
+                  to drop it
+                </span>
+              </li>
             ) : (
-              <>
-                Drag paints continuously; <b>Enter</b> paints at the cursor.
-              </>
+              <li data-span="1">
+                <span className={styles.keyChips}>
+                  <Kbd>drag</Kbd>
+                  <Kbd>Enter</Kbd>
+                </span>
+                <span>
+                  drag paints continuously; Enter paints at the cursor
+                </span>
+              </li>
             )}
-          </p>
+          </ul>
 
           <p className={styles.foot}>
             Orbits are computed in <code>src/lib/orbit.ts</code> by exact integer
@@ -5025,7 +5195,15 @@ export default function DrawPage() {
                   <dl className={styles.helpList}>
                     {group.rows.map((row) => (
                       <div key={row.chord} className={styles.helpRow}>
-                        <dt className={styles.helpKeys}>{row.keys}</dt>
+                        {/* One chip per ROW rather than per letter: several of
+                            these chords are alternatives (`⌘Z / Ctrl Z`) or
+                            ranges (`Shift 1 … 7`), and splitting those into
+                            separate caps would print keys that are not pressed
+                            together as though they were. The chip is the same
+                            one the lines under the plate use. */}
+                        <dt className={styles.helpKeys}>
+                          <Kbd>{row.keys}</Kbd>
+                        </dt>
                         <dd className={styles.helpWhat}>{row.what}</dd>
                       </div>
                     ))}
