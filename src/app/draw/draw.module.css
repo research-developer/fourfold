@@ -289,6 +289,21 @@
   font-weight: 600;
 }
 
+/**
+ * The focus ring, INSIDE the segment.
+ *
+ * A segmented control is one bordered unit with `overflow: hidden`, which is
+ * what makes its seams meet — and it was silently eating the outside two
+ * pixels of every focus ring on every button in it. Unnoticeable while the
+ * buttons were wide words; obvious the moment they became 25px squares, where
+ * two clipped edges out of four is most of the ring. Drawn inset it is whole,
+ * on every side, in both the light-on-dark and dark-on-light states.
+ */
+.segBtn:focus-visible,
+.zoomStepper button:focus-visible {
+  outline-offset: -2px;
+}
+
 .depthRow {
   margin-top: 8px;
 }
@@ -804,18 +819,28 @@
  * now rides INSIDE that rule and the row it needed was already being paid for.
  * The canvas got the 73px.
  */
-.bench {
+/**
+ * The deck: ONE band, TWO rows, and every control on it is one row tall.
+ *
+ * `--deck-row` is the whole geometry. Every button in the deck — segmented or
+ * not, icon or word — is exactly this tall, so the two rows read as rows
+ * across five groups that are otherwise built out of different boxes. Change
+ * it here and the deck stays aligned; there is no second number to keep in
+ * step.
+ *
+ * `align-items: center` rather than `stretch`, because the segmented controls
+ * are one bordered unit of two 1fr rows (total 2r + 1px of shared border) while
+ * the free-standing icon buttons are two boxes with a gap between them (2r +
+ * 3px). Those cannot be made equal without giving one of them a border it does
+ * not want, and centred the 2px difference is invisible.
+ */
+.deck {
+  --deck-row: 25px;
   display: flex;
   flex-wrap: wrap;
-  align-items: flex-end;
-  gap: 10px 16px;
-  min-width: 0;
-}
-
-.benchGroup {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
+  align-items: center;
+  gap: 8px 14px;
+  flex: 1 1 100%;
   min-width: 0;
 }
 
@@ -824,6 +849,71 @@
   letter-spacing: 0.28em;
   text-transform: uppercase;
   color: var(--bone-faint);
+  white-space: nowrap;
+}
+
+/* DRAG: the key beside the control rather than above it, because a key on its
+   own line would have made this group three rows tall in a two-row band. */
+.deckDrag {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+/* TOOL over SHAPE: a two-row grid whose first column is the key. The keys are
+   what let the glyphs be glyphs — no group in this deck is unlabelled. */
+.deckRows {
+  display: grid;
+  grid-template-columns: auto minmax(0, auto);
+  align-items: center;
+  gap: 3px 7px;
+  min-width: 0;
+}
+
+/**
+ * Two rows of one, stacked into one bordered unit: the seams run across
+ * instead of down.
+ *
+ * The row arithmetic is the fiddly part, and it is the reason the deck reads as
+ * two rows rather than as five groups that nearly line up. A group of two
+ * FREE-STANDING buttons is `2r + 3` tall (the gap). This is ONE bordered unit
+ * holding both, so it is `2r + 1 + 2` — the shared seam and its own frame —
+ * which comes to the same `2r + 3`. The tool/shape pair is two SEPARATE units
+ * with a gap, `2(r' + 2) + 3`, so its inner rows have to be 2px shorter to land
+ * on the same total. Nothing here is a magic number; every one of them is that
+ * sum.
+ */
+.stackSeg {
+  grid-auto-flow: row;
+  grid-auto-columns: var(--deck-row);
+  grid-auto-rows: var(--deck-row);
+  width: max-content;
+}
+
+.stackSeg .segBtn {
+  border-right: 0;
+  border-bottom: 1px solid var(--rule-bright);
+}
+
+.stackSeg .segBtn:last-child {
+  border-bottom: 0;
+}
+
+/* An icon segment: square cells, less the 2px of frame that puts the unit back
+   on the deck's row height. */
+.iconSeg {
+  grid-auto-columns: var(--deck-row);
+  grid-auto-rows: calc(var(--deck-row) - 2px);
+  width: max-content;
+  max-width: 100%;
+}
+
+.iconSegBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
 }
 
 /* The adjustment grid, on its own strip under the rule. Present only while the
@@ -838,21 +928,23 @@
   border-bottom: 1px solid var(--rule);
 }
 
-.toolSeg,
-.dragSeg {
-  grid-auto-columns: auto;
-  width: max-content;
-  max-width: 100%;
+/**
+ * The icon, at ONE size everywhere.
+ *
+ * 13px on a 16-unit grid puts the family's 1.6-unit stroke at 1.3 device
+ * pixels, which is the weight the console's hairlines are already drawn at, so
+ * the glyphs sit ON the type rather than in front of it. `currentColor` in the
+ * markup means the pressed, hover, disabled and focus states the buttons
+ * already have are the glyph's states too, with no second set of rules.
+ */
+.icon {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  display: block;
 }
 
-.toolBtn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  padding: 7px 13px;
-}
-
+/* The transport's play/pause, which is not on the deck and keeps its own size. */
 .toolGlyph {
   width: 12px;
   height: 12px;
@@ -860,11 +952,187 @@
 }
 
 /* The active tool is the loudest thing in the strip, and it changes colour with
-   the tool — so "which brush am I holding" is answered by hue, by glyph and by
-   the word, and no one of the three has to carry it alone. */
+   the tool — so "which brush am I holding" is answered by hue and by glyph, and
+   the same hue is on the word in the status line a few pixels above, so neither
+   has to carry it alone. */
 .toolSeg .segBtn[aria-pressed="true"] {
   background: var(--tool-accent);
   color: var(--ink);
+}
+
+/* ---------- the right-hand end of the deck ---------- */
+
+/**
+ * A free-standing icon button, on the deck's row height and square.
+ *
+ * Square rather than the old 9px-text pill: the glyph is the whole of the
+ * label, so padding around it is the only thing left to size, and a run of
+ * squares is what makes a 2×2 read as a 2×2.
+ */
+.iconBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  width: var(--deck-row);
+  height: var(--deck-row);
+  padding: 0;
+  border-radius: 2px;
+}
+
+/**
+ * MEMORY, as two columns of two.
+ *
+ * Reading DOWN a column: undo/redo, then replay/history. Reading ACROSS a row:
+ * what changes the drawing, then what only looks at it. The reviewer asked for
+ * undo over redo on the right, and that is the left column of this verbatim;
+ * the second column is where REPLAY and HISTORY landed, because they are the
+ * same faculty — the drawing's memory — and the only two controls in the deck
+ * that change nothing at all.
+ */
+.deckMemory {
+  display: grid;
+  grid-template-columns: repeat(2, auto);
+  gap: 3px;
+}
+
+/* FILE: out, then in. Two rows of one — and one WIDTH, taken from whichever of
+   the two is wider, which is SAVE because it carries the caret its menu owes
+   the reader. Two file buttons of different widths read as two unrelated
+   controls that happen to be stacked. */
+.deckFile {
+  display: grid;
+  grid-auto-rows: auto;
+  gap: 3px;
+}
+
+.deckFile .iconBtn {
+  width: 100%;
+  min-width: var(--deck-row);
+}
+
+/**
+ * The two that are not about this drawing.
+ *
+ * Detached, as asked: its own hairline and a wider gap before it, so the
+ * control that empties the plate is never adjacent to the one that saves it.
+ * `?` is a circle and sits on the top row — the top right of the deck — and NEW
+ * is under it.
+ */
+.deckMeta {
+  display: grid;
+  grid-auto-rows: auto;
+  gap: 3px;
+  justify-items: end;
+  padding-left: 12px;
+  margin-left: 2px;
+  border-left: 1px solid var(--rule);
+}
+
+/* The one round thing on the page. A question is not an action, and the shape
+   says so before the glyph does. */
+.helpBtn {
+  width: var(--deck-row);
+  height: var(--deck-row);
+  padding: 0;
+  border-radius: 50%;
+  font-size: 11px;
+  letter-spacing: 0;
+  line-height: 1;
+  color: var(--bone-dim);
+}
+
+.helpBtn:hover:not(:disabled) {
+  color: var(--bone);
+}
+
+/* ---------- the save menu ---------- */
+
+.saveWrap {
+  position: relative;
+}
+
+.saveBtn {
+  width: auto;
+  padding: 0 3px 0 4px;
+}
+
+.caret {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  opacity: 0.75;
+}
+
+.saveBtn[aria-expanded="true"] {
+  background: var(--bone);
+  border-color: var(--bone);
+  color: var(--ink);
+}
+
+/**
+ * The list. It opens DOWNWARD over the artwork rather than pushing the rule
+ * taller, because a menu that reflows the canvas the moment it opens moves the
+ * drawing under the hand that opened it.
+ */
+.menu {
+  position: absolute;
+  top: calc(100% + 5px);
+  right: 0;
+  z-index: 6;
+  display: flex;
+  flex-direction: column;
+  min-width: 168px;
+  max-width: min(220px, 70vw);
+  padding: 3px;
+  background: var(--plate-2);
+  border: 1px solid var(--rule-bright);
+  border-radius: 3px;
+  box-shadow: 0 18px 44px -14px rgba(0, 0, 0, 0.95);
+  animation: menu-in 120ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@keyframes menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-3px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.menuItem {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 2px;
+  text-align: left;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.menuItem:hover:not(:disabled),
+.menuItem:focus-visible {
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.menuKey {
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--bone);
+}
+
+.menuWhat {
+  font-size: 9.5px;
+  letter-spacing: 0.02em;
+  color: var(--bone-faint);
 }
 
 .adjustGrid {
@@ -1312,6 +1580,10 @@
 .newBtn {
   position: relative;
   overflow: hidden;
+  height: var(--deck-row);
+  padding: 0 9px;
+  font-size: 9px;
+  letter-spacing: 0.14em;
   border-color: rgba(240, 163, 163, 0.5);
   color: #f0a3a3;
 }
@@ -1359,14 +1631,66 @@
   }
 }
 
+/* ---------- zoom ---------- */
+
+/**
+ * ZOOM, in the status line and LABELLED.
+ *
+ * It shipped as `−  1×  +` in the action strip with no label, no glyph and no
+ * tooltip, and a reviewer read it as "I don't know what these do" — which was
+ * the honest reading, because nothing on screen said. The fix is the word. It
+ * wears the same micro-key the bench groups wear, so the function is legible
+ * standing still, at a glance, with no pointer anywhere near it.
+ *
+ * And it moved. Zoom does not touch the drawing: it is a fact about the frame
+ * you are looking at, which is what every other item on the status line is,
+ * while the strip it used to sit in is the things that CHANGE — save, load,
+ * wipe. One row of that misfiling was `1×` sitting between `history` and `svg`.
+ */
 .zoomGroup {
-  display: inline-flex;
-  gap: 2px;
+  display: grid;
+  grid-template-rows: var(--deck-row) var(--deck-row);
+  gap: 3px;
+  align-items: center;
+  justify-items: start;
 }
 
-.zoomGroup button {
+.zoomStepper {
+  display: inline-flex;
+  border: 1px solid var(--rule-bright);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.zoomStepper button {
+  border: 0;
+  border-right: 1px solid var(--rule-bright);
+  border-radius: 0;
+  padding: 0;
+  min-width: 22px;
+  height: calc(var(--deck-row) - 2px);
+  font-size: 10.5px;
+  letter-spacing: 0;
+  line-height: 1;
+  color: var(--bone-dim);
   font-variant-numeric: tabular-nums;
-  min-width: 26px;
+}
+
+.zoomStepper button:last-child {
+  border-right: 0;
+}
+
+/* The readout AND the reset, so the factor is always on screen and 1× is always
+   one click away. Disabled at 1×, which is exactly when there is nothing to
+   reset — and it still reads `1×`, so the group never goes blank. */
+.zoomStepper .zoomNow {
+  min-width: 27px;
+  color: var(--bone);
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.zoomStepper button:disabled {
+  opacity: 0.45;
 }
 
 /* ---------- the shortcut panel ---------- */
@@ -1488,6 +1812,53 @@
   color: var(--bone-faint);
 }
 
+/**
+ * The glyph legend.
+ *
+ * Every icon on the plate rule, printed beside what it does. A tooltip is not a
+ * label — it needs a pointer, a hover and a second of patience, and a
+ * touchscreen has none of the three — so the panel that already holds the
+ * keyboard contract holds the visual one too. Rendered from the same components
+ * the strip uses, so it cannot drift.
+ */
+.glyphSection {
+  margin-top: 15px;
+  padding-top: 12px;
+  border-top: 1px solid var(--rule);
+}
+
+.glyphList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 3px 22px;
+}
+
+.glyphRow {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 2px 0;
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--bone-dim);
+}
+
+.glyphCell {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  background: var(--plate-2);
+  color: var(--bone);
+}
+
 .helpFoot {
   margin: 16px 0 0;
   padding-top: 11px;
@@ -1557,8 +1928,15 @@
    * and stopped being a band of its own. 330 → 279 is exactly the 51px that
    * move gave back, measured at 1512×950: the canvas went 704×620 to 762×671
    * and the plate as a whole ended at the same height it did before.
+   *
+   * 279 → 244 is the same accounting done again. The rule went from eleven
+   * word-buttons and three captioned benches wrapping over two bands to one
+   * two-row deck of glyphs, and measured at the same 1512×950 that is 130px of
+   * plate rule down to 95. The 35px is the canvas's, by the same rule that gave
+   * it the 51: the plate is not allowed to keep height the controls stopped
+   * needing.
    */
-  --d-avail: calc(100dvh - 279px);
+  --d-avail: calc(100dvh - 244px);
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -1634,6 +2012,25 @@
   font-weight: 500;
 }
 
+/**
+ * The status line, and the one control that belongs on it.
+ *
+ * Two children and one rule between them: the readout may wrap to as many
+ * lines as the sentence needs, and ZOOM is pinned to the far end of the FIRST
+ * of them and never moves. That is the whole reason this row exists rather
+ * than the zoom group simply being another item in `.readout` — as one flex
+ * child among four it wrapped onto a line of its own the moment the sentence
+ * to its left grew, and cost the canvas a third row of the plate rule.
+ */
+.statusRow {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px 18px;
+  flex: 1 1 100%;
+  min-width: 0;
+}
+
 .readout {
   display: flex;
   flex-wrap: wrap;
@@ -1664,63 +2061,58 @@
   letter-spacing: 0.22em;
 }
 
-/* Actions live on the plate, not in the rail: they act on the artwork, and the
-   hand that just finished a stroke is already here. Pushed to the far end of
-   whichever line they land on, so `clear` is never adjacent to `paint`. */
-.tools {
-  display: flex;
-  gap: 5px;
-  flex: none;
+/* The deck takes the rest of the line, and its right-hand groups are pushed to
+   the far end of it — so the control that WIPES is never adjacent to the tool
+   the pointer is about to reach for. */
+.deckMemory {
   margin-left: auto;
 }
 
-.tools button {
-  font-size: 9px;
-  letter-spacing: 0.14em;
-  padding: 6px 10px;
-}
-
-/* Touch: the toolbar drops onto its own row anyway, so spend the space on
-   targets a thumb can actually hit. */
+/* Touch: the deck drops onto its own row anyway, so spend the space on targets
+   a thumb can actually hit. */
 @media (max-width: 700px) {
-  /* Ten controls do not fit one 390px row, and squeezing them clipped the last
-     one — measured: NEW lost its last two letters. So the row WRAPS, and the
-     zoom trio is kept together as one unit rather than being stretched like the
-     rest, because "−  1×  +" only reads as a control when the three are
-     adjacent. */
-  .tools {
+  /**
+   * A phone gets bigger rows and one wrap point, and the wrap point is chosen:
+   * the deck breaks between the DRAWING half and the DID half, because those
+   * are the two things a thumb reaches for in different moments. Everything
+   * that was a run of eleven word-buttons wrapping wherever it ran out of room
+   * is now five blocks that each hold together.
+   */
+  .deck {
+    --deck-row: 38px;
     width: 100%;
-    flex-wrap: wrap;
+    gap: 10px 12px;
   }
-  .tools > button {
-    flex: 1 1 60px;
-    padding: 11px 4px;
+  .deckRows {
+    flex: 1 1 190px;
+  }
+  .deckRows .seg {
+    width: 100%;
+  }
+  .iconSeg {
+    grid-auto-columns: minmax(var(--deck-row), 1fr);
+  }
+  /* The right-hand end starts a new line of its own and fills it, so MEMORY,
+     FILE and META are three blocks across one row rather than the tail of a
+     row that began with the brushes. */
+  .deckMemory {
+    margin-left: 0;
+  }
+  .deckMeta {
+    margin-left: auto;
+  }
+  .newBtn {
+    padding: 0 12px;
     font-size: 9.5px;
   }
-  .zoomGroup {
-    flex: 0 0 auto;
+  /* The zoom stepper is a thumb target too, and the three stay adjacent —
+     `−  1×  +` only reads as one control when they are. */
+  .zoomStepper button {
+    min-width: 40px;
+    font-size: 12px;
   }
-  .zoomGroup button {
-    padding: 11px 8px;
-    font-size: 9.5px;
-  }
-
-  /* Every bench group takes the full row and every target grows: a phone has
-     one column of room and a thumb, not a pointer. */
-  .bench,
-  .benchGroup {
-    flex: 1 1 100%;
-  }
-  .toolSeg,
-  .dragSeg {
-    width: 100%;
-    grid-auto-columns: 1fr;
-  }
-  .toolBtn {
-    padding: 10px 4px;
-  }
-  .dragSeg .segBtn {
-    padding: 10px 4px;
+  .zoomStepper .zoomNow {
+    min-width: 46px;
   }
   .adjustGrid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
