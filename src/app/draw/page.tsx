@@ -121,6 +121,15 @@ import {
 } from "@/lib/relief";
 import { PROGRESSION_NAMES, type ProgressionName } from "@/lib/progression";
 import {
+  animatedSvg,
+  animationCensus,
+  animationSteps,
+  everyState,
+  revertTo,
+  stateAt,
+  type AnimationStep,
+} from "@/lib/replay";
+import {
   SCHEMES,
   SCHEME_NAMES,
   swatchFromHex,
@@ -144,6 +153,7 @@ import {
   redo,
   undo,
   type History,
+  type StrokeMark,
 } from "@/lib/strokes";
 import BrushDial from "./BrushDial";
 import ColourWell from "./ColourWell";
@@ -309,6 +319,80 @@ const CONFIRM_MS = 4000;
 
 /** Zoom stops. Powers of two, so the plate lands on the same pixels each time. */
 const ZOOM_MAX = 8;
+
+/**
+ * How long a replay holds each gesture, in milliseconds.
+ *
+ * The range is set by the two things a replay is for. At the fast end it has to
+ * read as a DRAWING happening — 80 ms is about five gestures a second, which is
+ * roughly the rate a hand actually works at, and anything quicker stops being
+ * legible as separate strokes. At the slow end it has to be usable as a
+ * teaching pace: 1200 ms is long enough to say what a gesture did before the
+ * next one lands. 250 ms is the default because it replays a fifty-gesture
+ * drawing in twelve and a half seconds, which is long enough to follow and
+ * short enough to sit through twice.
+ *
+ * The SAME number is written into the exported animation, so the control is a
+ * preview of the file rather than a separate setting that happens to look like
+ * one.
+ */
+const STEP_MS: readonly number[] = [80, 150, 250, 400, 700, 1200] as const;
+const STEP_MS_DEFAULT = 250;
+
+/**
+ * How long the finished plate holds before the exported animation loops, and
+ * how long a gesture takes to come up.
+ *
+ * The hold is not decoration: without it the last stroke is on screen for one
+ * step and the loop reads as a flicker rather than as a drawing that was
+ * finished. The fade is short enough to read as a stroke LANDING rather than as
+ * a dissolve, and it is what stops a fast replay looking like a strobe.
+ */
+const HOLD_MS = 1800;
+const FADE_MS = 90;
+
+/** Past this many gestures the scrub ticks stop being a scale and become a fill. */
+const TICK_LIMIT = 64;
+
+/** The board's handlers, switched off while a preview is standing. */
+const NOTHING = () => {};
+
+function TransportGlyph({ playing }: { playing: boolean }) {
+  return (
+    <svg viewBox="0 0 16 16" className={styles.toolGlyph} aria-hidden="true">
+      {playing ? (
+        <>
+          <rect x={4} y={3} width={3.2} height={10} fill="currentColor" />
+          <rect x={8.8} y={3} width={3.2} height={10} fill="currentColor" />
+        </>
+      ) : (
+        <polygon points="4,3 13,8 4,13" fill="currentColor" />
+      )}
+    </svg>
+  );
+}
+
+/**
+ * A preview of a state the drawing is no longer in.
+ *
+ * REPLAY and HISTORY are ONE state and not two, which is the whole of how they
+ * are stopped from fighting: they are the same question — what did the plate
+ * look like after gesture n? — asked by a timer and asked by a hand. Opening
+ * one while the other stands simply changes `kind`, so there is no moment where
+ * two previews disagree about what is on the plate, and every guard in the page
+ * has one thing to test rather than two.
+ *
+ * `plate` is a reconstructed ADDRESS plate, held here rather than derived on
+ * every render: stepping it is O(one gesture), and rebuilding it from the base
+ * each render would be O(the whole history).
+ */
+interface Rewind {
+  kind: "replay" | "history";
+  /** Committed gestures applied. 0 is the state the history began from. */
+  index: number;
+  plate: AddressPlate;
+  playing: boolean;
+}
 
 /**
  * The seven schemes and the five brush slots, as the number row addresses them.
@@ -508,8 +592,18 @@ export default function DrawPage() {
    * second click lands on the same pixels as the first — which is the property
    * that makes it a guard and not a lottery.
    */
-  const [armed, setArmed] = useState<"new" | null>(null);
+  const [armed, setArmed] = useState<"new" | "revert" | null>(null);
   const disarmAt = useRef<number | null>(null);
+
+  /**
+   * The standing preview, or `null` when the plate on screen is the live one.
+   *
+   * See `Rewind`. Everything that WRITES is gated on this being null, so the
+   * non-destructiveness is one test in one place rather than a promise repeated
+   * at a dozen call sites.
+   */
+  const [rewind, setRewind] = useState<Rewind | null>(null);
+  const [stepMs, setStepMs] = useState(STEP_MS_DEFAULT);
 
   const [helpOpen, setHelpOpen] = useState(false);
   const helpClose = useRef<HTMLButtonElement>(null);
@@ -564,6 +658,15 @@ export default function DrawPage() {
    */
   const pendingEvents = useRef(0);
   const [liveEvents, setLiveEvents] = useState(0);
+  /**
+   * The symmetry groups the gesture in progress has applied, as addresses.
+   *
+   * A ref for the same reason `pending` is one: a drag applies the brush many
+   * times between two renders, and each application contributes its own orbit.
+   * Kept as ADDRESSES rather than indices so the record survives a depth change
+   * exactly as the plate does — see `StrokeMark`.
+   */
+  const pendingGroups = useRef<Address[][]>([]);
 
   const scheme = SCHEMES[schemeName];
   const adjust = ADJUSTMENTS[adjustName];
@@ -649,7 +752,32 @@ export default function DrawPage() {
    * so this costs one lookup on a re-render that changed neither.
    */
   const book = useMemo(() => addressBook(hex), [hex]);
-  const paint = useMemo(() => resolvePlate(plate, book), [plate, book]);
+  /**
+   * Standing at a state the drawing is no longer in.
+   *
+   * Derived rather than stored, so there is exactly one thing to test and no
+   * second flag that can be left set. Every write on the page is gated on it.
+   */
+  const previewing = rewind !== null;
+  /**
+   * The plate the board draws — the LIVE one, or the reconstructed one while a
+   * preview stands.
+   *
+   * The substitution happens here and nowhere else, which is what makes a
+   * preview cost one line: the ghost, the readouts, the relief and the board
+   * all read `paint`, and none of them has to learn that a preview exists. The
+   * live `plate` is untouched by this and by everything downstream of it —
+   * `resolvePlate` returns a cached map and mutates nothing — so closing a
+   * preview is dropping a reference rather than restoring a backup.
+   *
+   * A preview also survives a DEPTH change, for the same reason the drawing
+   * does: the reconstructed plate is an address plate, so it resolves onto
+   * whatever book is on screen.
+   */
+  const paint = useMemo(
+    () => resolvePlate(rewind === null ? plate : rewind.plate, book),
+    [plate, rewind, book]
+  );
 
   /**
    * The window the board draws, clamped so the figure never leaves the frame.
@@ -784,8 +912,17 @@ export default function DrawPage() {
    * across a depth-4 plate rather than once per pointer event — which is the
    * entire reason a 1536-cell display effect is affordable.
    */
+  /**
+   * Frozen at the RESTING ring while a preview stands.
+   *
+   * The template ring follows the pointer, and a preview is a picture of a
+   * state rather than a brush being aimed — a plate that heaved under the mouse
+   * while it was replaying would be reporting a brush nobody is holding. The
+   * resting ring is also the one the export bakes, so the preview and the file
+   * agree about the shape of the plate.
+   */
   const ring =
-    seedCell === null
+    seedCell === null || previewing
       ? restShell(reliefSurface)
       : templateShell(reliefSurface, seedCell);
 
@@ -1056,6 +1193,9 @@ export default function DrawPage() {
     plateRef.current = next;
     pending.current = [];
     pendingEvents.current = 0;
+    pendingGroups.current = [];
+    // A preview is a window onto a history that is about to stop existing.
+    setRewind(null);
     setLiveEvents(0);
     setPlate(plateRef.current);
     setHistory(EMPTY_HISTORY);
@@ -1084,7 +1224,7 @@ export default function DrawPage() {
    * rest of the session. Escape and a blur disarm it too, so the three ways a
    * person abandons an action all work.
    */
-  const arm = useCallback((what: "new", said: string) => {
+  const arm = useCallback((what: "new" | "revert", said: string) => {
     if (disarmAt.current !== null) window.clearTimeout(disarmAt.current);
     setArmed(what);
     disarmAt.current = window.setTimeout(() => {
@@ -1093,7 +1233,7 @@ export default function DrawPage() {
       // The timeout SAYS so. A live region still reading "armed" after the
       // button had quietly gone back to normal was the one state in this guard
       // where the screen and the announcement disagreed.
-      setAnnounce("the confirm expired — nothing was cleared");
+      setAnnounce("the confirm expired — nothing was changed");
     }, CONFIRM_MS);
     setAnnounce(said);
   }, []);
@@ -1127,6 +1267,7 @@ export default function DrawPage() {
    * could tell apart from the other.
    */
   const doNew = () => {
+    if (previewing) return;
     if (armed !== "new") {
       arm(
         "new",
@@ -1316,6 +1457,9 @@ export default function DrawPage() {
 
   const paintAt = useCallback(
     (i: number) => {
+      // A preview is not a canvas. Gated here as well as at the board's
+      // handlers, because the keyboard reaches this function by three routes.
+      if (previewing) return;
       const stamp = clipStamp(
         brushStamp(canvas.surface, canvas.bands, i, shape),
         keepCell
@@ -1345,19 +1489,42 @@ export default function DrawPage() {
         pendingEvents.current += 1;
         setLiveEvents(pendingEvents.current);
       }
+      // The symmetry this application used, recorded before the indices are
+      // forgotten. `groups` is null for a plain orbit — where there is no
+      // grouping, not a grouping of one — so the orbit itself is the group,
+      // which is exactly the shape the animated export wants.
+      for (const g of stamp.groups ?? [stamp.cells]) {
+        if (g.length === 0) continue;
+        pendingGroups.current.push(g.map((c) => book.addr[c]));
+      }
       plateRef.current = applyPlateEdits(plateRef.current, edits, "do");
       pending.current = mergeEdits(pending.current, edits);
       setPlate(plateRef.current);
     },
-    [canvas, book, keepCell, shape, tool, scheme, adjust, prog, base, events, progOrigin]
+    [
+      previewing,
+      canvas,
+      book,
+      keepCell,
+      shape,
+      tool,
+      scheme,
+      adjust,
+      prog,
+      base,
+      events,
+      progOrigin,
+    ]
   );
 
   const endStroke = useCallback(
     (how: "stroke" | "commit" = "stroke") => {
       const edits = pending.current;
       const used = pendingEvents.current;
+      const groups = pendingGroups.current;
       pending.current = [];
       pendingEvents.current = 0;
+      pendingGroups.current = [];
       setLiveEvents(0);
       if (edits.length === 0) {
         // Not silence. A gesture that changed nothing is the most confusing
@@ -1370,7 +1537,9 @@ export default function DrawPage() {
         );
         return;
       }
-      setHistory((h) => commit(h, { edits }));
+      const mark: StrokeMark<Address> | undefined =
+        groups.length === 0 ? undefined : { mode, groups };
+      setHistory((h) => commit(h, mark === undefined ? { edits } : { edits, mark }));
       // Pushed together with the stroke and never apart from it: the two stacks
       // being the same height is what makes the progression index recoverable.
       setEvents((e) => pushEvents(e, used));
@@ -1399,6 +1568,10 @@ export default function DrawPage() {
   );
 
   const doUndo = useCallback(() => {
+    if (previewing) {
+      setAnnounce("a preview is standing — close it before undoing");
+      return;
+    }
     const step = undo(history);
     if (step.stroke === null) {
       setAnnounce("nothing to undo");
@@ -1407,9 +1580,13 @@ export default function DrawPage() {
     setHistory(step.history);
     setEvents(undoEvents(events));
     applyStroke(step.stroke.edits, "undo", `undid ${step.stroke.edits.length} cells`);
-  }, [history, events, applyStroke]);
+  }, [previewing, history, events, applyStroke]);
 
   const doRedo = useCallback(() => {
+    if (previewing) {
+      setAnnounce("a preview is standing — close it before redoing");
+      return;
+    }
     const step = redo(history);
     if (step.stroke === null) {
       setAnnounce("nothing to redo");
@@ -1418,7 +1595,198 @@ export default function DrawPage() {
     setHistory(step.history);
     setEvents(redoEvents(events));
     applyStroke(step.stroke.edits, "do", `redid ${step.stroke.edits.length} cells`);
-  }, [history, events, applyStroke]);
+  }, [previewing, history, events, applyStroke]);
+
+  // ── the past, previewed ─────────────────────────────────────────────────
+
+  /** How many gestures the history holds. The scrub's upper stop. */
+  const steps = history.past.length;
+
+  /**
+   * Open a preview, or move an open one to the other instrument.
+   *
+   * REPLAY opens at the BEGINNING and starts playing, because that is the whole
+   * of what it is for. HISTORY opens at the LIVE state, because a scrub that
+   * jumped the drawing somewhere the moment it was opened would be an edit
+   * disguised as a control.
+   *
+   * Everything that names a cell of the live plate is dropped on the way in: a
+   * standing candidate is a promise about a plate that is no longer on screen,
+   * and committing it would paint onto a state nobody is looking at.
+   */
+  const openRewind = useCallback(
+    (kind: "replay" | "history") => {
+      if (steps === 0) {
+        setAnnounce(
+          `nothing to ${kind === "replay" ? "replay" : "scrub"} — no gesture has been committed yet`
+        );
+        return;
+      }
+      disarm();
+      setShapeDrag(null);
+      setCandidate(null);
+      setHover(null);
+      const index = kind === "replay" ? 0 : steps;
+      setRewind({
+        kind,
+        index,
+        plate: stateAt(plateRef.current, history.past, steps, index),
+        playing: kind === "replay",
+      });
+      setAnnounce(
+        kind === "replay"
+          ? `replay — ${steps} gesture${steps === 1 ? "" : "s"} at ${stepMs} ms each; the plate is a preview and nothing is being changed`
+          : `history — ${steps} gesture${steps === 1 ? "" : "s"}; drag the scrub to preview an earlier state. Nothing is changed until REVERT`
+      );
+    },
+    [steps, history, disarm, stepMs]
+  );
+
+  const closeRewind = useCallback((why: string) => {
+    setRewind(null);
+    setAnnounce(why);
+  }, []);
+
+  /**
+   * Move the preview to state `to`.
+   *
+   * Stepped FROM WHERE IT STANDS rather than rebuilt from the base, so a
+   * play-step costs one gesture's edits and a scrub costs only the gestures it
+   * crosses. See `stateAt`.
+   */
+  const seekRewind = useCallback(
+    (to: number, say = true) => {
+      setRewind((r) => {
+        if (r === null) return r;
+        const n = Math.min(Math.max(0, Math.round(to)), steps);
+        if (n === r.index) return r;
+        return { ...r, index: n, plate: stateAt(r.plate, history.past, r.index, n) };
+      });
+      if (say) {
+        const n = Math.min(Math.max(0, Math.round(to)), steps);
+        setAnnounce(
+          n === steps
+            ? `state ${n} of ${steps} — the live drawing`
+            : `state ${n} of ${steps} — ${steps - n} gesture${
+                steps - n === 1 ? "" : "s"
+              } after this`
+        );
+      }
+    },
+    [steps, history]
+  );
+
+  const togglePlay = useCallback(() => {
+    setRewind((r) => {
+      if (r === null) return r;
+      // Playing from the end is a replay from the top, which is what the button
+      // plainly means at that point and what a second press of P should do.
+      if (!r.playing && r.index >= steps) {
+        return {
+          ...r,
+          index: 0,
+          plate: stateAt(r.plate, history.past, r.index, 0),
+          playing: true,
+        };
+      }
+      return { ...r, playing: !r.playing };
+    });
+  }, [steps, history]);
+
+  /**
+   * The clock.
+   *
+   * One `setTimeout` per step rather than one interval for the whole run: the
+   * step is a state change, so the effect re-runs anyway, and a timeout that is
+   * created and cleared per step cannot drift out of step with an index that
+   * was moved by hand — dragging the scrub mid-play simply continues from where
+   * it was dropped.
+   */
+  useEffect(() => {
+    // Nothing is set here synchronously. The clock only ever schedules, and the
+    // LAST step is the one that stops it — a replay that had to notice it had
+    // finished on a later render would be a second place the end is decided.
+    if (rewind === null || !rewind.playing || rewind.index >= steps) return;
+    const id = window.setTimeout(() => {
+      const n = Math.min(rewind.index + 1, steps);
+      setRewind({
+        ...rewind,
+        index: n,
+        plate: stateAt(rewind.plate, history.past, rewind.index, n),
+        playing: n < steps,
+      });
+      if (n >= steps) {
+        setAnnounce(
+          `replay finished — ${steps} gesture${
+            steps === 1 ? "" : "s"
+          } played back; the drawing is exactly as it was`
+        );
+      }
+    }, stepMs);
+    return () => window.clearTimeout(id);
+  }, [rewind, steps, history, stepMs]);
+
+  /**
+   * What reverting to the previewed state would cost, computed against the LIVE
+   * plate so the number in the button is the number the button will do.
+   */
+  const revert = useMemo(
+    () => (rewind === null ? null : revertTo(plate, history, rewind.index)),
+    [rewind, history, plate]
+  );
+
+  /**
+   * REVERT: one more gesture, not a truncation.
+   *
+   * The edits that take the live plate back to the previewed state are pushed
+   * as an ordinary undoable stroke, so NEW remains the only control on the page
+   * that destroys anything and ⌘Z puts every rolled-back gesture back at once.
+   * It spends ZERO colouring events, on the same rule an erase or a preset
+   * does: the progression's argument is a sum over the log, the log gains a
+   * rung, and undoing the revert pops it — nothing drifts.
+   *
+   * The one thing that IS lost is the redo branch, because pushing any gesture
+   * clears it. So the guard fires exactly when there is a redo branch to lose,
+   * and not otherwise: an armed button that appears when nothing is at stake is
+   * how people learn to click through guards.
+   */
+  const doRevert = () => {
+    if (rewind === null || revert === null) {
+      setAnnounce("the drawing already stands at that state — nothing to revert");
+      return;
+    }
+    if (revert.discardedRedo > 0 && armed !== "revert") {
+      arm(
+        "revert",
+        `REVERT is armed — click again to roll back ${revert.rolledBack} gesture${
+          revert.rolledBack === 1 ? "" : "s"
+        }, which also discards ${revert.discardedRedo} redo step${
+          revert.discardedRedo === 1 ? "" : "s"
+        } for good, or press Escape`
+      );
+      return;
+    }
+    disarm();
+    const at = rewind.index;
+    plateRef.current = applyPlateEdits(plateRef.current, revert.stroke.edits, "do");
+    setPlate(plateRef.current);
+    setHistory((h) => commit(h, revert.stroke));
+    setEvents((e) => pushEvents(e, 0));
+    setRewind(null);
+    setAnnounce(
+      `reverted to state ${at} — ${revert.rolledBack} gesture${
+        revert.rolledBack === 1 ? "" : "s"
+      } rolled back over ${revert.changed} cell${
+        revert.changed === 1 ? "" : "s"
+      } as ONE undoable step; ⌘Z brings them all back${
+        revert.discardedRedo === 0
+          ? ""
+          : `. ${revert.discardedRedo} redo step${
+              revert.discardedRedo === 1 ? "" : "s"
+            } discarded`
+      }`
+    );
+  };
 
   /**
    * Lay a whole plate down as ONE gesture.
@@ -1435,7 +1803,14 @@ export default function DrawPage() {
       colours: readonly (string | null)[],
       spent: number,
       said: (n: number) => string,
-      nothing: string
+      nothing: string,
+      /**
+       * The symmetry the gesture used, when it had one. A preset does not: it
+       * is a statement about the whole figure rather than an orbit, and saying
+       * otherwise would put a symmetry in the animated file that the gesture
+       * never claimed.
+       */
+      mark?: StrokeMark<Address>
     ) => {
       const edits = planPlateEdits(
         plateRef.current,
@@ -1449,7 +1824,7 @@ export default function DrawPage() {
       }
       plateRef.current = applyPlateEdits(plateRef.current, edits, "do");
       setPlate(plateRef.current);
-      setHistory((h) => commit(h, { edits }));
+      setHistory((h) => commit(h, mark === undefined ? { edits } : { edits, mark }));
       setEvents((e) => pushEvents(e, spent));
       setAnnounce(said(edits.length));
     },
@@ -1465,7 +1840,7 @@ export default function DrawPage() {
   const commitShape = useCallback(() => {
     const d = shapeDrag;
     setShapeDrag(null);
-    if (d === null) return;
+    if (d === null || previewing) return;
     const built = shapeStampFor(d.anchor, d.at, d.alt);
     if (built === null || built.stamp.cells.length === 0) {
       setAnnounce("nothing changed — the figure reached no cell the brush may touch");
@@ -1488,10 +1863,20 @@ export default function DrawPage() {
         `${built.said} — ${k} cell${k === 1 ? "" : "s"} ${verb} with the ${mode}-fold brush`,
       tool === "adjust"
         ? "nothing adjusted — the figure found no paint under it"
-        : "nothing changed"
+        : "nothing changed",
+      // A line is a source row and its images under the subgroup; a ring is one
+      // orbit-indexed set. Both arrive as a stamp, so both carry their grouping
+      // into the history with nothing here having to know which is which.
+      {
+        mode,
+        groups: (built.stamp.groups ?? [built.stamp.cells])
+          .filter((g) => g.length > 0)
+          .map((g) => g.map((c) => book.addr[c])),
+      }
     );
   }, [
     shapeDrag,
+    previewing,
     shapeStampFor,
     events,
     progOrigin,
@@ -1516,6 +1901,7 @@ export default function DrawPage() {
    */
   const applyPreset = useCallback(
     (name: PresetName) => {
+      if (previewing) return;
       // The whole plate, in every sector — a preset is a statement about the
       // FIGURE and the figure is the hexagon. Each sector receives the same
       // canonical colouring, so a framed sector then shows exactly the drawing
@@ -1533,27 +1919,28 @@ export default function DrawPage() {
         `${PRESETS[name].label} — the plate already shows it`
       );
     },
-    [hex, effectiveBase, layStroke]
+    [previewing, hex, effectiveBase, layStroke]
   );
 
   // ── propose and commit ──────────────────────────────────────────────────
 
   const propose = useCallback(
     (i: number) => {
+      if (previewing) return;
       noteSector(i);
       setCandidate(i);
       setCursor(i);
       setHover(null);
     },
-    [noteSector]
+    [previewing, noteSector]
   );
 
   const commitCandidate = useCallback(() => {
-    if (candidate === null) return;
+    if (candidate === null || previewing) return;
     paintAt(candidate);
     endStroke("commit");
     setCandidate(null);
-  }, [candidate, paintAt, endStroke]);
+  }, [candidate, previewing, paintAt, endStroke]);
 
   const dropCandidate = useCallback(() => {
     if (candidate === null) return;
@@ -1768,6 +2155,7 @@ export default function DrawPage() {
   );
 
   const onCursorPaint = useCallback(() => {
+    if (previewing) return;
     if (cursor === null) {
       const start = stepCursor(canvas.centroids, null, "up", canvas.inView);
       if (start < 0) return;
@@ -1796,6 +2184,7 @@ export default function DrawPage() {
     paintAt(cursor);
     endStroke();
   }, [
+    previewing,
     noteSector,
     cursor,
     canvas,
@@ -1892,8 +2281,14 @@ export default function DrawPage() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const el = document.activeElement;
+      // A RANGE is not a text field. It has to swallow the arrows and Home/End,
+      // which it does natively, but Escape has to keep closing the preview the
+      // slider belongs to — otherwise the one control most likely to have focus
+      // while a preview stands is the one place Escape stops working. So it is
+      // let through as far as Escape, ⌘Z and `?`, and stopped after them.
+      const onRange = el instanceof HTMLInputElement && el.type === "range";
       if (
-        el instanceof HTMLInputElement ||
+        (el instanceof HTMLInputElement && !onRange) ||
         el instanceof HTMLTextAreaElement ||
         (el instanceof HTMLElement && el.isContentEditable)
       ) {
@@ -1911,7 +2306,19 @@ export default function DrawPage() {
           return;
         }
         if (armed !== null) {
-          disarm("cancelled — nothing was cleared");
+          disarm("cancelled — nothing was changed");
+          return;
+        }
+        // Before the candidate and the anchored drag, and it cannot collide
+        // with either: both are dropped when a preview opens and neither can be
+        // started while one stands.
+        if (rewind !== null) {
+          closeRewind(
+            `${rewind.kind} closed — the drawing is exactly as it was, ${resolvePlate(
+              plateRef.current,
+              book
+            ).size} cells on the plate`
+          );
           return;
         }
         if (shapeDrag !== null) {
@@ -1947,6 +2354,9 @@ export default function DrawPage() {
         return;
       }
       if (helpOpen) return;
+      // Past here every key is a drawing key, and the scrub owns them all while
+      // it has focus.
+      if (onRange) return;
 
       if (e.key === " ") {
         e.preventDefault();
@@ -2042,6 +2452,20 @@ export default function DrawPage() {
         pickRelief(!reliefOn);
         return;
       }
+      // The two previews. P is the transport — open it, and then play/pause it
+      // — and M is the scrub. Opening either while the other stands moves the
+      // ONE preview across rather than raising a second one.
+      if (k === "p") {
+        if (rewind !== null && rewind.kind === "replay") togglePlay();
+        else openRewind("replay");
+        return;
+      }
+      if (k === "m") {
+        if (rewind !== null && rewind.kind === "history") {
+          closeRewind("history closed — the drawing is exactly as it was");
+        } else openRewind("history");
+        return;
+      }
       // The view, on the keys nearest the depth pair: V flips the frame, and
       // the two bracket-neighbours step the sector round the plate. Neither is
       // destructive, so neither asks.
@@ -2122,6 +2546,11 @@ export default function DrawPage() {
     openHelp,
     armed,
     disarm,
+    rewind,
+    openRewind,
+    closeRewind,
+    togglePlay,
+    book,
     shapeDrag,
     shapeTool,
     pickShapeTool,
@@ -2160,7 +2589,16 @@ export default function DrawPage() {
    * drawing, so paint → export → clear → load → re-export is byte-identical
    * instead of depending on where the mouse happened to be.
    */
-  const svgText = useCallback(() => {
+  /**
+   * The polygons a file is written from, and the wash over them.
+   *
+   * Lifted out of `svgText` VERBATIM so the animated export can be written from
+   * the same shapes: two exporters that each computed the relief bake would be
+   * two chances to curve the picture about a different centre, and the still and
+   * the animation would then disagree about where a cell is. Nothing here
+   * changed — the still writes exactly the bytes it always did.
+   */
+  const bakedFrame = useCallback(() => {
     const baked = reliefOn
       ? reliefFrame(reliefSurface, restShell(reliefSurface), reading)
       : null;
@@ -2183,6 +2621,11 @@ export default function DrawPage() {
             opacity: w.alpha,
             shapes: w.cells.filter(canvas.inView).map((i) => cells[i].verts),
           }));
+    return { baked, cells, overlay };
+  }, [canvas, reliefSurface, reliefOn, reading]);
+
+  const svgText = useCallback(() => {
+    const { baked, cells, overlay } = bakedFrame();
     return artworkSvg({
       width: canvas.geom.width,
       height: canvas.geom.height,
@@ -2226,6 +2669,7 @@ export default function DrawPage() {
       overlay,
     });
   }, [
+    bakedFrame,
     canvas,
     book,
     showTiling,
@@ -2235,8 +2679,6 @@ export default function DrawPage() {
     mode,
     schemeName,
     band,
-    reliefSurface,
-    reliefOn,
     reading,
   ]);
 
@@ -2245,9 +2687,9 @@ export default function DrawPage() {
    * it is and what every file this program has ever written called it.
    */
   const nameFor = useCallback(
-    (ext: "svg" | "png") =>
+    (ext: "svg" | "png", suffix = "") =>
       exportName({
-        kind: canvas.view.mode === "sector" ? "triangle" : "hexagon",
+        kind: (canvas.view.mode === "sector" ? "triangle" : "hexagon") + suffix,
         depth,
         mode,
         scheme: schemeName,
@@ -2274,6 +2716,117 @@ export default function DrawPage() {
     const name = nameFor("svg");
     download(new Blob([svgText()], { type: "image/svg+xml;charset=utf-8" }), name);
     setAnnounce(`exported ${name}`);
+  };
+
+  /**
+   * The replay, as a standalone looping SVG.
+   *
+   * A SEPARATE output. The still above is untouched by everything here — same
+   * function, same spec, same bytes — because an animation that quietly changed
+   * what SVG meant would have cost the one export people already rely on.
+   *
+   * `grouping` decides whether the per-step markup is written per ORBIT or per
+   * CELL. Both files work; the second exists so the saving the grouped form buys
+   * can be measured on the real drawing rather than argued about. See
+   * `replay.ts`, and `test/replay.test.ts`, which measures it.
+   */
+  const animationText = useCallback(
+    (grouping: "orbit" | "cell") => {
+      const past = history.past;
+      if (past.length === 0) return null;
+      const { baked, cells, overlay } = bakedFrame();
+      const shown = canvas.view.mode === "sector" ? canvas.shown : undefined;
+      // One forward walk of the whole history, resolved onto this depth. The
+      // preview steps one gesture at a time; a file needs all of them at once.
+      const states = everyState(plateRef.current, past).map((p) =>
+        resolvePlate(p, book)
+      );
+      const frames: AnimationStep[] = animationSteps(
+        states,
+        past,
+        book,
+        // An erase is drawn in the fill an unpainted cell wears, so a step can
+        // TAKE colour away without any element ever having to be removed.
+        showTiling ? TILE : PLATE_BG,
+        shown
+      );
+      if (frames.length === 0) return null;
+      return {
+        census: animationCensus(frames),
+        text: animatedSvg({
+          width: canvas.geom.width,
+          height: canvas.geom.height,
+          cells,
+          shown,
+          background: PLATE_BG,
+          unpainted: showTiling ? TILE : null,
+          tileSeam: SEAM,
+          paintSeam: PAINT_SEAM,
+          weldPaint: weld,
+          seamWidth: canvas.geom.seamWidth,
+          overlay,
+          title: `FOURFOLD replay — ${
+            canvas.view.mode === "sector"
+              ? `sector ${canvas.view.sector}`
+              : "hexagon"
+          }, depth ${depth}, ${frames.length} gesture${
+            frames.length === 1 ? "" : "s"
+          } at ${stepMs} ms`,
+          // The same payload the still carries, so a replay is also a drawing:
+          // dropping one back on the plate restores the finished plate exactly.
+          payload: payloadFromPaint(
+            "hexagon",
+            depth,
+            convention,
+            states[states.length - 1],
+            baked === null ? undefined : { on: true, reading },
+            plateEntries(plateRef.current, book),
+            canvas.view.mode === "sector"
+              ? { sector: canvas.view.sector }
+              : undefined
+          ),
+          ground: states[0],
+          steps: frames,
+          stepMs,
+          holdMs: HOLD_MS,
+          fadeMs: FADE_MS,
+          grouping,
+        }),
+      };
+    },
+    [
+      history,
+      bakedFrame,
+      canvas,
+      book,
+      showTiling,
+      weld,
+      depth,
+      convention,
+      reading,
+      stepMs,
+    ]
+  );
+
+  const exportAnimation = () => {
+    const built = animationText("orbit");
+    if (built === null) {
+      setAnnounce("nothing to animate — no committed gesture changed a cell in this frame");
+      return;
+    }
+    const name = nameFor("svg", "-replay");
+    const bytes = new Blob([built.text], {
+      type: "image/svg+xml;charset=utf-8",
+    });
+    download(bytes, name);
+    const { steps: n, groups, cells, orbitGroups } = built.census;
+    setAnnounce(
+      `exported ${name} — ${n} gesture${n === 1 ? "" : "s"}, ${groups} symmetry group${
+        groups === 1 ? "" : "s"
+      } (${orbitGroups} recorded orbits) over ${cells} cell${
+        cells === 1 ? "" : "s"
+      }, one CSS rule per gesture; ${Math.round(bytes.size / 1024)} kB`
+    );
   };
 
   const exportPng = () => {
@@ -2473,6 +3026,10 @@ export default function DrawPage() {
     e.preventDefault();
     dragDepth.current = 0;
     setDropping(false);
+    if (previewing) {
+      refuse("a preview is standing — close it before loading a drawing");
+      return;
+    }
     const file = e.dataTransfer.files?.[0];
     if (file === undefined) {
       refuse("nothing was dropped that this program could read");
@@ -3337,7 +3894,7 @@ export default function DrawPage() {
                 <button
                   type="button"
                   onClick={doUndo}
-                  disabled={history.past.length === 0}
+                  disabled={history.past.length === 0 || previewing}
                   aria-label="undo the last gesture"
                 >
                   undo
@@ -3345,10 +3902,45 @@ export default function DrawPage() {
                 <button
                   type="button"
                   onClick={doRedo}
-                  disabled={history.future.length === 0}
+                  disabled={history.future.length === 0 || previewing}
                   aria-label="redo the last undone gesture"
                 >
                   redo
+                </button>
+                {/* The two previews. They sit with undo and redo because they
+                    are the same faculty — the drawing's memory — and they are
+                    the only controls here that change nothing at all. */}
+                <button
+                  type="button"
+                  className={rewind?.kind === "replay" ? styles.rewindOn : undefined}
+                  onClick={() =>
+                    rewind?.kind === "replay"
+                      ? closeRewind("replay closed — the drawing is exactly as it was")
+                      : openRewind("replay")
+                  }
+                  disabled={steps === 0}
+                  aria-pressed={rewind?.kind === "replay"}
+                  aria-label={`replay the drawing, ${steps} gesture${
+                    steps === 1 ? "" : "s"
+                  } — a preview; nothing is changed`}
+                >
+                  replay
+                </button>
+                <button
+                  type="button"
+                  className={rewind?.kind === "history" ? styles.rewindOn : undefined}
+                  onClick={() =>
+                    rewind?.kind === "history"
+                      ? closeRewind("history closed — the drawing is exactly as it was")
+                      : openRewind("history")
+                  }
+                  disabled={steps === 0}
+                  aria-pressed={rewind?.kind === "history"}
+                  aria-label={`history — scrub the ${steps} earlier state${
+                    steps === 1 ? "" : "s"
+                  } of this drawing; a preview, nothing is changed`}
+                >
+                  history
                 </button>
                 {/* Zoom, so Space-to-pan has something to pan. Buttons rather
                     than keys alone: a modifier nobody can reach without a
@@ -3379,10 +3971,13 @@ export default function DrawPage() {
                     +
                   </button>
                 </span>
+                {/* Off while a preview stands: these write the LIVE plate, and
+                    a file that did not match the picture on screen would be the
+                    one export nobody could account for. */}
                 <button
                   type="button"
                   onClick={exportSvg}
-                  disabled={paint.size === 0}
+                  disabled={paint.size === 0 || previewing}
                   aria-label="export the artwork as SVG"
                 >
                   svg
@@ -3390,17 +3985,19 @@ export default function DrawPage() {
                 <button
                   type="button"
                   onClick={exportPng}
-                  disabled={paint.size === 0}
+                  disabled={paint.size === 0 || previewing}
                   aria-label="export the artwork as PNG"
                 >
                   png
                 </button>
-                {/* Never disabled: loading is the one action that is always
-                    available, including on an empty plate, which is the state
-                    a person who has just arrived with a file is in. */}
+                {/* Never disabled except under a preview: loading is otherwise
+                    the one action that is always available, including on an
+                    empty plate, which is the state a person who has just
+                    arrived with a file is in. */}
                 <button
                   type="button"
                   onClick={openPicker}
+                  disabled={previewing}
                   aria-label="load an SVG drawing back onto the plate — or drop one on the canvas"
                 >
                   load
@@ -3430,6 +4027,7 @@ export default function DrawPage() {
                     armed === "new" ? styles.armedBtn : ""
                   }`}
                   onClick={doNew}
+                  disabled={previewing}
                   onBlur={() => {
                     if (armed === "new") disarm();
                   }}
@@ -3490,6 +4088,237 @@ export default function DrawPage() {
               </div>
             )}
 
+            {/* The preview bench.
+                ONE scale, two instruments. REPLAY drives it with a transport
+                and HISTORY with a hand, and they share the scrub because they
+                are asking the same question of the same axis — which is also
+                why they cannot fight: there is one `rewind` and one index.
+                It rides on a strip of its own, like the adjustment grid, so it
+                costs canvas height only while a preview is actually standing. */}
+            {rewind !== null && (
+              <div className={styles.rewindBar} data-kind={rewind.kind}>
+                <div className={styles.rewindHead}>
+                  <span className={styles.rewindTag}>{rewind.kind}</span>
+                  <span className={styles.rewindCount}>
+                    <b>{rewind.index}</b>
+                    <span aria-hidden="true">/</span>
+                    {steps}
+                  </span>
+                  <span className={styles.rewindSaid}>
+                    {rewind.index === steps
+                      ? "the live drawing"
+                      : `${steps - rewind.index} gesture${
+                          steps - rewind.index === 1 ? "" : "s"
+                        } after this`}
+                  </span>
+                  <button
+                    type="button"
+                    className={styles.rewindClose}
+                    onClick={() =>
+                      closeRewind(
+                        `${rewind.kind} closed — the drawing is exactly as it was`
+                      )
+                    }
+                    aria-label="close the preview and return to the live drawing"
+                  >
+                    close
+                  </button>
+                </div>
+
+                <div className={styles.rewindRow}>
+                  {rewind.kind === "replay" && (
+                    <span
+                      className={styles.transport}
+                      role="group"
+                      aria-label="replay transport"
+                    >
+                      <button
+                        type="button"
+                        onClick={() => seekRewind(0)}
+                        disabled={rewind.index === 0}
+                        aria-label="back to the first state"
+                      >
+                        ⏮
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => seekRewind(rewind.index - 1)}
+                        disabled={rewind.index === 0}
+                        aria-label="one gesture back"
+                      >
+                        ‹
+                      </button>
+                      <button
+                        type="button"
+                        className={styles.playBtn}
+                        onClick={togglePlay}
+                        aria-pressed={rewind.playing}
+                        aria-label={rewind.playing ? "pause the replay" : "play the replay"}
+                      >
+                        <TransportGlyph playing={rewind.playing} />
+                        {rewind.playing ? "pause" : "play"}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => seekRewind(rewind.index + 1)}
+                        disabled={rewind.index === steps}
+                        aria-label="one gesture on"
+                      >
+                        ›
+                      </button>
+                    </span>
+                  )}
+
+                  {/* The scale. A real range input, so the arrows, Home and End
+                      work without a line of code, and the ticks are one per
+                      gesture — an engraved scale rather than a progress bar. */}
+                  <span
+                    className={styles.scrubWrap}
+                    style={
+                      {
+                        "--scrub-at": `${(100 * rewind.index) / Math.max(steps, 1)}%`,
+                        "--scrub-tick": `${100 / Math.max(steps, 1)}%`,
+                      } as React.CSSProperties
+                    }
+                  >
+                    {steps <= TICK_LIMIT && (
+                      <span className={styles.scrubTicks} aria-hidden="true" />
+                    )}
+                    <input
+                      type="range"
+                      className={styles.scrub}
+                      min={0}
+                      max={steps}
+                      step={1}
+                      value={rewind.index}
+                      onChange={(e) => seekRewind(Number(e.target.value))}
+                      aria-label={
+                        rewind.kind === "replay"
+                          ? "replay position, in committed gestures"
+                          : "history position, in committed gestures"
+                      }
+                      aria-valuetext={
+                        rewind.index === steps
+                          ? `state ${steps} of ${steps} — the live drawing`
+                          : `state ${rewind.index} of ${steps} — ${
+                              steps - rewind.index
+                            } gesture${
+                              steps - rewind.index === 1 ? "" : "s"
+                            } after this`
+                      }
+                    />
+                  </span>
+
+                  {rewind.kind === "replay" && (
+                    <>
+                      <label className={styles.rewindField}>
+                        <span className={styles.benchKey}>step</span>
+                        <select
+                          className={styles.rewindSelect}
+                          value={stepMs}
+                          onChange={(e) => {
+                            const ms = Number(e.target.value);
+                            setStepMs(ms);
+                            setAnnounce(
+                              `replay at ${ms} ms a gesture — ${(
+                                (steps * ms) /
+                                1000
+                              ).toFixed(1)} s for the whole drawing; the exported animation uses the same figure`
+                            );
+                          }}
+                          aria-label="delay between replay steps"
+                        >
+                          {STEP_MS.map((ms) => (
+                            <option key={ms} value={ms}>
+                              {ms} ms
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <button
+                        type="button"
+                        className={styles.rewindAction}
+                        onClick={exportAnimation}
+                        aria-label="save the replay as an animated SVG — one CSS animation per gesture, one group per orbit"
+                      >
+                        save svg animation
+                      </button>
+                    </>
+                  )}
+
+                  {rewind.kind === "history" && (
+                    <button
+                      type="button"
+                      className={`${styles.revertBtn} ${
+                        armed === "revert" ? styles.armedBtn : ""
+                      }`}
+                      onClick={doRevert}
+                      onBlur={() => {
+                        if (armed === "revert") disarm();
+                      }}
+                      disabled={revert === null}
+                      aria-label={
+                        revert === null
+                          ? "the drawing already stands at this state — nothing to revert"
+                          : armed === "revert"
+                          ? `confirm — roll back ${revert.rolledBack} gestures and discard ${revert.discardedRedo} redo steps`
+                          : `revert to state ${rewind.index} — rolls back ${revert.rolledBack} gesture${
+                              revert.rolledBack === 1 ? "" : "s"
+                            } as one undoable step`
+                      }
+                    >
+                      {armed === "revert" ? "revert — sure?" : "revert"}
+                      {armed === "revert" && (
+                        <span
+                          className={styles.armFuse}
+                          style={{ animationDuration: `${CONFIRM_MS}ms` }}
+                          aria-hidden="true"
+                        />
+                      )}
+                    </button>
+                  )}
+                </div>
+
+                <p className={styles.rewindNote}>
+                  {rewind.kind === "replay" ? (
+                    <>
+                      A <b>preview</b>. The plate, the history and the undo stack
+                      are untouched — closing this leaves the drawing exactly as
+                      it was. The exported animation is a{" "}
+                      <b>separate file</b>: one <code>&lt;g&gt;</code> per orbit
+                      carrying <i>one</i> CSS animation, not one per cell.
+                    </>
+                  ) : revert === null ? (
+                    <>
+                      A <b>preview</b>. Scrub to an earlier state and{" "}
+                      <b>revert</b> becomes available; nothing on the plate moves
+                      until you press it.
+                    </>
+                  ) : (
+                    <>
+                      <b>
+                        Revert rolls back {revert.rolledBack} gesture
+                        {revert.rolledBack === 1 ? "" : "s"}
+                      </b>{" "}
+                      over {revert.changed} cell
+                      {revert.changed === 1 ? "" : "s"} — as <i>one more entry</i>{" "}
+                      in the history, not a truncation, so <b>⌘Z brings them all
+                      back</b>.{" "}
+                      {revert.discardedRedo === 0 ? (
+                        <>Nothing is discarded.</>
+                      ) : (
+                        <>
+                          It <b>does</b> discard {revert.discardedRedo} redo step
+                          {revert.discardedRedo === 1 ? "" : "s"} for good, which
+                          is why it asks twice.
+                        </>
+                      )}
+                    </>
+                  )}
+                </p>
+              </div>
+            )}
+
             {loadError !== null && (
               <p className={styles.loadError} role="alert">
                 <span>{loadError}</span>
@@ -3516,9 +4345,13 @@ export default function DrawPage() {
                 geom={canvas.geom}
                 relief={relief}
                 paint={paint}
-                preview={preview}
-                candidate={candidateSpec}
-                cursor={cursor}
+                // The ghost, the standing proposal and the cursor are all
+                // promises about a plate that is not the one on screen, so a
+                // preview drops all three. The STATE is kept — the cursor comes
+                // back where it was left when the preview closes.
+                preview={previewing ? null : preview}
+                candidate={previewing ? null : candidateSpec}
+                cursor={previewing ? null : cursor}
                 guides={guides}
                 showGuides={showGuides}
                 showTiling={showTiling}
@@ -3529,7 +4362,11 @@ export default function DrawPage() {
                 view={view}
                 className={styles.canvas}
                 candidateClass={styles.marching}
-                label={`drawing plate framed on ${
+                label={`${
+                  rewind === null
+                    ? "drawing plate"
+                    : `${rewind.kind} preview — state ${rewind.index} of ${steps}, read only —`
+                } framed on ${
                   viewMode === "sector" ? `sector ${sector}` : "all six sectors"
                 }, depth ${depth}, ${total} cells drawn of ${modelTotal}, ${mode}-fold symmetry brush, ${tool} tool, ${shapeTool} shape${
                   band === null ? "" : `, band ${band}`
@@ -3540,20 +4377,33 @@ export default function DrawPage() {
                       : "paints"
                     : "anchors then lays the figure"
                 }. Press question mark for every shortcut.`}
-                onHover={onHover}
-                onPaint={paintAt}
-                onStrokeEnd={endStroke}
-                onPropose={propose}
-                onCommit={commitCandidate}
-                onArrow={onArrow}
-                onShapeDrag={(anchor, at, alt) => setShapeDrag({ anchor, at, alt })}
-                onShapeEnd={commitShape}
+                onHover={previewing ? NOTHING : onHover}
+                onPaint={previewing ? NOTHING : paintAt}
+                onStrokeEnd={previewing ? NOTHING : endStroke}
+                onPropose={previewing ? NOTHING : propose}
+                onCommit={previewing ? NOTHING : commitCandidate}
+                onArrow={previewing ? NOTHING : onArrow}
+                onShapeDrag={
+                  previewing
+                    ? NOTHING
+                    : (anchor, at, alt) => setShapeDrag({ anchor, at, alt })
+                }
+                onShapeEnd={previewing ? NOTHING : commitShape}
                 onPan={onPan}
               />
-              {tool !== "paint" && (
-                <span className={styles.modeFlag} data-tool={tool} aria-hidden="true">
-                  {tool}
+              {/* One flag, and the preview outranks the tool: while a preview
+                  stands the brush is switched off, so naming it would be
+                  telling the reader about a control that is not connected. */}
+              {rewind !== null ? (
+                <span className={styles.previewFlag} aria-hidden="true">
+                  {rewind.kind} · {rewind.index}/{steps}
                 </span>
+              ) : (
+                tool !== "paint" && (
+                  <span className={styles.modeFlag} data-tool={tool} aria-hidden="true">
+                    {tool}
+                  </span>
+                )
               )}
               {/* Commit rides ON the plate, opposite the tool flag.
                   It used to sit in the tool strip, and from there it was a
@@ -3593,7 +4443,7 @@ export default function DrawPage() {
                   </div>
                 </div>
               )}
-              {paint.size === 0 && candidateSpec === null && !dropping && (
+              {paint.size === 0 && candidateSpec === null && !dropping && !previewing && (
                 <p className={styles.emptyHint}>
                   {dragMode === "propose"
                     ? "drag to propose — tap the ghost to commit"

@@ -59,8 +59,35 @@ export interface CellEdit<K extends EditKey = number> {
   to: string | null;
 }
 
+/**
+ * Where a gesture's cells came from, as the SYMMETRY that produced them.
+ *
+ * The edits alone say which cells changed and to what. They do not say that six
+ * of those cells are one orbit — that is a fact about the brush, and it is gone
+ * the instant `planEdits` has run. Recording it is what lets a replay write the
+ * orbit down as a DOM GROUP instead of six unrelated polygons: see
+ * `replay.ts`, where one group carries one animation.
+ *
+ * `groups` is what `brushStamp` already returns — the image bands when a band is
+ * in play, and the orbit itself when it is not — mapped into whatever key the
+ * stroke is written in. A gesture that applied the brush many times (a drag)
+ * holds many groups, in the order they were applied.
+ *
+ * OPTIONAL and absent by default. A stroke recorded before this existed, or by
+ * something with no symmetry to claim — a preset, a revert, a loaded file — has
+ * no mark, and a replay says so by emitting one plain group rather than
+ * inventing a symmetry the gesture did not have.
+ */
+export interface StrokeMark<K extends EditKey = number> {
+  /** The brush symmetry the gesture was made under. */
+  mode: number;
+  /** One entry per orbit or image band the gesture applied, in stroke order. */
+  groups: K[][];
+}
+
 export interface Stroke<K extends EditKey = number> {
   edits: CellEdit<K>[];
+  mark?: StrokeMark<K>;
 }
 
 export interface History<K extends EditKey = number> {
@@ -397,6 +424,21 @@ function fmt(n: number): string {
 
 const points = (c: ArtCell) =>
   c.verts.map((v) => `${fmt(v[0])},${fmt(v[1])}`).join(" ");
+
+/**
+ * The two coordinate writers, exported under names of their own.
+ *
+ * `replay.ts` writes a SECOND file from the same cells, and the two have to lay
+ * a coordinate down identically or the animation and the still would disagree
+ * about where a cell is — visibly, if anyone opened them side by side, and
+ * silently in a diff. One implementation, two callers, rather than a copy that
+ * is correct on the day it is written.
+ *
+ * Aliases rather than a rename, so `artworkSvg` below reads exactly as it did
+ * and its bytes cannot have moved.
+ */
+export const fmtCoord = fmt;
+export const cellPoints = points;
 
 const escapeText = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");

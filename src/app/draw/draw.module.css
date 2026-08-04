@@ -910,6 +910,312 @@
   box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.5);
 }
 
+/* ---------- the preview bench ---------- */
+
+/**
+ * REPLAY and HISTORY, on a strip of their own under the plate rule.
+ *
+ * Same grammar as `.adjustBar`, and for the same reason: it is present only
+ * while it is being used, so it costs canvas height exactly when it is asked
+ * for and never otherwise.
+ *
+ * VIOLET is the accent, and it is the one hue in the console that had not been
+ * spent on a control. The tool bench already owns the other three — bone for
+ * paint, rose for what destroys, sky for what transforms — and violet is
+ * already the colour of ROTATION on the canvas, which is the console's word for
+ * a symmetry acting over time. So "you are looking at a state the drawing is no
+ * longer in" arrives as a hue that has never once meant "this is live".
+ */
+.rewindBar {
+  --preview-accent: #a78bfa;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 9px 11px 10px;
+  margin-bottom: 11px;
+  border: 1px solid rgba(167, 139, 250, 0.32);
+  border-left-width: 3px;
+  border-radius: 2px;
+  background: rgba(167, 139, 250, 0.05);
+}
+
+.rewindHead {
+  display: flex;
+  align-items: center;
+  gap: 6px 12px;
+  flex-wrap: wrap;
+  font-size: 9.5px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+}
+
+/* The same chip the tool status wears, in the preview's own colour, so the two
+   "what state am I in" badges are plainly the same kind of statement. */
+.rewindTag {
+  padding: 3px 7px;
+  border: 1px solid var(--preview-accent);
+  border-radius: 2px;
+  color: var(--preview-accent);
+  font-weight: 600;
+  letter-spacing: 0.22em;
+}
+
+/* The position, in the display face the dials use. It is the number the whole
+   strip is about, so it is the only thing here set in the serif. */
+.rewindCount {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 3px;
+  font-family: var(--font-display), Georgia, serif;
+  font-size: 15px;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--bone-faint);
+}
+
+.rewindCount b {
+  color: var(--bone);
+  font-weight: 500;
+}
+
+.rewindSaid {
+  min-width: 0;
+  color: var(--bone-faint);
+}
+
+.rewindClose {
+  margin-left: auto;
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 5px 9px;
+}
+
+.rewindRow {
+  display: flex;
+  align-items: center;
+  gap: 8px 12px;
+  flex-wrap: wrap;
+}
+
+.transport {
+  display: inline-flex;
+  gap: 2px;
+  flex: none;
+}
+
+.transport button {
+  font-size: 11px;
+  line-height: 1;
+  padding: 6px 8px;
+  min-width: 26px;
+}
+
+.playBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  border-color: rgba(167, 139, 250, 0.5);
+  color: var(--preview-accent);
+}
+
+.playBtn:hover:not(:disabled) {
+  border-color: var(--preview-accent);
+  background: rgba(167, 139, 250, 0.12);
+}
+
+.playBtn[aria-pressed="true"] {
+  background: var(--preview-accent);
+  border-color: var(--preview-accent);
+  color: var(--ink);
+}
+
+/**
+ * The scale. One track, two instruments — the transport drives it and the hand
+ * drags it, and the ticks are one per COMMITTED GESTURE rather than a smooth
+ * bar, because the axis really is discrete and a continuous meter would be
+ * describing a drawing that does not exist between two strokes.
+ */
+.scrubWrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 1 1 200px;
+  min-width: 140px;
+  height: 22px;
+}
+
+.scrubTicks {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 9px;
+  transform: translateY(-50%);
+  pointer-events: none;
+  opacity: 0.45;
+  background-image: repeating-linear-gradient(
+    90deg,
+    var(--rule-bright) 0 1px,
+    transparent 1px var(--scrub-tick, 100%)
+  );
+}
+
+.scrub {
+  position: relative;
+  width: 100%;
+  height: 22px;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.scrub::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 2px;
+  background: linear-gradient(
+    90deg,
+    var(--preview-accent) 0 var(--scrub-at, 0%),
+    var(--rule-bright) var(--scrub-at, 0%) 100%
+  );
+}
+
+.scrub::-moz-range-track {
+  height: 3px;
+  border-radius: 2px;
+  background: linear-gradient(
+    90deg,
+    var(--preview-accent) 0 var(--scrub-at, 0%),
+    var(--rule-bright) var(--scrub-at, 0%) 100%
+  );
+}
+
+/* The same 3px bone bar the hue rail wears, so the two sliders on the page are
+   recognisably one control. */
+.scrub::-webkit-slider-thumb {
+  appearance: none;
+  width: 3px;
+  height: 17px;
+  margin-top: -7px;
+  border: 0;
+  border-radius: 2px;
+  background: var(--bone);
+  box-shadow: 0 0 0 1px rgba(10, 9, 8, 0.85), 0 0 10px rgba(0, 0, 0, 0.6);
+}
+
+.scrub::-moz-range-thumb {
+  width: 3px;
+  height: 17px;
+  border: 0;
+  border-radius: 2px;
+  background: var(--bone);
+  box-shadow: 0 0 0 1px rgba(10, 9, 8, 0.85), 0 0 10px rgba(0, 0, 0, 0.6);
+}
+
+.scrub:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+.rewindField {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+
+.rewindSelect {
+  padding: 5px 7px;
+  border: 1px solid var(--rule-bright);
+  border-radius: 2px;
+  background: var(--plate-2);
+  color: var(--bone-dim);
+  font: inherit;
+  font-size: 9.5px;
+  letter-spacing: 0.1em;
+  font-variant-numeric: tabular-nums;
+}
+
+.rewindSelect:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: 2px;
+}
+
+.rewindAction {
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 6px 10px;
+  border-color: rgba(167, 139, 250, 0.5);
+  color: var(--preview-accent);
+}
+
+.rewindAction:hover:not(:disabled) {
+  border-color: var(--preview-accent);
+  background: rgba(167, 139, 250, 0.12);
+}
+
+/**
+ * REVERT wears the preview's colour and NOT the destructive rose, because it is
+ * not destructive: it is one more entry in the history and ⌘Z takes it back.
+ * It turns rose — by taking `.armedBtn`, the same class NEW uses — in the one
+ * case where something really is lost for good, which is a standing redo
+ * branch. A guard that fires when nothing is at stake is how people learn to
+ * click through guards.
+ */
+.revertBtn {
+  position: relative;
+  overflow: hidden;
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  padding: 6px 10px;
+  border-color: rgba(167, 139, 250, 0.5);
+  color: var(--preview-accent);
+}
+
+.revertBtn:hover:not(:disabled) {
+  border-color: var(--preview-accent);
+  background: rgba(167, 139, 250, 0.12);
+}
+
+.rewindNote {
+  font-size: 10px;
+  line-height: 1.62;
+  color: var(--bone-faint);
+  margin: 0;
+  max-width: 92ch;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.rewindNote b {
+  color: var(--bone-dim);
+  font-weight: 500;
+}
+
+.rewindNote code {
+  color: var(--bone-dim);
+  background: var(--plate-2);
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  padding: 0 3px;
+}
+
+/* The toolbar buttons that hold a preview open. */
+.rewindOn {
+  border-color: var(--d-rot);
+  background: rgba(167, 139, 250, 0.14);
+  color: var(--bone);
+}
+
 /* The standing proposal's own controls, floated over the plate opposite the
    tool flag. Same visual grammar as `.modeFlag` — a dark chip with a hairline
    — because it is the same kind of thing: a state of the artwork, stated on the
@@ -1428,6 +1734,24 @@
   .commitRow button {
     padding: 11px 10px;
   }
+
+  /* The preview strip: the scale takes its own row so it is a full-width drag
+     rather than a 60px one, and every control beside it grows to a thumb. */
+  .scrubWrap {
+    flex: 1 1 100%;
+    order: -1;
+  }
+  .transport button,
+  .playBtn,
+  .rewindAction,
+  .revertBtn,
+  .rewindSelect {
+    padding: 10px 10px;
+  }
+  .rewindAction,
+  .revertBtn {
+    flex: 1 1 auto;
+  }
 }
 
 .canvasHold {
@@ -1450,6 +1774,26 @@
   font-size: 8.5px;
   letter-spacing: 0.3em;
   text-transform: uppercase;
+  pointer-events: none;
+}
+
+/* The plate itself declaring that it is not live. Same chip as `.modeFlag`, in
+   the preview's violet, and it REPLACES the tool flag rather than sitting
+   beside it — the brush is switched off while this is up. */
+.previewFlag {
+  position: absolute;
+  top: 5px;
+  left: 5px;
+  z-index: 1;
+  padding: 4px 8px;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  background: rgba(10, 9, 8, 0.72);
+  font-size: 8.5px;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  font-variant-numeric: tabular-nums;
+  color: var(--d-rot);
   pointer-events: none;
 }
 
@@ -1699,7 +2043,8 @@
   }
   /* The fuse keeps its animation: it is not decoration, it is the only display
      of how long the armed button has left, and a still bar would state a
-     deadline that is not there. */
+     deadline that is not there. The replay keeps its timer for the same reason
+     — it is the content, not an effect on it. */
   .dialBtn,
   .preset,
   .presetBtn,
