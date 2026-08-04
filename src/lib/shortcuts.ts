@@ -86,7 +86,21 @@ export const SHORTCUTS: readonly ShortcutGroup[] = [
     rows: [
       { chord: "mod+z", keys: "⌘Z / Ctrl Z", what: "undo a whole gesture" },
       { chord: "mod+shift+z", keys: "⌘⇧Z / Ctrl ⇧Z", what: "redo" },
-      { chord: "escape", keys: "Esc", what: "drop a candidate, cancel a confirm, close this panel" },
+      {
+        chord: "p",
+        keys: "P",
+        what: "replay — play the drawing back gesture by gesture; again to pause",
+      },
+      {
+        chord: "m",
+        keys: "M",
+        what: "history — scrub the drawing's earlier states; nothing is changed",
+      },
+      {
+        chord: "escape",
+        keys: "Esc",
+        what: "close a preview, drop a candidate, cancel a confirm, close this panel",
+      },
       { chord: "?", keys: "?", what: "this panel" },
     ],
   },
