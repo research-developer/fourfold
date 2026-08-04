@@ -459,45 +459,243 @@ const TOOL_LABEL: Record<Tool, string> = {
   adjust: "transform the colour already there",
 };
 
-function ToolGlyph({ tool }: { tool: Tool }) {
+/**
+ * The console's icon family, drawn here and nowhere else.
+ *
+ * ONE grid (16×16), ONE stroke weight (1.6), ONE colour (`currentColor`), and
+ * every glyph inline in this file. Inline because the page ships under a strict
+ * CSP and an icon font or a CDN sprite would be a network origin the drawing
+ * program does not otherwise need; `currentColor` because every state the
+ * buttons already have — pressed, hover, disabled, focus — is expressed as a
+ * text colour, and a glyph that inherits it keeps all four for free rather than
+ * needing a second set of rules.
+ *
+ * 16 rather than 24 so the numbers below are the same numbers a reader sees:
+ * the plate rule renders these at 13px, and a 16-unit grid at 13px puts a
+ * 1.6-unit stroke at 1.3 device pixels, which is the weight of the hairlines
+ * the console is already drawn in. A 24-grid would have needed 2.4.
+ */
+function Glyph({
+  children,
+  filled,
+}: {
+  children: React.ReactNode;
+  /** Some glyphs are solid shapes; those set their own `fill` and clear stroke. */
+  filled?: boolean;
+}) {
   return (
-    <svg viewBox="0 0 16 16" className={styles.toolGlyph} aria-hidden="true">
-      {tool === "paint" && <polygon points="8,2 15,14 1,14" fill="currentColor" />}
-      {tool === "erase" && (
-        <>
-          <polygon
-            points="8,2 15,14 1,14"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth={1.6}
-            strokeDasharray="3 2.4"
-          />
-          <line
-            x1={3}
-            y1={13}
-            x2={13}
-            y2={3}
-            stroke="currentColor"
-            strokeWidth={1.6}
-          />
-        </>
-      )}
-      {tool === "adjust" && (
-        <>
-          <circle
-            cx={8}
-            cy={8}
-            r={6}
-            fill="none"
-            stroke="currentColor"
-            strokeWidth={1.6}
-          />
-          <path d="M8 2 A6 6 0 0 1 8 14 Z" fill="currentColor" />
-        </>
-      )}
+    <svg
+      viewBox="0 0 16 16"
+      className={styles.icon}
+      aria-hidden="true"
+      focusable="false"
+      fill={filled ? "currentColor" : "none"}
+      stroke={filled ? "none" : "currentColor"}
+      strokeWidth={1.6}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      {children}
     </svg>
   );
 }
+
+/**
+ * The three brushes.
+ *
+ * The triangle is the figure's own atom, so PAINT is a filled one; ERASE is the
+ * same triangle drawn as an outline that is no longer there, struck through;
+ * ADJUST is a disc half-turned, which is what an adjustment does to a colour
+ * that is already down — it does not add and it does not remove.
+ */
+function ToolGlyph({ tool }: { tool: Tool }) {
+  if (tool === "paint") {
+    return (
+      <Glyph filled>
+        <polygon points="8,2.5 14.5,13.5 1.5,13.5" />
+      </Glyph>
+    );
+  }
+  if (tool === "erase") {
+    return (
+      <Glyph>
+        <polygon points="8,2.5 14.5,13.5 1.5,13.5" strokeDasharray="3 2.4" />
+        <line x1={3.2} y1={12.8} x2={12.8} y2={3.2} />
+      </Glyph>
+    );
+  }
+  return (
+    <Glyph>
+      <circle cx={8} cy={8} r={5.7} />
+      <path d="M8 2.3 A5.7 5.7 0 0 1 8 13.7 Z" fill="currentColor" stroke="none" />
+    </Glyph>
+  );
+}
+
+/**
+ * WHICH cells, as three figures rather than three words.
+ *
+ * FREE is a hand's line. LINE is a segment between two anchors, drawn on a
+ * lattice diagonal rather than square-on, because a lattice row is never
+ * horizontal. RING is a HEXAGON and not a circle, and that is not decoration:
+ * the ring is a level set of the exact hexagonal norm about the plate's centre,
+ * so a circular glyph would be a picture of a shape this program cannot draw.
+ */
+function ShapeGlyph({ shape }: { shape: ShapeTool }) {
+  if (shape === "free") {
+    return (
+      <Glyph>
+        <path d="M2.2 10.6 C 4.4 3.6, 6.4 12.8, 8.6 8.2 S 12.4 3.4, 13.8 7.4" />
+      </Glyph>
+    );
+  }
+  if (shape === "line") {
+    return (
+      <Glyph>
+        <line x1={3.6} y1={12.4} x2={12.4} y2={3.6} />
+        <circle cx={3.6} cy={12.4} r={2} fill="currentColor" stroke="none" />
+        <circle cx={12.4} cy={3.6} r={2} fill="currentColor" stroke="none" />
+      </Glyph>
+    );
+  }
+  return (
+    <Glyph>
+      <polygon points="8,1.8 13.6,5 13.6,11 8,14.2 2.4,11 2.4,5" />
+      <circle cx={8} cy={8} r={1.4} fill="currentColor" stroke="none" />
+    </Glyph>
+  );
+}
+
+/**
+ * What a DRAG does, as the reviewer asked for it: one solid stroke, one dotted.
+ *
+ * The geometry is identical and only the ink differs, which is the whole of the
+ * distinction — PROPOSE draws the same cells PAINT would, and holds them as a
+ * ghost until they are tapped. Drawn on the diagonal so it reads as a gesture
+ * rather than as a minus sign, and dotted with round caps so the dots are dots.
+ */
+function DragGlyph({ mode }: { mode: DragMode }) {
+  return (
+    <Glyph>
+      <line
+        x1={3}
+        y1={12.4}
+        x2={13}
+        y2={3.6}
+        strokeWidth={1.8}
+        strokeDasharray={mode === "propose" ? "0.1 3.2" : undefined}
+      />
+    </Glyph>
+  );
+}
+
+/**
+ * The action glyphs.
+ *
+ * UNDO and REDO are the one mirrored pair the strip needs to be read as a pair.
+ * REPLAY is a transport — the same play triangle the replay bar's own button
+ * uses, so the control and the thing it opens are drawn the same. HISTORY is a
+ * CLOCK, and the two sit one above the other on purpose: same ring, and what is
+ * inside it is the whole difference. A triangle is a thing that is about to
+ * happen; hands are a thing that already has. It was drawn as a scrub first,
+ * because a scrub is what the button opens, and at 13px the ticks read as a bar
+ * chart — the glyph has to survive the size it is used at, not the size it is
+ * designed at. SAVE and LOAD share a tray and differ only in which way the arrow runs,
+ * so the pair reads as one idea with a direction rather than as two icons.
+ */
+type ActionIcon = "undo" | "redo" | "replay" | "history" | "save" | "load";
+
+function ActionGlyph({ name }: { name: ActionIcon }) {
+  switch (name) {
+    case "undo":
+      return (
+        <Glyph>
+          <path d="M5.8 10.2 A4.2 4.2 0 1 0 10 6 H 4" />
+          <polyline points="6.4,3.6 4,6 6.4,8.4" />
+        </Glyph>
+      );
+    case "redo":
+      return (
+        <Glyph>
+          <path d="M10.2 10.2 A4.2 4.2 0 1 1 6 6 H 12" />
+          <polyline points="9.6,3.6 12,6 9.6,8.4" />
+        </Glyph>
+      );
+    case "replay":
+      return (
+        <Glyph>
+          <circle cx={8} cy={8} r={5.9} />
+          <polygon points="6.5,4.9 11.3,8 6.5,11.1" fill="currentColor" stroke="none" />
+        </Glyph>
+      );
+    case "history":
+      return (
+        <Glyph>
+          <circle cx={8} cy={8} r={5.7} />
+          <polyline points="8,4.4 8,8 11.3,8" />
+        </Glyph>
+      );
+    case "save":
+      return (
+        <Glyph>
+          <line x1={8} y1={2.2} x2={8} y2={9.6} />
+          <polyline points="5.3,6.9 8,9.6 10.7,6.9" />
+          <polyline points="2.6,10.9 2.6,13.6 13.4,13.6 13.4,10.9" />
+        </Glyph>
+      );
+    case "load":
+      return (
+        <Glyph>
+          <line x1={8} y1={9.6} x2={8} y2={2.2} />
+          <polyline points="5.3,4.9 8,2.2 10.7,4.9" />
+          <polyline points="2.6,10.9 2.6,13.6 13.4,13.6 13.4,10.9" />
+        </Glyph>
+      );
+  }
+}
+
+/** The one thing that says "there is a list under this button". */
+function MenuCaret() {
+  return (
+    <svg
+      viewBox="0 0 16 16"
+      className={styles.caret}
+      aria-hidden="true"
+      focusable="false"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth={2.2}
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <polyline points="3.5,6 8,10.5 12.5,6" />
+    </svg>
+  );
+}
+
+/**
+ * The strip, spelled out in the shortcut panel.
+ *
+ * An icon that has to be hovered to be understood is a word nobody can read, so
+ * every glyph in the plate rule is also printed here beside its name — the same
+ * component, so the panel cannot come to describe a strip that no longer exists.
+ */
+const GLYPH_LEGEND: readonly { icon: React.ReactNode; what: string }[] = [
+  { icon: <ToolGlyph tool="paint" />, what: "paint — lay the scheme's colours" },
+  { icon: <ToolGlyph tool="erase" />, what: "erase — back to bare tiling" },
+  { icon: <ToolGlyph tool="adjust" />, what: "adjust — transform what is there" },
+  { icon: <ShapeGlyph shape="free" />, what: "free — every cell the pointer crosses" },
+  { icon: <ShapeGlyph shape="line" />, what: "line — drag along a lattice row" },
+  { icon: <ShapeGlyph shape="ring" />, what: "ring — a level set of the hex norm" },
+  { icon: <DragGlyph mode="paint" />, what: "drag paints continuously" },
+  { icon: <DragGlyph mode="propose" />, what: "drag proposes; tap to commit" },
+  { icon: <ActionGlyph name="undo" />, what: "undo a whole gesture" },
+  { icon: <ActionGlyph name="redo" />, what: "redo it" },
+  { icon: <ActionGlyph name="replay" />, what: "replay the drawing being made" },
+  { icon: <ActionGlyph name="history" />, what: "history — scrub the earlier states" },
+  { icon: <ActionGlyph name="save" />, what: "save — SVG or PNG" },
+  { icon: <ActionGlyph name="load" />, what: "load an SVG onto the plate" },
+];
 
 export default function DrawPage() {
   /**
@@ -608,6 +806,22 @@ export default function DrawPage() {
   const [helpOpen, setHelpOpen] = useState(false);
   const helpClose = useRef<HTMLButtonElement>(null);
   const helpOpener = useRef<HTMLElement | null>(null);
+
+  /**
+   * The save menu: is it open?
+   *
+   * SVG and PNG used to be two buttons, and two buttons is what they are once
+   * the strip is icons — "the artwork, out" is ONE idea with a format on the
+   * end of it, and drawing it twice spent two of the six slots the right-hand
+   * end of the rule has. So they collapse into a menu button, and the menu is a
+   * real one: `aria-haspopup`, `role="menu"`, arrow keys, Escape back to the
+   * trigger. A hover-only reveal would have been a control no keyboard and no
+   * touchscreen could open.
+   */
+  const [saveWanted, setSaveWanted] = useState(false);
+  const saveWrap = useRef<HTMLDivElement | null>(null);
+  const saveBtn = useRef<HTMLButtonElement | null>(null);
+  const saveMenu = useRef<HTMLDivElement | null>(null);
 
   /**
    * The view: a zoom factor and a centre, both display-only.
@@ -2219,6 +2433,10 @@ export default function DrawPage() {
 
   const openHelp = useCallback(() => {
     helpOpener.current = document.activeElement as HTMLElement | null;
+    // `?` is reachable from inside the save menu — it is the one key the menu
+    // does not swallow — and a menu left standing behind the scrim would be a
+    // panel over the artwork with nothing pointing at it.
+    setSaveWanted(false);
     setHelpOpen(true);
   }, []);
 
@@ -2232,6 +2450,87 @@ export default function DrawPage() {
   useEffect(() => {
     if (helpOpen) helpClose.current?.focus();
   }, [helpOpen]);
+
+  /**
+   * Both exports write the LIVE plate, so both are off while a preview stands
+   * and off on an empty plate.
+   *
+   * Which means the menu can be open when its own trigger goes dead — opening a
+   * replay from the keyboard will do it — and the menu has to go with it, or it
+   * is two items floating over the artwork that no longer do anything. So the
+   * open state is DERIVED rather than synchronised: `saveWanted` is what the
+   * user asked for and `saveOpen` is what is true, and there is no effect that
+   * has to notice the difference and correct it a render later.
+   */
+  const saveOff = paint.size === 0 || previewing;
+  const saveOpen = saveWanted && !saveOff;
+
+  /**
+   * Close the save menu, and put the focus back where it was taken from.
+   *
+   * `refocus` is false for the one path where the pointer has already moved the
+   * focus somewhere else — a click outside — because pulling it back to a
+   * button the user has just clicked away from is a keyboard trap with good
+   * manners.
+   */
+  const closeSaveMenu = useCallback((refocus = true) => {
+    setSaveWanted(false);
+    if (refocus) saveBtn.current?.focus();
+  }, []);
+
+  /** The menu opens with its first item under the finger, mouse or keyboard. */
+  useEffect(() => {
+    if (!saveOpen) return;
+    saveMenu.current?.querySelector("button")?.focus();
+  }, [saveOpen]);
+
+  /** A click anywhere else dismisses it, which is the one thing every menu does. */
+  useEffect(() => {
+    if (!saveOpen) return;
+    const onDown = (e: PointerEvent) => {
+      if (!saveWrap.current?.contains(e.target as Node)) setSaveWanted(false);
+    };
+    document.addEventListener("pointerdown", onDown);
+    return () => document.removeEventListener("pointerdown", onDown);
+  }, [saveOpen]);
+
+  /**
+   * Roving focus inside the menu.
+   *
+   * Two items, so this is short — but it is the difference between a menu and a
+   * pair of buttons in a box, and `role="menu"` promises it.
+   */
+  const onMenuKey = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      const items = Array.from(
+        saveMenu.current?.querySelectorAll("button") ?? []
+      );
+      const at = items.indexOf(document.activeElement as HTMLButtonElement);
+      if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+        e.preventDefault();
+        const step = e.key === "ArrowDown" ? 1 : -1;
+        items[(at + step + items.length) % items.length]?.focus();
+        return;
+      }
+      if (e.key === "Home" || e.key === "End") {
+        e.preventDefault();
+        (e.key === "Home" ? items[0] : items[items.length - 1])?.focus();
+        return;
+      }
+      // Tab leaves, and a menu that stayed open behind the focus would be a
+      // panel floating over the artwork with nothing pointing at it.
+      if (e.key === "Tab") closeSaveMenu(false);
+    },
+    [closeSaveMenu]
+  );
+
+  /** Down-arrow opens it, which is what `aria-haspopup` tells a reader it will. */
+  const onSaveKey = useCallback((e: React.KeyboardEvent<HTMLButtonElement>) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      e.preventDefault();
+      setSaveWanted(true);
+    }
+  }, []);
 
   const setZoomTo = useCallback(
     (z: number) => {
@@ -2305,6 +2604,12 @@ export default function DrawPage() {
           closeHelp();
           return;
         }
+        // Before the confirm and before the preview: the menu is the innermost
+        // thing that is open, and Escape unwinds from the inside out.
+        if (saveOpen) {
+          closeSaveMenu();
+          return;
+        }
         if (armed !== null) {
           disarm("cancelled — nothing was changed");
           return;
@@ -2354,6 +2659,10 @@ export default function DrawPage() {
         return;
       }
       if (helpOpen) return;
+      // An open menu swallows the drawing keys for the same reason the panel
+      // does: the focus is inside it, and `P` while a menu item is focused must
+      // not start a replay behind it.
+      if (saveOpen) return;
       // Past here every key is a drawing key, and the scrub owns them all while
       // it has focus.
       if (onRange) return;
@@ -2544,6 +2853,8 @@ export default function DrawPage() {
     helpOpen,
     closeHelp,
     openHelp,
+    saveOpen,
+    closeSaveMenu,
     armed,
     disarm,
     rewind,
@@ -3764,6 +4075,11 @@ export default function DrawPage() {
         >
           <div className={styles.plate}>
             <div className={styles.plateRule} data-tool={tool}>
+              {/* The status line and the frame it is a status OF. The readout
+                  wraps inside this row; ZOOM is pinned to the far end of it and
+                  does not, so the one control on this line stays where it was
+                  put however long the sentence to its left runs. */}
+              <div className={styles.statusRow}>
               <span className={styles.readout}>
                 {/* The tool leads the status line, in its own colour. A brush
                     that destroys or transforms must never be a state the reader
@@ -3793,21 +4109,76 @@ export default function DrawPage() {
                   {schemeName} · <b>{paint.size} painted</b>
                 </span>
               </span>
+              </div>
 
-              {/* The tool bench, IN the plate header rather than on a band of
-                  its own beneath it. It was a separate strip and it cost 73px
-                  of canvas height at 1512×950 — measured — while this row was
-                  already wrapping and had the width to carry it for free. The
-                  reasoning that put the tools here in the first place is
-                  unchanged: they act on the ARTWORK, and the hand that has just
-                  finished a stroke is already at the plate. */}
-              <div className={styles.bench}>
-                <div className={styles.benchGroup}>
+              {/* The control deck: TWO ROWS, and every row is read the same way
+                  — what the hand is holding on the left, what has been done to
+                  the drawing on the right.
+
+                  It was one flat strip of eleven words, and the words were the
+                  problem: `tool` and `shape` are the same question asked twice
+                  and they were sitting a hundred pixels apart, while `svg` and
+                  `png` were two buttons for one idea. Two rows of icons say the
+                  same thing in a third of the width, which is what buys the
+                  right-hand end enough room to keep MEMORY, FILE and the two
+                  meta controls apart from each other instead of packed into one
+                  run where `new` ends up beside `load`.
+
+                  The keys — tool, shape, drag — stay, and they are the reason
+                  the icons are allowed to be icons: no group in this deck is
+                  ever unlabelled, so a glyph never has to carry a name on its
+                  own. */}
+              <div className={styles.deck}>
+                {/* DRAG, on the far left and stacked, because it is the one
+                    control here that qualifies the OTHER two rather than
+                    standing beside them: it says what a press-and-drag does
+                    with whichever tool and whichever shape is in the hand. Two
+                    rows of one, so the deck opens on a column and the eye has
+                    something to start from. */}
+                <div className={styles.deckDrag}>
+                  <span className={styles.benchKey} id="drag-key">
+                    drag
+                  </span>
+                  <div
+                    className={`${styles.seg} ${styles.stackSeg}`}
+                    role="group"
+                    aria-labelledby="drag-key"
+                  >
+                    {(["paint", "propose"] as DragMode[]).map((d) => (
+                      <button
+                        key={d}
+                        type="button"
+                        className={`${styles.segBtn} ${styles.iconSegBtn}`}
+                        aria-pressed={dragMode === d}
+                        title={
+                          d === "paint"
+                            ? "drag paints continuously"
+                            : "drag proposes a candidate — tap it to commit"
+                        }
+                        aria-label={
+                          d === "paint"
+                            ? "drag lays colour continuously"
+                            : "drag proposes a candidate; tap it to commit"
+                        }
+                        onClick={() => pickDragMode(d)}
+                      >
+                        <DragGlyph mode={d} />
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* WHAT colour on top, WHICH cells underneath. Two questions,
+                    two controls, and stacking them is what finally says they
+                    are two: LINE composes with ERASE without either of them
+                    knowing the other exists, and a reader who has them one
+                    above the other can see that they multiply. */}
+                <div className={styles.deckRows}>
                   <span className={styles.benchKey} id="tool-key">
                     tool
                   </span>
                   <div
-                    className={`${styles.seg} ${styles.toolSeg}`}
+                    className={`${styles.seg} ${styles.iconSeg} ${styles.toolSeg}`}
                     role="group"
                     aria-labelledby="tool-key"
                   >
@@ -3815,27 +4186,22 @@ export default function DrawPage() {
                       <button
                         key={t}
                         type="button"
-                        className={`${styles.segBtn} ${styles.toolBtn}`}
+                        className={`${styles.segBtn} ${styles.iconSegBtn}`}
                         aria-pressed={tool === t}
+                        title={`${t} — ${TOOL_LABEL[t]}`}
                         aria-label={`${t} tool — ${TOOL_LABEL[t]}`}
                         onClick={() => pickTool(t)}
                       >
                         <ToolGlyph tool={t} />
-                        {t}
                       </button>
                     ))}
                   </div>
-                </div>
 
-                {/* WHICH cells, beside WHAT colour. Two questions, two
-                    controls: LINE composes with ERASE without either of them
-                    knowing the other exists. */}
-                <div className={styles.benchGroup}>
                   <span className={styles.benchKey} id="shape-key">
                     shape
                   </span>
                   <div
-                    className={`${styles.seg} ${styles.dragSeg}`}
+                    className={`${styles.seg} ${styles.iconSeg}`}
                     role="group"
                     aria-labelledby="shape-key"
                   >
@@ -3843,8 +4209,15 @@ export default function DrawPage() {
                       <button
                         key={s}
                         type="button"
-                        className={styles.segBtn}
+                        className={`${styles.segBtn} ${styles.iconSegBtn}`}
                         aria-pressed={shapeTool === s}
+                        title={
+                          s === "free"
+                            ? "free — every cell the pointer crosses"
+                            : s === "line"
+                            ? "line — drag along a lattice row"
+                            : "ring — drag outward; a level set of the hexagonal norm"
+                        }
                         aria-label={
                           s === "free"
                             ? "free brush — every cell the pointer crosses"
@@ -3854,154 +4227,211 @@ export default function DrawPage() {
                         }
                         onClick={() => pickShapeTool(s)}
                       >
-                        {s}
+                        <ShapeGlyph shape={s} />
                       </button>
                     ))}
                   </div>
                 </div>
 
-                <div className={styles.benchGroup}>
-                  <span className={styles.benchKey} id="drag-key">
-                    drag
+                {/* ZOOM, which shipped as `−  1×  +` with no label, no glyph
+                    and no tooltip — three unmarked buttons that a reviewer read
+                    as "I don't know what these do", which was the honest
+                    reading, because nothing on screen said. Two things change.
+
+                    It is LABELLED, in the same micro-key every other group in
+                    this deck wears, so the function is legible standing still
+                    with no pointer anywhere near it — which is the whole of the
+                    defect. And it has MOVED: it used to sit in the run that
+                    holds save, load and the button that wipes the plate, and it
+                    is not one of those. Zoom changes nothing about the drawing;
+                    it changes the window. So it sits on the seam of this deck,
+                    after the controls that say what the hand is holding and
+                    before the ones that say what has been done — belonging to
+                    neither, which is exactly right.
+
+                    The middle button is the readout AND the reset, so the
+                    factor is always on screen and 1× is always one click away.
+                    It exists so that Space-drag has something to pan, and the
+                    tooltip on `+` is where that is said. */}
+                <div className={styles.zoomGroup} role="group" aria-labelledby="zoom-key">
+                  <span className={styles.benchKey} id="zoom-key">
+                    zoom
                   </span>
-                  <div
-                    className={`${styles.seg} ${styles.dragSeg}`}
-                    role="group"
-                    aria-labelledby="drag-key"
-                  >
-                    {(["paint", "propose"] as DragMode[]).map((d) => (
-                      <button
-                        key={d}
-                        type="button"
-                        className={styles.segBtn}
-                        aria-pressed={dragMode === d}
-                        aria-label={
-                          d === "paint"
-                            ? "drag lays colour continuously"
-                            : "drag proposes a candidate; tap it to commit"
-                        }
-                        onClick={() => pickDragMode(d)}
-                      >
-                        {d}
-                      </button>
-                    ))}
-                  </div>
+                  <span className={styles.zoomStepper}>
+                    <button
+                      type="button"
+                      onClick={() => setZoomTo(zoom / 2)}
+                      disabled={zoom <= 1}
+                      title="zoom out — show more of the figure"
+                      aria-label="zoom out"
+                    >
+                      −
+                    </button>
+                    <button
+                      type="button"
+                      className={styles.zoomNow}
+                      onClick={() => setZoomTo(1)}
+                      disabled={zoom === 1}
+                      title="fit the whole figure"
+                      aria-label={`zoom ${zoom} times — click to fit the whole figure`}
+                    >
+                      {zoom}×
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setZoomTo(zoom * 2)}
+                      disabled={zoom >= ZOOM_MAX}
+                      title="zoom in — hold Space and drag to pan"
+                      aria-label="zoom in"
+                    >
+                      +
+                    </button>
+                  </span>
                 </div>
 
-              </div>
+                {/* MEMORY: two columns of two, and the column is the
+                    distinction. On the left, the two that CHANGE the drawing;
+                    on the right, the two that only look at it. They are one
+                    faculty — what this drawing has been — so they are one
+                    block, and the reviewer's `undo` over `redo` is the left
+                    half of it verbatim. */}
+                <div className={styles.deckMemory} role="group" aria-label="memory">
+                  <button
+                    type="button"
+                    className={styles.iconBtn}
+                    onClick={doUndo}
+                    disabled={history.past.length === 0 || previewing}
+                    title="undo the last gesture (⌘Z)"
+                    aria-label="undo the last gesture"
+                  >
+                    <ActionGlyph name="undo" />
+                  </button>
+                  <button
+                    type="button"
+                    className={`${styles.iconBtn} ${
+                      rewind?.kind === "replay" ? styles.rewindOn : ""
+                    }`}
+                    onClick={() =>
+                      rewind?.kind === "replay"
+                        ? closeRewind("replay closed — the drawing is exactly as it was")
+                        : openRewind("replay")
+                    }
+                    disabled={steps === 0}
+                    aria-pressed={rewind?.kind === "replay"}
+                    title="replay the drawing being made (P) — nothing is changed"
+                    aria-label={`replay the drawing, ${steps} gesture${
+                      steps === 1 ? "" : "s"
+                    } — a preview; nothing is changed`}
+                  >
+                    <ActionGlyph name="replay" />
+                  </button>
+                  <button
+                    type="button"
+                    className={styles.iconBtn}
+                    onClick={doRedo}
+                    disabled={history.future.length === 0 || previewing}
+                    title="redo the last undone gesture (⌘⇧Z)"
+                    aria-label="redo the last undone gesture"
+                  >
+                    <ActionGlyph name="redo" />
+                  </button>
+                  <button
+                    type="button"
+                    className={`${styles.iconBtn} ${
+                      rewind?.kind === "history" ? styles.rewindOn : ""
+                    }`}
+                    onClick={() =>
+                      rewind?.kind === "history"
+                        ? closeRewind("history closed — the drawing is exactly as it was")
+                        : openRewind("history")
+                    }
+                    disabled={steps === 0}
+                    aria-pressed={rewind?.kind === "history"}
+                    title="history — scrub this drawing's earlier states (M)"
+                    aria-label={`history — scrub the ${steps} earlier state${
+                      steps === 1 ? "" : "s"
+                    } of this drawing; a preview, nothing is changed`}
+                  >
+                    <ActionGlyph name="history" />
+                  </button>
+                </div>
 
-              <span className={styles.tools}>
-                <button
-                  type="button"
-                  onClick={doUndo}
-                  disabled={history.past.length === 0 || previewing}
-                  aria-label="undo the last gesture"
-                >
-                  undo
-                </button>
-                <button
-                  type="button"
-                  onClick={doRedo}
-                  disabled={history.future.length === 0 || previewing}
-                  aria-label="redo the last undone gesture"
-                >
-                  redo
-                </button>
-                {/* The two previews. They sit with undo and redo because they
-                    are the same faculty — the drawing's memory — and they are
-                    the only controls here that change nothing at all. */}
-                <button
-                  type="button"
-                  className={rewind?.kind === "replay" ? styles.rewindOn : undefined}
-                  onClick={() =>
-                    rewind?.kind === "replay"
-                      ? closeRewind("replay closed — the drawing is exactly as it was")
-                      : openRewind("replay")
-                  }
-                  disabled={steps === 0}
-                  aria-pressed={rewind?.kind === "replay"}
-                  aria-label={`replay the drawing, ${steps} gesture${
-                    steps === 1 ? "" : "s"
-                  } — a preview; nothing is changed`}
-                >
-                  replay
-                </button>
-                <button
-                  type="button"
-                  className={rewind?.kind === "history" ? styles.rewindOn : undefined}
-                  onClick={() =>
-                    rewind?.kind === "history"
-                      ? closeRewind("history closed — the drawing is exactly as it was")
-                      : openRewind("history")
-                  }
-                  disabled={steps === 0}
-                  aria-pressed={rewind?.kind === "history"}
-                  aria-label={`history — scrub the ${steps} earlier state${
-                    steps === 1 ? "" : "s"
-                  } of this drawing; a preview, nothing is changed`}
-                >
-                  history
-                </button>
-                {/* Zoom, so Space-to-pan has something to pan. Buttons rather
-                    than keys alone: a modifier nobody can reach without a
-                    keyboard is a feature half the users do not have. */}
-                <span className={styles.zoomGroup} role="group" aria-label="zoom">
+                {/* FILE: the artwork out, and the artwork in. Two rows of one,
+                    mirrored glyphs, one tray between them. */}
+                <div className={styles.deckFile}>
+                  <div className={styles.saveWrap} ref={saveWrap}>
+                    <button
+                      ref={saveBtn}
+                      type="button"
+                      className={`${styles.iconBtn} ${styles.saveBtn}`}
+                      onClick={() => setSaveWanted((o) => !o)}
+                      onKeyDown={onSaveKey}
+                      disabled={saveOff}
+                      aria-haspopup="menu"
+                      aria-expanded={saveOpen}
+                      aria-controls="save-menu"
+                      title="save the artwork — SVG or PNG"
+                      aria-label="save the artwork — choose SVG or PNG"
+                    >
+                      <ActionGlyph name="save" />
+                      <MenuCaret />
+                    </button>
+                    {saveOpen && (
+                      <div
+                        id="save-menu"
+                        ref={saveMenu}
+                        role="menu"
+                        aria-label="save format"
+                        className={styles.menu}
+                        onKeyDown={onMenuKey}
+                      >
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className={styles.menuItem}
+                          onClick={() => {
+                            closeSaveMenu();
+                            exportSvg();
+                          }}
+                        >
+                          <span className={styles.menuKey}>svg</span>
+                          <span className={styles.menuWhat}>
+                            vector — carries the plate back
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className={styles.menuItem}
+                          onClick={() => {
+                            closeSaveMenu();
+                            exportPng();
+                          }}
+                        >
+                          <span className={styles.menuKey}>png</span>
+                          <span className={styles.menuWhat}>
+                            raster — twice the plate&apos;s size
+                          </span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                  {/* Never disabled except under a preview: loading is
+                      otherwise the one action that is always available,
+                      including on an empty plate, which is the state a person
+                      who has just arrived with a file is in. */}
                   <button
                     type="button"
-                    onClick={() => setZoomTo(zoom / 2)}
-                    disabled={zoom <= 1}
-                    aria-label="zoom out"
+                    className={styles.iconBtn}
+                    onClick={openPicker}
+                    disabled={previewing}
+                    title="load an SVG onto the plate — or drop one on the canvas"
+                    aria-label="load an SVG drawing back onto the plate — or drop one on the canvas"
                   >
-                    −
+                    <ActionGlyph name="load" />
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => setZoomTo(1)}
-                    disabled={zoom === 1}
-                    aria-label={`zoom ${zoom} times — click to fit the whole figure`}
-                  >
-                    {zoom}×
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setZoomTo(zoom * 2)}
-                    disabled={zoom >= ZOOM_MAX}
-                    aria-label="zoom in"
-                  >
-                    +
-                  </button>
-                </span>
-                {/* Off while a preview stands: these write the LIVE plate, and
-                    a file that did not match the picture on screen would be the
-                    one export nobody could account for. */}
-                <button
-                  type="button"
-                  onClick={exportSvg}
-                  disabled={paint.size === 0 || previewing}
-                  aria-label="export the artwork as SVG"
-                >
-                  svg
-                </button>
-                <button
-                  type="button"
-                  onClick={exportPng}
-                  disabled={paint.size === 0 || previewing}
-                  aria-label="export the artwork as PNG"
-                >
-                  png
-                </button>
-                {/* Never disabled except under a preview: loading is otherwise
-                    the one action that is always available, including on an
-                    empty plate, which is the state a person who has just
-                    arrived with a file is in. */}
-                <button
-                  type="button"
-                  onClick={openPicker}
-                  disabled={previewing}
-                  aria-label="load an SVG drawing back onto the plate — or drop one on the canvas"
-                >
-                  load
-                </button>
+                </div>
+
                 <input
                   ref={fileInput}
                   type="file"
@@ -4011,42 +4441,59 @@ export default function DrawPage() {
                   tabIndex={-1}
                   aria-hidden="true"
                 />
-                <button
-                  type="button"
-                  onClick={() => (helpOpen ? closeHelp() : openHelp())}
-                  aria-expanded={helpOpen}
-                  aria-label="keyboard shortcuts"
-                >
-                  ?
-                </button>
-                {/* The one control that wipes, and the only one. Warm, apart
-                    from the neutral chrome, and it asks twice. */}
-                <button
-                  type="button"
-                  className={`${styles.newBtn} ${
-                    armed === "new" ? styles.armedBtn : ""
-                  }`}
-                  onClick={doNew}
-                  disabled={previewing}
-                  onBlur={() => {
-                    if (armed === "new") disarm();
-                  }}
-                  aria-label={
-                    armed === "new"
-                      ? "confirm — wipe the plate and the whole undo history"
-                      : "new plate — wipes everything, and asks first"
-                  }
-                >
-                  {armed === "new" ? "new — sure?" : "new"}
-                  {armed === "new" && (
-                    <span
-                      className={styles.armFuse}
-                      style={{ animationDuration: `${CONFIRM_MS}ms` }}
-                      aria-hidden="true"
-                    />
-                  )}
-                </button>
-              </span>
+
+                {/* The two that are not about this drawing at all: the one that
+                    explains the program, and the one that ends the drawing.
+                    Kept behind a rule and a wider gap, because a wipe adjacent
+                    to an export is a wipe somebody will hit reaching for it. */}
+                <div className={styles.deckMeta}>
+                  <button
+                    type="button"
+                    className={styles.helpBtn}
+                    onClick={() => (helpOpen ? closeHelp() : openHelp())}
+                    aria-expanded={helpOpen}
+                    title="keyboard shortcuts and what every glyph means (?)"
+                    aria-label="keyboard shortcuts"
+                  >
+                    ?
+                  </button>
+                  {/* The one control that wipes, and the only one. Warm, apart
+                      from the neutral chrome, and it asks twice — and it stays
+                      a WORD while everything beside it became a glyph, because
+                      the one button that cannot be misread is the one that
+                      empties the plate. */}
+                  <button
+                    type="button"
+                    className={`${styles.newBtn} ${
+                      armed === "new" ? styles.armedBtn : ""
+                    }`}
+                    onClick={doNew}
+                    disabled={previewing}
+                    onBlur={() => {
+                      if (armed === "new") disarm();
+                    }}
+                    title={
+                      armed === "new"
+                        ? "click again to wipe the plate"
+                        : "new plate — wipes everything, and asks first"
+                    }
+                    aria-label={
+                      armed === "new"
+                        ? "confirm — wipe the plate and the whole undo history"
+                        : "new plate — wipes everything, and asks first"
+                    }
+                  >
+                    {armed === "new" ? "sure?" : "new"}
+                    {armed === "new" && (
+                      <span
+                        className={styles.armFuse}
+                        style={{ animationDuration: `${CONFIRM_MS}ms` }}
+                        aria-hidden="true"
+                      />
+                    )}
+                  </button>
+                </div>
+              </div>
             </div>
 
             {/* The adjustment palette keeps a strip of its own, because it is
@@ -4586,6 +5033,23 @@ export default function DrawPage() {
                 </section>
               ))}
             </div>
+            {/* The strip, spelled out. An icon whose name is only in a tooltip
+                is a word that cannot be read on a touchscreen, so every glyph
+                in the plate rule is printed here beside what it does — and it
+                is the SAME component, so this cannot come to describe a strip
+                that no longer exists. */}
+            <section className={`${styles.helpGroup} ${styles.glyphSection}`}>
+              <h3 className={styles.helpGroupTitle}>the strip</h3>
+              <ul className={styles.glyphList}>
+                {GLYPH_LEGEND.map((g) => (
+                  <li key={g.what} className={styles.glyphRow}>
+                    <span className={styles.glyphCell}>{g.icon}</span>
+                    {g.what}
+                  </li>
+                ))}
+              </ul>
+            </section>
+
             <p className={styles.helpFoot}>
               The six ring keys are the six <b>same-orientation</b> lattice steps
               — one cell edge each, at 0°, 60°, 120°, 180°, 240° and 300°, and
