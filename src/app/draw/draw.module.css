@@ -6,12 +6,14 @@
    ============================================================ */
 
 .page {
+  /* The one token this page defines for itself; the rest come from
+     globals.css. There were five more here — --d-spine, --d-boundary and the
+     three --d-median-* — set at the top where a token block goes and read by
+     nothing in src/. The mirror families that once used them draw their own
+     colours in BrushDial.tsx and DrawBoard.tsx now. Two of the five were also
+     the only place this file spelled the amber out as a hex literal instead of
+     reaching for var(--warn), so that goes with them. */
   --d-rot: #a78bfa;
-  --d-spine: #67e8f9;
-  --d-boundary: #f59e0b;
-  --d-median-a: #67e8f9;
-  --d-median-b: #4ade80;
-  --d-median-c: #f59e0b;
 
   max-width: 1560px;
   margin: 0 auto;
@@ -254,6 +256,351 @@
   letter-spacing: 0.2em;
   text-transform: uppercase;
   color: var(--bone-faint);
+}
+
+/* ---------- the layers panel ---------- */
+
+/**
+ * The tree, one row a layer, TOP OF THE DRAWING FIRST.
+ *
+ * `--lay-row` and `--lay-step` are the whole geometry: the row height and the
+ * width of one nesting level. Every other number below is one of those two, so
+ * a deeper tree indents by exactly one step per level and nothing has to be
+ * kept in step by hand.
+ *
+ * A bordered list rather than a run of loose rows, because a layer stack is one
+ * object — the thing that occludes — and a panel of floating rows reads as a
+ * menu of unrelated switches.
+ */
+.layerList {
+  --lay-row: 26px;
+  --lay-step: 11px;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--rule-bright);
+  border-radius: 2px;
+  /* Sixteen rows is what `layers.flatten` measures as interactive at depth 5;
+     past that the panel scrolls rather than pushing the rail's other sections
+     off the bottom of a laptop screen. */
+  max-height: calc(var(--lay-row) * 12);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.layerRow {
+  display: flex;
+  align-items: stretch;
+  height: var(--lay-row);
+  border-bottom: 1px solid var(--rule);
+  position: relative;
+}
+
+.layerRow:last-child {
+  border-bottom: 0;
+}
+
+/**
+ * The selected row: a bone edge, not a fill.
+ *
+ * A filled row would fight the swatch strip two millimetres to its right, which
+ * is the one part of this panel that is allowed to be coloured. The edge reads
+ * at a glance, survives the dimming a hidden row gets, and leaves the ink
+ * strip the only saturated thing in the rail — the same rule the rest of the
+ * console holds to.
+ */
+.layerRowOn {
+  background: rgba(236, 230, 220, 0.055);
+}
+
+.layerRowOn::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 2px;
+  background: var(--bone);
+}
+
+/* EFFECTIVELY hidden — its own switch or an ancestor's. Dimmed rather than
+   struck through: the row is still selectable, still renameable, and its paint
+   is still there. */
+.layerRowOff .layerLabel,
+.layerRowOff .layerInk {
+  opacity: 0.42;
+}
+
+.layerEmpty {
+  padding: 10px 9px;
+  font-size: 10px;
+  line-height: 1.6;
+  color: var(--bone-faint);
+}
+
+.layerEmpty b {
+  color: var(--bone-dim);
+  font-weight: 500;
+}
+
+/**
+ * The indent guides: ONE HAIRLINE PER ANCESTOR LEVEL.
+ *
+ * Depth is COUNTED here and not measured. Three lines is three levels, at any
+ * width, on any screen, with no reference row to compare against — which is
+ * what makes arbitrary nesting legible in a panel 240px wide.
+ *
+ * A guide whose level has no sibling left below stops at the row's middle
+ * (`.layerGuideEnd`), so a subtree closes with a corner instead of a line that
+ * runs on into rows it has nothing to do with.
+ */
+.layerGuides {
+  display: flex;
+  flex: none;
+  position: relative;
+}
+
+.layerGuide {
+  width: var(--lay-step);
+  position: relative;
+}
+
+.layerGuide::before {
+  content: "";
+  position: absolute;
+  left: 5px;
+  top: 0;
+  bottom: 0;
+  border-left: 1px solid var(--rule-bright);
+}
+
+.layerGuideEnd::before {
+  bottom: 50%;
+}
+
+/* The elbow: the last guide turned into the row. Drawn on the guide strip
+   rather than on the label, so the label's box is the same at every depth. */
+.layerTick {
+  position: absolute;
+  right: 0;
+  top: 50%;
+  width: 6px;
+  border-top: 1px solid var(--rule-bright);
+}
+
+/**
+ * The layer's OWN colours, as a column of hairline bands.
+ *
+ * `layers.coloursOf` sorted and capped at six. It is the one place in this rail
+ * where the drawing's own hues appear, and it earns the space: at depth, a row
+ * that says what is on it is a row you do not have to solo to identify.
+ */
+.layerInk {
+  flex: none;
+  width: 5px;
+  margin: 3px 6px 3px 3px;
+  display: flex;
+  flex-direction: column;
+  border-radius: 1px;
+  overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+
+.layerInk > span {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+.layerInk[data-empty] {
+  box-shadow: inset 0 0 0 1px var(--rule);
+  background: repeating-linear-gradient(
+    -45deg,
+    transparent 0 2px,
+    var(--rule) 2px 3px
+  );
+}
+
+/* The row itself is the select control: a whole-width button, so the target is
+   the row and not the eight characters of the name. */
+.layerPick {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  padding: 0 6px 0 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--bone-dim);
+  text-align: left;
+}
+
+.layerPick:hover {
+  color: var(--bone);
+}
+
+.layerPick[aria-pressed="true"] {
+  color: var(--bone);
+}
+
+/**
+ * A layer's name is USER DATA, so it is set exactly as it was typed.
+ *
+ * The rail's chrome is small caps throughout and the cascade was reaching in
+ * here and shouting a person's own words back at them — `Sky` came out `SKY`,
+ * and the rename field showed one thing while the row showed another. Every
+ * other string in this rail is a label this program wrote; this is the one that
+ * is not, and it opts out.
+ */
+.layerLabel,
+.layerName {
+  text-transform: none;
+  letter-spacing: 0.01em;
+}
+
+.layerLabel {
+  font-size: 10.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.layerStat {
+  flex: none;
+  font-size: 8.5px;
+  letter-spacing: 0.06em;
+  color: var(--bone-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The rename field, sitting exactly where the label was so the row does not
+   move when it opens. */
+.layerName {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 3px 6px 3px 0;
+  padding: 0 5px;
+  font: inherit;
+  font-size: 10.5px;
+  color: var(--bone);
+  background: var(--ink);
+  border: 1px solid var(--rule-bright);
+  border-radius: 2px;
+}
+
+.layerActs {
+  flex: none;
+  display: flex;
+  align-items: stretch;
+}
+
+/**
+ * The four per-row controls: lock, show, copy, paste.
+ *
+ * Square on the row height, so the strip is exactly four rows wide at every
+ * depth and the eye reads a column rather than four ragged ends. The focus ring
+ * is inset for the same reason the segmented buttons' is — the list clips at
+ * its own border and an outside ring loses two of its four edges.
+ */
+.layerAct {
+  width: var(--lay-row);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 0;
+  border-left: 1px solid var(--rule);
+  border-radius: 0;
+  background: transparent;
+  color: var(--bone-faint);
+}
+
+.layerAct:hover:not(:disabled) {
+  color: var(--bone);
+  background: rgba(236, 230, 220, 0.06);
+}
+
+.layerAct[aria-pressed="true"] {
+  color: var(--bone);
+  background: rgba(236, 230, 220, 0.1);
+}
+
+.layerAct:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.layerAct:focus-visible,
+.layerBtn:focus-visible,
+.layerPick:focus-visible {
+  outline: 2px solid var(--bone);
+  outline-offset: -2px;
+}
+
+/* The two control strips under the list. Wrapping, so a narrow rail folds them
+   instead of clipping a control off the end. */
+.layerBar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+  margin-top: 7px;
+}
+
+.layerBtn {
+  width: 28px;
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--rule-bright);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--bone-dim);
+}
+
+.layerBtn:hover:not(:disabled) {
+  color: var(--bone);
+  border-color: var(--bone-faint);
+}
+
+.layerBtn:disabled {
+  opacity: 0.32;
+  cursor: not-allowed;
+}
+
+/* The seam inside a strip: what separates "the sheet" from "the document", and
+   the arrange pair from the pair that creates and destroys. */
+.layerGap {
+  width: 1px;
+  height: 16px;
+  margin: 0 4px;
+  background: var(--rule-bright);
+}
+
+.layerIcon {
+  width: 14px;
+  height: 14px;
+  flex: none;
+  display: block;
+}
+
+/* Touch: the rows and their controls grow with everything else on the page. */
+@media (pointer: coarse) {
+  .layerList {
+    --lay-row: 34px;
+  }
+
+  .layerBtn {
+    width: 36px;
+    height: 34px;
+  }
+
+  .layerIcon {
+    width: 16px;
+    height: 16px;
+  }
 }
 
 /* ---------- segmented controls ---------- */
@@ -1428,6 +1775,8 @@
 }
 
 .rewindAction {
+  position: relative;
+  overflow: hidden;
   flex: none;
   font-size: 9px;
   letter-spacing: 0.14em;
@@ -1439,6 +1788,25 @@
 .rewindAction:hover:not(:disabled) {
   border-color: var(--preview-accent);
   background: rgba(167, 139, 250, 0.12);
+}
+
+/**
+ * How far the GIF has got.
+ *
+ * A width driven from React rather than a CSS animation, and that is the point:
+ * `.armFuse` counts DOWN a known duration, which a keyframe can do on its own,
+ * and this one reports WORK, which nothing but the work itself knows about. A
+ * bar that animated smoothly to a guessed finish would be a lie a person could
+ * catch. The button also carries the per cent as text, because a progress bar
+ * with no number is not readable by a screen reader.
+ */
+.gifFuse {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--preview-accent);
+  transition: width 90ms linear;
 }
 
 /**
@@ -2062,6 +2430,138 @@
   margin-left: auto;
 }
 
+/**
+ * ONE ROW OF CONTROLS, on a screen wide enough to hold it. TWO everywhere else.
+ *
+ * Every group in the deck is built as a COLUMN OF TWO — drag's two modes, tool
+ * over shape, replay over history, save over load, help over new — and that is
+ * what makes the band 63px tall (`2r + 3`) at every width. Flattened, each of
+ * them lays its two cells side by side and the band is 46px: ONE control row of
+ * 30px, with the group keys lifted onto a caption line above it, exactly as
+ * `.zoomGroup` has always drawn its own. 17px of canvas back, and every group
+ * still labelled — no glyph in this deck is ever unlabelled, which is the rule
+ * that made the icons legal in the first place.
+ *
+ * ── WHAT WAS MEASURED, and where the brief was wrong ────────────────────
+ *
+ * The premise handed to this change was that the last round had freed enough
+ * width at 1512 to lay the deck out on one line. It has not, and the deck's
+ * width is not the window's:
+ *
+ *   THE DECK GETS WHAT THE RAIL LEAVES, and the rail relayouts twice — at
+ *   1040px and at 1480px, where `.railCol` splits into two columns. So the deck
+ *   is not monotone in the viewport. At 1479px it has 1039px; at 1480px it has
+ *   734px; at 1041px it has 629px and at 1040px it has 963px again.
+ *
+ *   KEYS INLINE DOES NOT FIT AT 1512. Laid out as one line with each group's
+ *   key beside its control, the deck needs 780px and has 766px. It fits at 1440
+ *   and at 1280 and fails at 1512 and at 1200 — a rule that switches on and off
+ *   as the window widens, which is no rule at all.
+ *
+ *   KEYS ABOVE NEEDS 625px, at every width where `--deck-row` is 30px. Measured
+ *   against what is available:
+ *
+ *              deck    needs   slack
+ *     1512 px   766      625     141
+ *     1480 px   734      625     109
+ *     1479 px  1039      625     414
+ *     1160 px   738      625     113
+ *     1120 px   702      625      77
+ *     1080 px   665      625      40
+ *     1041 px   629      625       4   ← the pinch
+ *     1040 px   963      625     338
+ *      701 px   648      625      23
+ *
+ * THE FLOOR IS 1080px, and it is the measured width at which the narrowest the
+ * deck ever gets clears the one-row form by 40px — one control's width of
+ * margin, which is what it takes to survive a scrollbar, a font that loads late
+ * or a key label a character longer. NOT 1024 and not 1200: the first is a
+ * round number that lands inside the 1041–1079 pinch, where the slack is under
+ * forty pixels and a hair's difference in metrics wraps the deck into two
+ * ragged lines; the second throws away 1080–1199, which has between 40 and 113
+ * pixels to spare.
+ *
+ * The band from 701px to 1040px would also hold one row, and it deliberately
+ * does not get one. A single ascending threshold is a rule a person can hold —
+ * wider is flatter — where one-row, then two-row, then one-row again as the
+ * window grows is an artefact of the rail's own breakpoints leaking into a
+ * control that has nothing to do with them.
+ *
+ * BELOW IT, NOTHING CHANGES. The two-row form is the default and it is what a
+ * phone keeps, so the mobile rules under this block are untouched and the 390px
+ * layout is exactly what it was.
+ */
+@media (min-width: 1080px) {
+  .deck {
+    /* The groups no longer have the same height — a keyed one carries its
+       caption and a keyless one does not — so they hang from the control line
+       rather than being centred on their own boxes. */
+    align-items: flex-end;
+    gap: 8px 14px;
+  }
+
+  /* DRAG: the two modes side by side, so the seams run down instead of across
+     — the stacked form's borders have to be undone in both directions or the
+     unit gets a seam it does not want on one edge and loses the one it does. */
+  .deckDrag {
+    display: grid;
+    grid-template-rows: auto var(--deck-row);
+    justify-items: start;
+    align-items: center;
+    gap: 3px;
+  }
+
+  .deckDrag .stackSeg {
+    grid-auto-flow: column;
+    grid-auto-rows: calc(var(--deck-row) - 2px);
+  }
+
+  .deckDrag .stackSeg .segBtn {
+    border-right: 1px solid var(--rule-bright);
+    border-bottom: 0;
+  }
+
+  .deckDrag .stackSeg .segBtn:last-child {
+    border-right: 0;
+  }
+
+  /* TOOL and SHAPE: side by side, each under its own key. Flowing down the
+     columns puts child 1 and 2 — the key and the control it names — in one
+     column, which is what makes this four elements in two labelled groups
+     rather than four elements in a row. */
+  .deckRows {
+    grid-auto-flow: column;
+    grid-template-columns: auto auto;
+    grid-template-rows: auto var(--deck-row);
+    align-items: center;
+    gap: 3px 7px;
+  }
+
+  /* ZOOM already reads key-over-control; it only has to stop reserving a whole
+     control row for the caption. */
+  .zoomGroup {
+    grid-template-rows: auto var(--deck-row);
+  }
+
+  .deckMemory,
+  .deckFile,
+  .deckMeta {
+    grid-auto-flow: column;
+    grid-auto-columns: auto;
+    gap: 0 3px;
+  }
+
+  /* The save button sets the FILE group's width when the pair is stacked; side
+     by side it must stop stretching its neighbour to match. */
+  .deckFile .iconBtn {
+    width: var(--deck-row);
+  }
+
+  .saveBtn {
+    width: auto;
+  }
+}
+
 /* Touch: the deck drops onto its own row anyway, so spend the space on targets
    a thumb can actually hit. */
 @media (max-width: 700px) {
@@ -2671,7 +3171,11 @@
   .marching,
   .commitBtn,
   .helpScrim,
-  .helpPanel {
+  .helpPanel,
+  /* The save menu was simply missed: it slides and fades in on open like the
+     help panel beside it, and unlike the two exemptions below it displays
+     nothing — it is decoration on an element that is already there. */
+  .menu {
     animation: none;
   }
   /* The fuse keeps its animation: it is not decoration, it is the only display
@@ -2685,4 +3189,24 @@
   .driftCell {
     transition: none;
   }
+}
+
+/**
+ * The INHERITED-state badge: the parent's own glyph, ghosted.
+ *
+ * One icon wide, so it never competes with the name for room, and it appears
+ * only on a row whose answer differs from its own switch — which is exactly the
+ * state that is otherwise invisible. The sentence that goes with it is on the
+ * row's tooltip and in its accessible name, in the layer model's own words.
+ */
+.layerFrom {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  opacity: 0.45;
+}
+
+.layerFrom svg {
+  width: 11px;
+  height: 11px;
 }

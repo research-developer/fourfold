@@ -39,18 +39,57 @@
  * other way round, one rule per cell, so the saving can be measured rather than
  * asserted — see `test/replay.test.ts`, which measures it.
  *
- * ── Why one `@keyframes` per stroke, and not one shared ─────────────────
+ * ── Why one `@keyframes` per stroke: MEASURED, not forced ───────────────
  *
- * A shared `@keyframes` plus a per-stroke `animation-delay` is the obvious
- * shape and it CANNOT loop. With `animation-iteration-count: infinite` the
- * delay applies to the first iteration only, so the second cycle plays every
- * group at once; with a finite count nothing ever resets. The window a stroke
- * is visible for — from its own reveal to the end of the cycle — has a
- * different LENGTH for every stroke, and a delay can only shift a window, not
- * resize it. So the reveal point lives in the keyframes, which makes it one
- * keyframes per stroke. That is still O(strokes) and not O(cells), which is the
- * whole of the requirement; the measurement in the test is against the per-cell
- * form of the same thing, written the same way.
+ * This section used to claim the per-stroke form was the only thing that works.
+ * THAT WAS FALSE, and a comment claiming impossibility when the thing is
+ * possible is worse than no comment, so here is what is actually true.
+ *
+ * AN O(1) FORM EXISTS AND WORKS. One `@property --t` registered as a number,
+ * one `@keyframes` driving it 0 → 1 across the cycle, one animation on the
+ * root, and each stroke carrying its own reveal point as `style="--k:0.37"`,
+ * with visibility from a comparison of `--t` against `--k`. It was BUILT and
+ * verified byte-for-byte against the per-stroke control in Chromium, Firefox
+ * and WebKit, across three cycles including both loop boundaries. It is not a
+ * sketch and it is not broken.
+ *
+ * IT WAS REJECTED ON MEASUREMENT. Registered custom properties animate on the
+ * main thread and every tick invalidates style for every element that reads
+ * them, so the work moves from "one keyframe list per stroke, resolved once"
+ * to "every cell restyled every frame":
+ *
+ *                            per-stroke keyframes      @property clock
+ *   200 gestures / 1600 cells   60.3 fps, 115 ms/3 s    59.7 fps,  530 ms/3 s
+ *   500 gestures / 6000 cells   60.2 fps, 227 ms/3 s    56.7 fps, 1070 ms/3 s
+ *
+ * That is 4.6× the style recalculation for a 9.4% saving in bytes, and it drops
+ * frames at depth-5 scale, which is exactly the size this program is built for.
+ * It also needs `@property` — Safari 16.4+, Firefox 128+ — where the current
+ * form works everywhere, and `syntax:"<number>"` written literally makes the
+ * SVG an XML parse error, so it has to be escaped or the file will not open at
+ * all. Cheaper bytes are not worth dropped frames and a narrower reader set.
+ *
+ * TWO THINGS REALLY ARE REFUTED, and they are the ones worth writing down
+ * because they are what a reader would reach for first:
+ *
+ *   SHARED KEYFRAMES PLUS `animation-delay` FAILS FROM CYCLE ONE. A per-stroke
+ *   delay applies only to the FIRST iteration, so with
+ *   `animation-iteration-count: infinite` the second cycle plays every group at
+ *   once. A delay shifts a window; it cannot resize one, and the window a
+ *   stroke is visible for — its own reveal to the end of the cycle — has a
+ *   different LENGTH for every stroke.
+ *
+ *   NESTED WRAPPERS FAIL GENERALLY, not just awkwardly. Nesting multiplies
+ *   opacities, so the set visible at time t must be a PRODUCT set; but the set
+ *   that must be visible is `{k : t_k ≤ t}`, a THRESHOLD set, and threshold
+ *   sets are not products. The two-bit counterexample is `{00, 01, 10}`: it is
+ *   a threshold set, and no product of per-bit factors yields it, because any
+ *   product containing 01 and 10 contains 11.
+ *
+ * So the per-stroke form is kept for its cost and its reach, not because it is
+ * the only thing that compiles. It is O(strokes) and not O(cells), which is the
+ * whole of the requirement; `grouping: "cell"` writes the per-cell form for
+ * real so the saving is measured rather than asserted.
  */
 
 import { encodeArt, type ArtPayload } from "./artfile";
@@ -368,6 +407,81 @@ export interface AnimationSpec {
   /** How long a group takes to come up. Short — it reads as a stroke landing. */
   fadeMs: number;
   grouping: AnimationGrouping;
+}
+
+// ── how long a step, a fade and a hold are ───────────────────────────────
+
+/**
+ * The longest a group takes to come up, and the longest the finished plate
+ * holds before the loop restarts.
+ *
+ * CEILINGS, not constants, and that is the fix to two real defects. Both used
+ * to be absolute numbers written into `page.tsx`, and both broke at the fast
+ * end of the step control:
+ *
+ *   FADE 90 ms EXCEEDED THE FASTEST STEP, which is 80 ms. On an 80 ms export
+ *   exactly one group was mid-fade at every instant, so the reveals overlapped
+ *   CONTINUOUSLY and the claim that the fade "stops a fast replay looking like a
+ *   strobe" was false there — it was a smear, which is the opposite complaint.
+ *   At 150 ms the fade was still 60% of the step.
+ *
+ *   THE HOLD WAS ABSOLUTE. Thirteen gestures at 80 ms draw for 1.04 s and then
+ *   held for 1.8 s: 63% of the loop was a still frame. A hundred gestures at
+ *   250 ms draw for 25 s and hold for the same 1.8 s: 7%. One number cannot
+ *   mean the same thing across a thirty-fold range of drawing lengths.
+ *
+ * See `animationTiming` for the rule and the numbers it produces.
+ */
+export const FADE_MS = 90;
+export const HOLD_MS = 1800;
+
+/**
+ * The shortest hold worth having.
+ *
+ * A hold exists so the last stroke is not on screen for one step — without it
+ * the loop reads as a flicker rather than as a drawing that was finished — so
+ * scaling it down with the drawing has to stop somewhere. Below about this a
+ * pause stops reading as a pause at all, and a five-gesture replay needs to
+ * rest on its finished state as much as a fifty-gesture one does.
+ */
+export const MIN_HOLD_MS = 400;
+
+export interface AnimationTiming {
+  readonly fadeMs: number;
+  readonly holdMs: number;
+}
+
+/**
+ * The fade and the hold for a replay of `steps` gestures at `stepMs` each.
+ *
+ * FADE = min(FADE_MS, stepMs / 3). A third is the largest share of a step that
+ * still reads as a stroke LANDING rather than as a dissolve, and it guarantees
+ * the thing the old constant could not: a group finishes coming up strictly
+ * before the next one starts, at every step length the control offers. The cap
+ * keeps the slow end exactly where it was — at 400 ms and above the fade is the
+ * same 90 ms it has always been.
+ *
+ *   80 ms step → 26 ms fade (was 90, i.e. longer than the step itself)
+ *   150        → 50          (was 90 — 60% of the step)
+ *   250        → 83
+ *   400 and up → 90, unchanged
+ *
+ * HOLD = min(HOLD_MS, max(MIN_HOLD_MS, drawing / 3)). A third of the drawing's
+ * own length keeps the still frame to about a quarter of the loop whatever the
+ * drawing is, the floor stops a very short replay flickering, and the cap
+ * leaves every long replay exactly as it was.
+ *
+ *   13 gestures @  80 ms → draw 1.04 s, hold 0.40 s — 28% of the loop, was 63%
+ *   50          @ 250    → draw 12.5 s, hold 1.8 s  — unchanged
+ *  100          @ 250    → draw 25 s,   hold 1.8 s  — unchanged
+ *
+ * Integers throughout: the percentages downstream are the only floats.
+ */
+export function animationTiming(stepMs: number, steps: number): AnimationTiming {
+  const fadeMs = Math.max(1, Math.min(FADE_MS, Math.floor(stepMs / 3)));
+  const draw = Math.max(0, steps) * Math.max(0, stepMs);
+  const holdMs = Math.min(HOLD_MS, Math.max(MIN_HOLD_MS, Math.round(draw / 3)));
+  return { fadeMs, holdMs };
 }
 
 /** Percentages are the one place a timing becomes a float. Three decimals. */

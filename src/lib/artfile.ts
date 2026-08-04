@@ -122,7 +122,127 @@ export interface ArtPayload {
    * switching view before saving would quietly destroy five sixths of a drawing.
    */
   view?: { sector: number };
+  /**
+   * The drawing as a STACK rather than as one flat colouring.
+   *
+   * `cells` says what the picture looks like; it cannot say that those colours
+   * came from four layers, one of them hidden, two of them nested inside a
+   * pasted composition. This field says it, and it is what makes "copy this
+   * layer" and "paste a composition onto a layer" round trips rather than
+   * flattenings.
+   *
+   * Optional and NOT versioned, on exactly the argument `relief`, `plate` and
+   * `view` already make: a reader that predates it treats its absence as "one
+   * layer, and `cells` is it", which is what every file written before this
+   * existed meant and what `cells` still says. Bumping would have made every one
+   * of those files unreadable to gain nothing.
+   *
+   * OMITTED entirely by `payloadFromPaint`, so every export this program made
+   * before layers existed still writes exactly the bytes it did. Only `emit.ts`
+   * writes it, and when it does, `cells` remains the flattened rendering of it
+   * so a reader that ignores this field still sees the drawing.
+   */
+  comp?: ArtComposition;
 }
+
+/**
+ * A layer, as the FILE states it.
+ *
+ * Every flag here is the layer's OWN, never the value it resolves to under its
+ * ancestors. A hidden parent hides its descendants when the stack is rendered,
+ * but each descendant keeps its own `hidden` — writing the resolved flag would
+ * mean that saving a composition with a hidden parent and loading it back
+ * permanently marked every child hidden, and no amount of un-hiding the parent
+ * would bring them back. The same argument applies to `locked` and `opacity`.
+ */
+export interface ArtLayer {
+  /** Unique within the composition, and an XML name — see `LAYER_ID`. */
+  id: string;
+  name?: string;
+  /** The layer's OWN visibility. Absent means visible. */
+  hidden?: boolean;
+  /** The layer's OWN lock. Absent means unlocked. */
+  locked?: boolean;
+  /** The layer's OWN alpha, `0…1`. Absent means 1. */
+  opacity?: number;
+  /** This layer's own paint: [cell index, `#rrggbb`], ascending. */
+  cells?: [number, string][];
+  /** Sub-layers, in paint order — later children sit over earlier ones. */
+  children?: ArtLayer[];
+  /** Animation: the step this layer is revealed at. See `emit.ts`. */
+  reveal?: number;
+  /** The brush symmetry the gesture was made under, when one was recorded. */
+  mode?: number;
+  /** How many cells the recorded orbit held, when this layer is one. */
+  orbit?: number;
+}
+
+export interface ArtAnimation {
+  /** Milliseconds between reveals. */
+  stepMs: number;
+  /** Milliseconds the finished plate holds before the loop restarts. */
+  holdMs: number;
+  /** How long a layer takes to come up. */
+  fadeMs: number;
+  /** How many reveal steps the cycle has. */
+  steps: number;
+}
+
+export interface ArtComposition {
+  /**
+   * The cell indices the picture FRAMES, as ascending ranges — `"0-1023"`, or
+   * `"0-5,12,40-63"`. Absent means every cell of the declared canvas.
+   *
+   * A range string rather than a list because the two real cases are one whole
+   * canvas and one whole sector, and both are a single range. It is validated
+   * as strictly as everything else here: ascending, non-overlapping, and inside
+   * the canvas it claims.
+   */
+  shown?: string;
+  anim?: ArtAnimation;
+  layers: ArtLayer[];
+}
+
+/**
+ * What a layer id may be.
+ *
+ * An XML name, because `emit.ts` writes it straight into `id="…"` and a reader
+ * should be able to match a `<g>` in the markup to an entry in the payload
+ * without a lookup table. Leading digits are excluded for the same reason: an
+ * id is a name, not a number.
+ */
+export const LAYER_ID = /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/;
+
+/**
+ * Ids `emit.ts` gives to FIXED elements of its own, which a layer may therefore
+ * not take. A payload naming one is rejected rather than silently renamed — a
+ * file that collides with the document's own furniture is not a file whose
+ * layer tree we should trust either.
+ *
+ * This list is NOT what keeps ids unique, and it must not be mistaken for it.
+ * It covers the two group ids that are literals in the emitter and the two
+ * prototype names it reaches for first; but `emit.prototypeId` also mints `u2`,
+ * `d2`, `p` and `ux`, `serialise` mints a root id and a title id, and none of
+ * those could ever be enumerated here without this list having to be extended
+ * every time that code learns a new name — which is exactly how a document
+ * came to be written with two `id="u2"` in it. Uniqueness is enforced where the
+ * ids are minted, by reading the ones the document actually holds. See
+ * `emit.prototypeId`. What remains here is a small closed set of literals,
+ * which cannot fall behind anything because nothing generates it.
+ */
+export const RESERVED_IDS: ReadonlySet<string> = new Set(["u", "d", "tiling", "paint"]);
+
+/**
+ * How deep a layer tree may nest, and how many layers it may hold in total.
+ *
+ * Not a limit of the idea — pasting a composition onto a layer nests by one
+ * each time, and nobody is going to do that thirty-two times. It is a limit on
+ * what an UNTRUSTED file may ask this program to walk: the validator below
+ * recurses, and a payload nested ten thousand deep is a stack overflow rather
+ * than a drawing. The node cap is the same argument for breadth.
+ */
+export const MAX_LAYER_DEPTH = 32;
+export const MAX_LAYERS = 8192;
 
 /**
  * The depths a plate may declare.
@@ -235,6 +355,7 @@ export function encodeArt(p: ArtPayload): string {
       relief: p.relief,
       plate: p.plate,
       view: p.view,
+      comp: p.comp,
     })
   );
   const line = `<!-- ${ART_MARKER}:${p.version} ${body} -->`;
@@ -336,6 +457,9 @@ function validate(version: number, raw: unknown): ArtPayload | null {
   const view = validateView(o.view, canvas);
   if (view === REJECT) return null;
 
+  const comp = validateComposition(o.comp, n);
+  if (comp === REJECT) return null;
+
   return {
     version,
     canvas,
@@ -345,6 +469,7 @@ function validate(version: number, raw: unknown): ArtPayload | null {
     ...(relief ?? {}),
     ...(plate ?? {}),
     ...(view ?? {}),
+    ...(comp ?? {}),
   };
 }
 
@@ -390,6 +515,199 @@ function validateView(
   const s = (raw as Record<string, unknown>).sector;
   if (typeof s !== "number" || !Number.isInteger(s) || s < 0 || s > 5) return REJECT;
   return { view: { sector: s } };
+}
+
+/**
+ * `undefined` for a file that says nothing about a layer stack — which is every
+ * file this program wrote before layers existed, and every export that is one
+ * flat colouring.
+ *
+ * Present and malformed is rejected outright, like every other field here, and
+ * the checks are the same ones `cells` gets plus the two the tree introduces:
+ * ids must be unique across the WHOLE tree, and the tree must be shallower than
+ * `MAX_LAYER_DEPTH` and smaller than `MAX_LAYERS`. Both of those are refusals
+ * rather than truncations: a file that nests ten thousand deep is not a
+ * composition to trim, it is an attempt to overflow the walk below.
+ */
+function validateComposition(
+  raw: unknown,
+  cellsInCanvas: number
+): { comp: ArtComposition } | undefined | typeof REJECT {
+  if (raw === undefined) return undefined;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return REJECT;
+  const c = raw as Record<string, unknown>;
+
+  let shown: string | undefined;
+  if (c.shown !== undefined) {
+    if (typeof c.shown !== "string") return REJECT;
+    if (parseRanges(c.shown, cellsInCanvas) === null) return REJECT;
+    shown = c.shown;
+  }
+
+  let anim: ArtAnimation | undefined;
+  if (c.anim !== undefined) {
+    if (typeof c.anim !== "object" || c.anim === null || Array.isArray(c.anim)) {
+      return REJECT;
+    }
+    const a = c.anim as Record<string, unknown>;
+    const ms = (v: unknown, lo: number): number | null =>
+      typeof v === "number" && Number.isInteger(v) && v >= lo && v <= 3_600_000
+        ? v
+        : null;
+    const stepMs = ms(a.stepMs, 1);
+    const holdMs = ms(a.holdMs, 0);
+    const fadeMs = ms(a.fadeMs, 0);
+    const steps = ms(a.steps, 0);
+    if (stepMs === null || holdMs === null || fadeMs === null || steps === null) {
+      return REJECT;
+    }
+    if (steps > MAX_LAYERS) return REJECT;
+    anim = { stepMs, holdMs, fadeMs, steps };
+  }
+
+  if (!Array.isArray(c.layers)) return REJECT;
+  const seen = new Set<string>();
+  const budget = { left: MAX_LAYERS };
+  const layers = validateLayers(c.layers, cellsInCanvas, seen, budget, 1);
+  if (layers === REJECT) return REJECT;
+
+  return {
+    comp: {
+      ...(shown === undefined ? {} : { shown }),
+      ...(anim === undefined ? {} : { anim }),
+      layers,
+    },
+  };
+}
+
+function validateLayers(
+  raw: readonly unknown[],
+  cellsInCanvas: number,
+  seen: Set<string>,
+  budget: { left: number },
+  depth: number
+): ArtLayer[] | typeof REJECT {
+  if (depth > MAX_LAYER_DEPTH) return REJECT;
+  const out: ArtLayer[] = [];
+  for (const entry of raw) {
+    if (budget.left-- <= 0) return REJECT;
+    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
+      return REJECT;
+    }
+    const l = entry as Record<string, unknown>;
+
+    if (typeof l.id !== "string" || !LAYER_ID.test(l.id)) return REJECT;
+    if (RESERVED_IDS.has(l.id)) return REJECT;
+    if (seen.has(l.id)) return REJECT;
+    seen.add(l.id);
+
+    const layer: ArtLayer = { id: l.id };
+
+    if (l.name !== undefined) {
+      if (typeof l.name !== "string" || l.name.length > 128) return REJECT;
+      layer.name = l.name;
+    }
+    for (const flag of ["hidden", "locked"] as const) {
+      const v = l[flag];
+      if (v === undefined) continue;
+      if (typeof v !== "boolean") return REJECT;
+      // Only `true` is written; `false` is the absent case, so a payload
+      // carrying it round trips to the same bytes either way.
+      if (v) layer[flag] = true;
+    }
+    if (l.opacity !== undefined) {
+      if (typeof l.opacity !== "number" || !(l.opacity >= 0 && l.opacity <= 1)) {
+        return REJECT;
+      }
+      layer.opacity = l.opacity;
+    }
+    for (const num of ["reveal", "mode", "orbit"] as const) {
+      const v = l[num];
+      if (v === undefined) continue;
+      if (typeof v !== "number" || !Number.isInteger(v) || v < 0 || v > MAX_LAYERS) {
+        return REJECT;
+      }
+      layer[num] = v;
+    }
+
+    if (l.cells !== undefined) {
+      if (!Array.isArray(l.cells)) return REJECT;
+      if (l.cells.length > cellsInCanvas) return REJECT;
+      const cells: [number, string][] = [];
+      const here = new Set<number>();
+      let last = -1;
+      for (const pair of l.cells) {
+        if (!Array.isArray(pair) || pair.length !== 2) return REJECT;
+        const i: unknown = pair[0];
+        const hex: unknown = pair[1];
+        if (typeof i !== "number" || !Number.isInteger(i) || i < 0 || i >= cellsInCanvas) {
+          return REJECT;
+        }
+        if (typeof hex !== "string" || !HEX6.test(hex)) return REJECT;
+        if (here.has(i)) return REJECT;
+        // Ascending is a promise the markup relies on: `emit.ts` pairs the k-th
+        // `<use>` of a layer with the k-th entry here, so an unordered list
+        // would silently colour the wrong triangles.
+        if (i <= last) return REJECT;
+        last = i;
+        here.add(i);
+        cells.push([i, hex]);
+      }
+      layer.cells = cells;
+    }
+
+    if (l.children !== undefined) {
+      if (!Array.isArray(l.children)) return REJECT;
+      const kids = validateLayers(l.children, cellsInCanvas, seen, budget, depth + 1);
+      if (kids === REJECT) return REJECT;
+      layer.children = kids;
+    }
+
+    out.push(layer);
+  }
+  return out;
+}
+
+/**
+ * `"0-5,12,40-63"` → the indices it names, ascending, or `null`.
+ *
+ * Strict: ascending, non-overlapping, inside `[0, limit)`, no empty parts, no
+ * whitespace. A range list is a statement about which cells the picture frames,
+ * and a sloppy one would frame cells the canvas does not have.
+ */
+export function parseRanges(text: string, limit: number): number[] | null {
+  if (text.length === 0) return [];
+  if (text.length > 1 << 16) return null;
+  const out: number[] = [];
+  let last = -1;
+  for (const part of text.split(",")) {
+    const m = /^(\d{1,7})(?:-(\d{1,7}))?$/.exec(part);
+    if (m === null) return null;
+    const lo = Number(m[1]);
+    const hi = m[2] === undefined ? lo : Number(m[2]);
+    if (hi < lo || lo <= last || hi >= limit) return null;
+    if (out.length + (hi - lo + 1) > limit) return null;
+    for (let i = lo; i <= hi; i++) out.push(i);
+    last = hi;
+  }
+  return out;
+}
+
+/** The inverse: ascending indices → the shortest range string naming them. */
+export function formatRanges(indices: readonly number[]): string {
+  const parts: string[] = [];
+  let k = 0;
+  while (k < indices.length) {
+    const lo = indices[k];
+    let hi = lo;
+    while (k + 1 < indices.length && indices[k + 1] === hi + 1) {
+      k++;
+      hi = indices[k];
+    }
+    parts.push(lo === hi ? String(lo) : `${lo}-${hi}`);
+    k++;
+  }
+  return parts.join(",");
 }
 
 /**
@@ -626,7 +944,15 @@ const shapeKey = (verts: readonly (readonly [number, number])[]): string =>
 const POLYGON = /<polygon\b([^>]*)>/gi;
 
 /**
- * One attribute out of a tag's attribute text.
+ * One attribute out of a tag's attribute text. THE one — `emit.ts` imports it.
+ *
+ * There used to be two of these, one here and a near-identical one in
+ * `emit.ts`, and they had already drifted: this one accepted `x='1'` and that
+ * one did not, so a file that had been through a toolchain which prefers single
+ * quotes read as geometry to the geometric importer and as nothing at all to
+ * the layer reader. Two readers of the same bytes that disagree about what an
+ * attribute is are a bug waiting for a file to find it, so there is now one
+ * function and both readers call it.
  *
  * The leading `[^-\w]` alternative is doing real work: a plain `\b` would let
  * `fill` match inside `data-fill` and, worse, inside `stroke-fill`-shaped names
@@ -636,7 +962,7 @@ const POLYGON = /<polygon\b([^>]*)>/gi;
 const ATTR = (name: string) =>
   new RegExp(`(?:^|[^-\\w])${name}\\s*=\\s*("([^"]*)"|'([^']*)')`, "i");
 
-const attrOf = (attrs: string, name: string): string | null => {
+export const attrOf = (attrs: string, name: string): string | null => {
   const m = ATTR(name).exec(attrs);
   if (m === null) return null;
   return m[2] ?? m[3] ?? null;

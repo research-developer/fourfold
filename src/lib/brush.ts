@@ -53,6 +53,27 @@
  * operations and checks the two stacks stay the same height, including across
  * the `HISTORY_LIMIT` trim, which is the one place a naive implementation
  * silently loses a rung.
+ *
+ * ── THAT INVARIANT IS NO LONGER MAINTAINED BY HAND ──────────────────────
+ *
+ * The paragraph above describes a contract that four call sites had to
+ * remember, and one of them did not: CLEAR went through the same `run` as every
+ * structural control and pushed a journal rung with no event rung, so the next
+ * undo popped a rung belonging to a different gesture and every later
+ * progression stroke was the wrong hue.
+ *
+ * The count now rides IN the journal rung — `layers.Act.events` — and
+ * `composer.eventsOf` projects an `EventLog` out of it. The two stacks are one
+ * stack: pushed together, trimmed together, moved together, because there is
+ * only one thing to move.
+ *
+ * So `EventLog`, `eventCount` and `progressionIndex` are still live and still
+ * the vocabulary; but `EMPTY_EVENTS`, `pushEvents`, `undoEvents` and
+ * `redoEvents` are the OLD second-stack mutators and nothing in the app calls
+ * them any more. They are kept because they are a tested statement of what the
+ * log's algebra is — the trim behaviour in particular is asserted here and
+ * relied on by the journal — but a new caller reaching for them is almost
+ * certainly re-creating the bug. Put the count in the act.
  */
 
 import { adjustCells, type Adjustment } from "./adjust";

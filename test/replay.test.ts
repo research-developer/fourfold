@@ -3,11 +3,15 @@ import {
   animatedSvg,
   animationCensus,
   animationSteps,
+  animationTiming,
   changedCells,
   clampIndex,
   everyState,
+  FADE_MS,
   historyBase,
+  HOLD_MS,
   markLookup,
+  MIN_HOLD_MS,
   revertTo,
   stateAt,
   type AnimationSpec,
@@ -389,6 +393,133 @@ function specFor(d: Drawn, grouping: "orbit" | "cell"): AnimationSpec {
     grouping,
   };
 }
+
+// ── the fade and the hold ────────────────────────────────────────────────
+
+/**
+ * THE TIMINGS ARE MEASURED AGAINST THE FILE, not against the constants.
+ *
+ * Two defects at the fast end of the step control, both from absolute numbers:
+ *
+ *   A 90 ms FADE IS LONGER THAN THE FASTEST 80 ms STEP, so on an 80 ms export
+ *   exactly one group was mid-fade at every instant — the reveals overlapped
+ *   continuously and the fade read as a smear rather than as strokes landing.
+ *   At 150 ms it was still 60% of the step.
+ *
+ *   A 1.8 s HOLD IS 63% OF A THIRTEEN-GESTURE LOOP AT 80 ms and 7% of a
+ *   hundred-gesture loop at 250 ms. One number cannot mean the same thing
+ *   across that range.
+ *
+ * The overlap test below reads the emitted `@keyframes` and checks the windows
+ * directly, so it measures what the browser will actually do rather than what
+ * the constants say.
+ */
+describe("the fade never outruns the step", () => {
+  /** Every stroke's [dark-until, lit-from] pair, in ms, read off the CSS. */
+  const windows = (svg: string, cycle: number): [number, number][] => {
+    const out: [number, number][] = [];
+    const re = /@keyframes s\d+\{([^{]*)\{opacity:0\}([\d.]+)%,100%\{opacity:1\}\}/g;
+    for (const m of svg.matchAll(re)) {
+      const dark = m[1].split(",").pop() ?? "0%";
+      const on = (Number.parseFloat(dark) / 100) * cycle;
+      const lit = (Number.parseFloat(m[2]) / 100) * cycle;
+      out.push([on, lit]);
+    }
+    return out;
+  };
+
+  const overlaps = (w: readonly [number, number][]): number => {
+    let n = 0;
+    for (let k = 1; k < w.length; k++) if (w[k][0] < w[k - 1][1]) n += 1;
+    return n;
+  };
+
+  it("has no two reveals in flight at once, at every step the control offers", () => {
+    const d = draw(3, spread(3, 8));
+    for (const stepMs of [80, 150, 250, 400, 700, 1200]) {
+      const steps = animationSteps(
+        everyState(d.plate, d.history.past).map((p) => resolved(d, p)),
+        d.history.past,
+        d.book,
+        "#201c19"
+      );
+      const { fadeMs, holdMs } = animationTiming(stepMs, steps.length);
+      const svg = animatedSvg({ ...specFor(d, "orbit"), stepMs, fadeMs, holdMs });
+      const cycle = steps.length * stepMs + holdMs;
+      const w = windows(svg, cycle);
+      expect(w.length).toBe(steps.length);
+      expect(overlaps(w)).toBe(0);
+      // A group is fully up before the next one begins.
+      expect(fadeMs).toBeLessThanOrEqual(stepMs);
+    }
+  });
+
+  /**
+   * The defect, still measurable — this is what the old absolute 90 ms did on
+   * the fastest step, and it is why the rule is a ceiling and not a constant.
+   */
+  it("the old absolute fade overlapped EVERY reveal at 80 ms", () => {
+    const d = draw(3, spread(3, 8));
+    const steps = animationSteps(
+      everyState(d.plate, d.history.past).map((p) => resolved(d, p)),
+      d.history.past,
+      d.book,
+      "#201c19"
+    );
+    const cycle = steps.length * 80 + 1800;
+    const bad = animatedSvg({
+      ...specFor(d, "orbit"),
+      stepMs: 80,
+      fadeMs: FADE_MS,
+      holdMs: HOLD_MS,
+    });
+    // Every reveal after the first is still fading when the next one starts.
+    expect(overlaps(windows(bad, cycle))).toBe(steps.length - 1);
+  });
+
+  it("caps the fade at the old constant, so nothing slow moved", () => {
+    for (const stepMs of [400, 700, 1200]) {
+      expect(animationTiming(stepMs, 20).fadeMs).toBe(FADE_MS);
+    }
+    expect(animationTiming(80, 20).fadeMs).toBe(26);
+    expect(animationTiming(150, 20).fadeMs).toBe(50);
+    expect(animationTiming(250, 20).fadeMs).toBe(83);
+  });
+});
+
+describe("the hold is a share of the drawing, not an absolute", () => {
+  const share = (stepMs: number, steps: number): number => {
+    const { holdMs } = animationTiming(stepMs, steps);
+    return holdMs / (steps * stepMs + holdMs);
+  };
+
+  it("no longer spends most of a short fast loop on a still frame", () => {
+    // 13 gestures at 80 ms: 1.04 s of drawing. The old absolute hold was 1.8 s
+    // — 63% of the cycle. Measured here as the share it is now.
+    const old = 1800 / (13 * 80 + 1800);
+    expect(old).toBeGreaterThan(0.6);
+    expect(share(80, 13)).toBeLessThan(0.35);
+    expect(animationTiming(80, 13).holdMs).toBe(MIN_HOLD_MS);
+  });
+
+  it("leaves a long replay exactly where it was", () => {
+    expect(animationTiming(250, 50).holdMs).toBe(HOLD_MS);
+    expect(animationTiming(250, 100).holdMs).toBe(HOLD_MS);
+    expect(animationTiming(1200, 20).holdMs).toBe(HOLD_MS);
+  });
+
+  it("never lets the still frame dominate, at any length the control offers", () => {
+    for (const stepMs of [80, 150, 250, 400, 700, 1200]) {
+      for (const steps of [5, 13, 25, 50, 100, 200]) {
+        expect(share(stepMs, steps)).toBeLessThanOrEqual(0.5);
+      }
+    }
+  });
+
+  it("still rests long enough to read as finished on a tiny replay", () => {
+    expect(animationTiming(80, 1).holdMs).toBeGreaterThanOrEqual(MIN_HOLD_MS);
+  });
+});
 
 describe("animatedSvg", () => {
   const d = draw(3, spread(3, 8));

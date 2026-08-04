@@ -32,14 +32,13 @@ import {
 } from "@/lib/artfile";
 import {
   addressBook,
-  applyPlateEdits,
   planPlateEdits,
   plateEntries,
   plateFromArtPayload,
   plateIntoSector,
   resolvePlate,
   type Address,
-  type AddressPlate,
+  type AddressBook,
   type PlateEdit,
 } from "@/lib/plate";
 import {
@@ -63,17 +62,12 @@ import {
   brushSpan,
   brushStamp,
   defaultDragMode,
-  EMPTY_EVENTS,
   eventCount,
   progressionIndex,
-  pushEvents,
-  redoEvents,
   stampColours,
   TOOLS,
-  undoEvents,
   upcomingBases,
   type DragMode,
-  type EventLog,
   type Tool,
 } from "@/lib/brush";
 import { buildFigure, type Convention } from "@/lib/figure";
@@ -124,11 +118,56 @@ import {
   animatedSvg,
   animationCensus,
   animationSteps,
-  everyState,
-  revertTo,
-  stateAt,
+  animationTiming,
   type AnimationStep,
 } from "@/lib/replay";
+import { gifSteps } from "@/lib/gif";
+import {
+  act as journalAct,
+  addLayer,
+  arrange as arrangeLayer,
+  census,
+  clearLayer,
+  demote,
+  effectiveOf,
+  emptyComposition,
+  find as findLayer,
+  flatten as flattenComposition,
+  fromPlate,
+  graft,
+  layerId,
+  newSession,
+  paintInto,
+  paintTarget,
+  pasteInto,
+  promote,
+  redo as redoSession,
+  removeLayer,
+  renameLayer,
+  select as selectLayer,
+  soleLayer,
+  switchesOf,
+  toggleLocked,
+  toggleVisible,
+  undo as undoSession,
+  type Composition,
+  type Layer,
+  type LayerId,
+  type Outcome,
+  type Session,
+  type Switches,
+} from "@/lib/layers";
+import {
+  actStrokes,
+  clampAct,
+  emitLayersOf,
+  eventsOf,
+  everyComposition,
+  revertMoves,
+  stackFromEmit,
+  stepComposition,
+} from "@/lib/composer";
+import { parse as parseEmit, serialise as serialiseEmit } from "@/lib/emit";
 import {
   SCHEMES,
   SCHEME_NAMES,
@@ -146,17 +185,13 @@ import {
 import type { ArtOverlayGroup } from "@/lib/strokes";
 import {
   artworkSvg,
-  commit,
-  EMPTY_HISTORY,
   exportName,
   mergeEdits,
-  redo,
-  undo,
-  type History,
   type StrokeMark,
 } from "@/lib/strokes";
 import BrushDial from "./BrushDial";
 import ColourWell from "./ColourWell";
+import LayersPanel from "./LayersPanel";
 import SectorDial, { SectorGlyph } from "./SectorDial";
 import styles from "./draw.module.css";
 
@@ -317,6 +352,18 @@ const DRIFT_AHEAD = 6;
  */
 const CONFIRM_MS = 4000;
 
+/**
+ * How many files one IMPORT will take.
+ *
+ * A bound rather than a policy: the picker is `multiple` because a person with
+ * four layers in four files should not have to press it four times, and a
+ * directory dropped by accident should not graft two thousand sub-layers into
+ * the drawing before anyone can press undo. Sixteen is the number `layers.ts`
+ * measures as interactive at depth 5 — see `flatten` — so this is the same
+ * number the composite is budgeted against rather than a second opinion.
+ */
+const MAX_IMPORT = 16;
+
 /** Zoom stops. Powers of two, so the plate lands on the same pixels each time. */
 const ZOOM_MAX = 8;
 
@@ -343,13 +390,31 @@ const STEP_MS_DEFAULT = 250;
  * How long the finished plate holds before the exported animation loops, and
  * how long a gesture takes to come up.
  *
- * The hold is not decoration: without it the last stroke is on screen for one
- * step and the loop reads as a flicker rather than as a drawing that was
- * finished. The fade is short enough to read as a stroke LANDING rather than as
- * a dissolve, and it is what stops a fast replay looking like a strobe.
+ * BOTH ARE DERIVED from the step length and the number of gestures rather than
+ * fixed here, because a fixed 90 ms fade is longer than the fastest 80 ms step
+ * — every reveal overlapping the next — and a fixed 1.8 s hold is 63% of a
+ * thirteen-gesture loop at 80 ms and 7% of a hundred-gesture loop at 250 ms.
+ * `replay.animationTiming` owns the rule, and the SVG and the GIF both read it,
+ * so the two exports cannot disagree about how long anything lasts.
  */
-const HOLD_MS = 1800;
-const FADE_MS = 90;
+
+/**
+ * The widths a GIF may be written at, and why the plate's own is not among them.
+ *
+ * The hexagon canvas is 1048 pixels across. A GIF is uncompressed pixels behind
+ * an LZW stream, so the file goes as the AREA: the same drawing measured here
+ * is 21 kB at 320 and 96 kB at 1024, and a 256-gesture plate is 98 kB against
+ * 388 kB. So the size is a real choice rather than a detail, and it is offered
+ * rather than decided.
+ *
+ * 512 is the default because it is the size at which a depth-4 cell is still
+ * several pixels across — the seam that shows the tiling survives, which is the
+ * thing that stops the plate reading as a flat block. Below 320 a depth-5 cell
+ * is under a pixel and the drawing becomes its own thumbnail; the export still
+ * works and says so, and nobody should have to find that out by trying.
+ */
+const GIF_WIDTHS: readonly number[] = [320, 512, 768, 1024] as const;
+const GIF_WIDTH_DEFAULT = 512;
 
 /** Past this many gestures the scrub ticks stop being a scale and become a fill. */
 const TICK_LIMIT = 64;
@@ -388,9 +453,19 @@ function TransportGlyph({ playing }: { playing: boolean }) {
  */
 interface Rewind {
   kind: "replay" | "history";
-  /** Committed gestures applied. 0 is the state the history began from. */
+  /** Committed acts applied. 0 is the state the journal began from. */
   index: number;
-  plate: AddressPlate;
+  /**
+   * The whole COMPOSITION at that state, not a plate.
+   *
+   * It was an `AddressPlate` while the drawing was one, and it has to be a tree
+   * now for the reason `layers.ts` gives for never merging plates: a preview
+   * built by flattening first would show a lower layer's fine detail punching
+   * through an upper layer's wash. Reconstructed by `composer.stepComposition`,
+   * which is exact in both directions, and flattened for the board exactly
+   * where the live composition is.
+   */
+  comp: Composition;
   playing: boolean;
 }
 
@@ -754,8 +829,19 @@ export default function DrawPage() {
    * `hexagon` draws all six sectors as the model builds them. `sector` draws one,
    * turned apex-up, which is the triangle this program used to hold as a separate
    * canvas. Switching between them is a change of frame and touches nothing.
+   *
+   * OPENS ON THE HEXAGON. It opened on a sector, which was the frame the program
+   * had when the sector was a separate canvas, and it stopped being the right
+   * default the moment the hexagon became the model: a person arriving at a
+   * drawing program should be looking at the whole of what they can draw on, and
+   * the sector view is a way of getting closer to part of it. Nothing downstream
+   * assumed the sector — every reader of this state is a two-branch conditional,
+   * and the two that could have been trouble are safe by construction: the brush
+   * scope is forced to `sector` only WHILE a sector is framed (`effScope`), and
+   * mode 12 is D₆'s, which the hexagon has and `pickView` clips on the way INTO
+   * a sector rather than out of it.
    */
-  const [viewMode, setViewMode] = useState<"hexagon" | "sector">("sector");
+  const [viewMode, setViewMode] = useState<"hexagon" | "sector">("hexagon");
   /**
    * Which sector is framed, and — in hexagon view — which one a SECTOR-scoped
    * brush is pointed at. One number for both, because they are the same question
@@ -798,15 +884,40 @@ export default function DrawPage() {
   const [candidate, setCandidate] = useState<number | null>(null);
 
   /**
-   * The drawing, keyed by ADDRESS and held at every depth it was painted at.
+   * The drawing: a TREE of address plates, and the journal of what was done to
+   * it.
    *
-   * This is the whole of the drawing's state. The index-keyed map the board
-   * renders is derived from it below and is never stored, because an index only
-   * means something next to the depth that issued it. See `plate.ts`.
+   * This is the whole of the drawing's state, and it replaced two pieces of it —
+   * a single `AddressPlate` and a `History<Address>` beside it. There is ONE
+   * journal now, `layers.ts`'s, and it holds paint, adds, deletes, reorders,
+   * promotions, pastes and renames as rungs of the same stack, so ⌘Z walks back
+   * through whatever was actually done in whatever order it happened. Two
+   * stacks would have meant a person pressing undo and having to know which of
+   * them they were addressing.
+   *
+   * The index-keyed map the board renders is derived from this below and is
+   * never stored, because an index only means something next to the depth that
+   * issued it. See `plate.ts`, and `layers.ts` for why each layer is resolved on
+   * its own rather than the plates being merged.
    */
-  const [plate, setPlate] = useState<AddressPlate>(new Map());
-  const [history, setHistory] = useState<History<Address>>(EMPTY_HISTORY);
-  const [events, setEvents] = useState<EventLog>(EMPTY_EVENTS);
+  const [session, setSession] = useState<Session>(() =>
+    newSession(emptyComposition())
+  );
+  const comp = session.composition;
+  const past = session.journal.past;
+  /**
+   * The colouring-event log, DERIVED from the journal rather than kept beside
+   * it.
+   *
+   * It used to be a second `useState` that four call sites pushed to, and the
+   * one that forgot — CLEAR, which goes through `run` like every other
+   * structural control — added a journal rung with no event rung, so a later
+   * undo popped a rung belonging to another gesture and every subsequent
+   * progression stroke was the wrong hue. `Act.events` now carries the count,
+   * so the two stacks are one stack and cannot be pushed apart. See
+   * `layers.Act`.
+   */
+  const events = useMemo(() => eventsOf(session.journal), [session.journal]);
   const [hover, setHover] = useState<number | null>(null);
   const [cursor, setCursor] = useState<number | null>(null);
   const [showGuides, setShowGuides] = useState(true);
@@ -852,6 +963,16 @@ export default function DrawPage() {
    */
   const [rewind, setRewind] = useState<Rewind | null>(null);
   const [stepMs, setStepMs] = useState(STEP_MS_DEFAULT);
+  const [gifWidth, setGifWidth] = useState(GIF_WIDTH_DEFAULT);
+  /**
+   * Is a GIF being written, and how far in?
+   *
+   * Two pieces of state rather than one nullable number, because "not running"
+   * and "running, nothing done yet" are different things to a button: the
+   * second must already be disabled.
+   */
+  const [gifBusy, setGifBusy] = useState(false);
+  const [gifAt, setGifAt] = useState(0);
 
   const [helpOpen, setHelpOpen] = useState(false);
   const helpClose = useRef<HTMLButtonElement>(null);
@@ -910,8 +1031,41 @@ export default function DrawPage() {
    */
   const dragDepth = useRef(0);
 
-  const plateRef = useRef<AddressPlate>(new Map());
+  /**
+   * The live composition, as the pointer sees it.
+   *
+   * A ref for exactly the reason the plate used to be one: a drag applies the
+   * brush several times between two renders, and each application has to plan
+   * against what the last one left rather than against the composition React
+   * last rendered. Every write below sets this FIRST and then hands the same
+   * value to `setSession`, so the ref is the authority mid-gesture and state is
+   * the authority everywhere else — and the effect under it puts the two back in
+   * step after anything that changes the session from outside a drag.
+   */
+  const compRef = useRef<Composition>(session.composition);
+  useEffect(() => {
+    compRef.current = session.composition;
+  }, [session]);
   const pending = useRef<PlateEdit[]>([]);
+  /**
+   * The layer the gesture in progress is landing in.
+   *
+   * Recorded at the first application and used at the commit, so a gesture that
+   * began on one layer finishes on it — clicking a panel row mid-drag cannot
+   * split one stroke across two sheets. An ID and not a `layers.Target`,
+   * deliberately: a `Target` is proof that the brush may write there NOW, and
+   * `paintAt` re-earns that on every application; this is only the name the
+   * finished gesture is journalled under.
+   */
+  const paintingInto = useRef<LayerId | null>(null);
+  /**
+   * Whether this gesture has already said why it is refusing.
+   *
+   * A drag over a locked layer applies the brush sixty times a second and every
+   * one of them refuses; without this the live region would repeat one sentence
+   * until the pointer came up, which is how a screen reader is made useless.
+   */
+  const refusedRef = useRef(false);
   /**
    * Colouring events spent by the gesture in progress.
    *
@@ -1006,16 +1160,26 @@ export default function DrawPage() {
   }, [hex, plateView, surface, bands, lattice, baseLattice]);
 
   /**
-   * The canvas's addresses, and the plate resolved onto them.
+   * The canvas's addresses, and the composition composited onto them.
    *
-   * `plate` is the state; `paint` is a VIEW of it at the depth on screen, which
-   * is what the board draws, what the ghost is computed against and what the
-   * export writes. Deriving it rather than storing it is the whole reason a
+   * `session` is the state; `paint` is a VIEW of it at the depth on screen,
+   * which is what the board draws, what the ghost is computed against and what
+   * the export writes. Deriving it rather than storing it is the whole reason a
    * depth change no longer clears the drawing: there is nothing indexed by the
-   * old numbering to throw away. `resolvePlate` is memoised on plate identity,
-   * so this costs one lookup on a re-render that changed neither.
+   * old numbering to throw away. `layers.flatten` is memoised on the STACK's
+   * identity, so a re-render that changed neither the tree nor the depth costs
+   * one lookup — and selecting a row, which shares the stack, costs nothing at
+   * all.
    */
   const book = useMemo(() => addressBook(hex), [hex]);
+  /**
+   * The tree, counted rather than asserted — see `layers.census`.
+   *
+   * Read by the layers panel's meta line, by the NEW confirm and by the guard
+   * that turns the exports off on an empty document, so all three agree about
+   * what "empty" means without any of them counting for itself.
+   */
+  const docCensus = useMemo(() => census(comp), [comp]);
   /**
    * Standing at a state the drawing is no longer in.
    *
@@ -1039,8 +1203,8 @@ export default function DrawPage() {
    * whatever book is on screen.
    */
   const paint = useMemo(
-    () => resolvePlate(rewind === null ? plate : rewind.plate, book),
-    [plate, rewind, book]
+    () => flattenComposition(rewind === null ? comp : rewind.comp, book),
+    [comp, rewind, book]
   );
 
   /**
@@ -1453,17 +1617,17 @@ export default function DrawPage() {
    * only cut finer or coarser, and every stroke in the history still names the
    * addresses it named. See `pickDepth`.
    */
-  const reset = useCallback((next: AddressPlate, why: string) => {
-    plateRef.current = next;
+  const reset = useCallback((next: Composition, why: string) => {
+    compRef.current = next;
     pending.current = [];
     pendingEvents.current = 0;
     pendingGroups.current = [];
-    // A preview is a window onto a history that is about to stop existing.
+    // A preview is a window onto a journal that is about to stop existing.
     setRewind(null);
     setLiveEvents(0);
-    setPlate(plateRef.current);
-    setHistory(EMPTY_HISTORY);
-    setEvents(EMPTY_EVENTS);
+    // The event log is the journal, and `newSession` empties it — so there is
+    // no second stack here to remember to clear.
+    setSession(newSession(next));
     setProgOrigin(0);
     setHover(null);
     setCursor(null);
@@ -1475,7 +1639,7 @@ export default function DrawPage() {
     (why: string) => {
       // A cleared plate is a new drawing, and a drawing made here is `apex`.
       setConvention(CONVENTION);
-      reset(new Map(), why);
+      reset(emptyComposition(), why);
     },
     [reset]
   );
@@ -1536,9 +1700,11 @@ export default function DrawPage() {
       arm(
         "new",
         `NEW is armed — click it again to wipe ${
-          plateRef.current.size
+          docCensus.addresses
         } painted address${
-          plateRef.current.size === 1 ? "" : "es"
+          docCensus.addresses === 1 ? "" : "es"
+        } across ${docCensus.total} layer${
+          docCensus.total === 1 ? "" : "s"
         } and the whole undo history, or press Escape`
       );
       return;
@@ -1698,12 +1864,12 @@ export default function DrawPage() {
       setCandidate(null);
       setShapeDrag(null);
       setAnnounce(
-        `depth ${d}, ${cellCount("hexagon", d)} cells — plate carried across, ${
-          plateRef.current.size
-        } address${plateRef.current.size === 1 ? "" : "es"} held`
+        `depth ${d}, ${cellCount("hexagon", d)} cells — every layer carried across, ${
+          docCensus.addresses
+        } address${docCensus.addresses === 1 ? "" : "es"} held`
       );
     },
-    [depth]
+    [depth, docCensus]
   );
 
   const pickIsolation = (next: Isolation) => {
@@ -1719,11 +1885,36 @@ export default function DrawPage() {
 
   // ── painting ────────────────────────────────────────────────────────────
 
+  /**
+   * The layer this gesture lands in, or the sentence saying why it will not.
+   *
+   * `paintTarget` refuses LOUDLY on a locked or hidden target and names the
+   * layer in the refusal — and it tells "L2 is locked" apart from "L2 is inside
+   * a locked layer", which is the difference between a switch you can see on the
+   * row in front of you and one you have to go and find. The page says exactly
+   * what it is handed rather than composing a sentence of its own, so the panel
+   * and the brush cannot drift apart about what is going on.
+   */
   const paintAt = useCallback(
     (i: number) => {
       // A preview is not a canvas. Gated here as well as at the board's
       // handlers, because the keyboard reaches this function by three routes.
       if (previewing) return;
+      const target = paintTarget(compRef.current);
+      if (!target.ok) {
+        // Once per gesture, not once per application: a drag over a locked
+        // layer would otherwise repeat the same sentence sixty times a second.
+        if (!refusedRef.current) {
+          refusedRef.current = true;
+          setAnnounce(target.said);
+        }
+        return;
+      }
+      // The CHECKED target, re-asked on every application — a layer can be
+      // locked or hidden from the panel while the pointer is down. `paintInto`
+      // takes this rather than a bare id, so painting somewhere the brush may
+      // not is not expressible; see `layers.Target`.
+      const into = target.value;
       const stamp = clipStamp(
         brushStamp(canvas.surface, canvas.bands, i, shape),
         keepCell
@@ -1732,18 +1923,24 @@ export default function DrawPage() {
       // Recomputed per application rather than taken from `effectiveBase`, so a
       // drag lays a gradient along its own path instead of one flat colour.
       const n = progressionIndex(events, progOrigin, pendingEvents.current);
-      // The colours are decided against the plate AS SHOWN — the adjustment
-      // brush transforms the colour a cell is displaying, including one it is
-      // displaying because an ancestor holds it. Memoised on plate identity, so
-      // this is a lookup on every application after the first.
-      const view = resolvePlate(plateRef.current, book);
+      // The colours are decided against the drawing AS SHOWN — the adjustment
+      // brush transforms the colour a cell is DISPLAYING, which under a stack
+      // is the composite and not the target layer's own paint. Memoised on the
+      // stack's identity, so this is a lookup on every application after the
+      // first.
+      const view = flattenComposition(compRef.current, book);
       const colours = stampColours(
         { tool, scheme, base: prog.at(base, n), adjust },
         view,
         stamp
       );
+      // Planned against the TARGET LAYER'S OWN plate, though, and not against
+      // the composite: an edit carries the colour it replaced, so planning
+      // against the picture would record a neighbouring layer's colour as this
+      // layer's `from` and undo would write it into the wrong sheet.
+      const own = target.value.layer.plate;
       const edits = planPlateEdits(
-        plateRef.current,
+        own,
         book,
         stamp.cells.map((c) => book.addr[c]),
         colours
@@ -1761,9 +1958,12 @@ export default function DrawPage() {
         if (g.length === 0) continue;
         pendingGroups.current.push(g.map((c) => book.addr[c]));
       }
-      plateRef.current = applyPlateEdits(plateRef.current, edits, "do");
+      // The gesture belongs to the layer it STARTED on, and `endStroke`
+      // journals against that id rather than against wherever it ended.
+      paintingInto.current = into.layer.id;
+      compRef.current = paintInto(compRef.current, into, edits);
       pending.current = mergeEdits(pending.current, edits);
-      setPlate(plateRef.current);
+      setSession((s) => ({ ...s, composition: compRef.current }));
     },
     [
       previewing,
@@ -1786,11 +1986,19 @@ export default function DrawPage() {
       const edits = pending.current;
       const used = pendingEvents.current;
       const groups = pendingGroups.current;
+      const into = paintingInto.current;
+      const refused = refusedRef.current;
       pending.current = [];
       pendingEvents.current = 0;
       pendingGroups.current = [];
+      paintingInto.current = null;
+      refusedRef.current = false;
       setLiveEvents(0);
-      if (edits.length === 0) {
+      // The refusal has already been said, in the layer model's own words. A
+      // second sentence here would either repeat it or, worse, contradict it
+      // with "nothing changed" — which is true and useless.
+      if (refused && edits.length === 0) return;
+      if (edits.length === 0 || into === null) {
         // Not silence. A gesture that changed nothing is the most confusing
         // thing an adjustment brush can do, and the reason is always the same
         // one worth teaching: there was no colour under it to transform.
@@ -1803,68 +2011,96 @@ export default function DrawPage() {
       }
       const mark: StrokeMark<Address> | undefined =
         groups.length === 0 ? undefined : { mode, groups };
-      setHistory((h) => commit(h, mark === undefined ? { edits } : { edits, mark }));
-      // Pushed together with the stroke and never apart from it: the two stacks
-      // being the same height is what makes the progression index recoverable.
-      setEvents((e) => pushEvents(e, used));
+      const stroke = mark === undefined ? { edits } : { edits, mark };
+      const name = findLayer(compRef.current, into)?.name ?? "the layer";
+      // The edits are ALREADY applied — `paintAt` wrote them into the ref as the
+      // pointer moved, each one through a freshly checked `layers.Target` — so
+      // this journals the same move rather than applying anything again. The
+      // gesture belongs to the layer it STARTED on, and that is `into`.
+      // The events ride IN the rung, so they cannot be pushed apart from the
+      // stroke — that is what makes the progression index recoverable, and it
+      // is now a property of the type rather than of this line. See `layers.Act`.
+      setSession((s) =>
+        journalAct(
+          { ...s, composition: compRef.current },
+          [{ kind: "paint", layer: into, stroke }],
+          `painted ${edits.length} cells on ${name}`,
+          used
+        )
+      );
       const verb =
         tool === "erase" ? "erased" : tool === "adjust" ? adjustName : "painted";
       setAnnounce(
         `${how === "commit" ? "committed — " : ""}${verb} ${edits.length} cell${
           edits.length === 1 ? "" : "s"
-        } with the ${mode}-fold brush${band === null ? "" : `, band ${band}`}${
-          isolation === null ? "" : `, arm ${isolation}`
-        } — ${resolvePlate(plateRef.current, book).size} on the plate`
+        } on ${name} with the ${mode}-fold brush${
+          band === null ? "" : `, band ${band}`
+        }${isolation === null ? "" : `, arm ${isolation}`} — ${
+          flattenComposition(compRef.current, book).size
+        } on the plate`
       );
     },
     [tool, adjustName, mode, band, isolation, book]
   );
 
-  const applyStroke = useCallback(
-    (edits: readonly PlateEdit[], direction: "do" | "undo", said: string) => {
-      plateRef.current = applyPlateEdits(plateRef.current, edits, direction);
-      setPlate(plateRef.current);
-      setAnnounce(
-        `${said} — ${resolvePlate(plateRef.current, book).size} cells on the plate`
-      );
-    },
-    [book]
-  );
-
+  /**
+   * ONE undo, over paint and over the shape of the tree alike.
+   *
+   * `layers.undo` walks the journal that `endStroke`, the panel and the presets
+   * all push to, so ⌘Z takes back whatever was actually done last — a stroke, a
+   * new layer, a reorder, a paste — in the order it happened. The alternative,
+   * a paint stack beside a layer stack, would have made the same keystroke mean
+   * two things depending on which the person had in mind.
+   *
+   * The EVENT LOG only moves for an act that painted. It shadows the journal so
+   * the progression index is recoverable, and a reorder spends no colour, so
+   * popping it for a structural act would slide every future stroke's hue.
+   */
   const doUndo = useCallback(() => {
     if (previewing) {
       setAnnounce("a preview is standing — close it before undoing");
       return;
     }
-    const step = undo(history);
-    if (step.stroke === null) {
+    const step = undoSession(session);
+    if (step.act === null) {
       setAnnounce("nothing to undo");
       return;
     }
-    setHistory(step.history);
-    setEvents(undoEvents(events));
-    applyStroke(step.stroke.edits, "undo", `undid ${step.stroke.edits.length} cells`);
-  }, [previewing, history, events, applyStroke]);
+    compRef.current = step.session.composition;
+    setSession(step.session);
+    // Nothing to do for the event log: it IS the journal, so it moved with it.
+    // This used to be a guarded `setEvents(undoEvents(events))`, and the guard
+    // was the bug — an act nobody counted popped somebody else's rung.
+    setAnnounce(
+      `undid ${step.act.note} — ${
+        flattenComposition(step.session.composition, book).size
+      } cells on the plate`
+    );
+  }, [previewing, session, book]);
 
   const doRedo = useCallback(() => {
     if (previewing) {
       setAnnounce("a preview is standing — close it before redoing");
       return;
     }
-    const step = redo(history);
-    if (step.stroke === null) {
+    const step = redoSession(session);
+    if (step.act === null) {
       setAnnounce("nothing to redo");
       return;
     }
-    setHistory(step.history);
-    setEvents(redoEvents(events));
-    applyStroke(step.stroke.edits, "do", `redid ${step.stroke.edits.length} cells`);
-  }, [previewing, history, events, applyStroke]);
+    compRef.current = step.session.composition;
+    setSession(step.session);
+    setAnnounce(
+      `redid ${step.act.note} — ${
+        flattenComposition(step.session.composition, book).size
+      } cells on the plate`
+    );
+  }, [previewing, session, book]);
 
   // ── the past, previewed ─────────────────────────────────────────────────
 
-  /** How many gestures the history holds. The scrub's upper stop. */
-  const steps = history.past.length;
+  /** How many acts the journal holds. The scrub's upper stop. */
+  const steps = past.length;
 
   /**
    * Open a preview, or move an open one to the other instrument.
@@ -1894,7 +2130,7 @@ export default function DrawPage() {
       setRewind({
         kind,
         index,
-        plate: stateAt(plateRef.current, history.past, steps, index),
+        comp: stepComposition(compRef.current, past, steps, index),
         playing: kind === "replay",
       });
       setAnnounce(
@@ -1903,7 +2139,7 @@ export default function DrawPage() {
           : `history — ${steps} gesture${steps === 1 ? "" : "s"}; drag the scrub to preview an earlier state. Nothing is changed until REVERT`
       );
     },
-    [steps, history, disarm, stepMs]
+    [steps, past, disarm, stepMs]
   );
 
   const closeRewind = useCallback((why: string) => {
@@ -1924,7 +2160,7 @@ export default function DrawPage() {
         if (r === null) return r;
         const n = Math.min(Math.max(0, Math.round(to)), steps);
         if (n === r.index) return r;
-        return { ...r, index: n, plate: stateAt(r.plate, history.past, r.index, n) };
+        return { ...r, index: n, comp: stepComposition(r.comp, past, r.index, n) };
       });
       if (say) {
         const n = Math.min(Math.max(0, Math.round(to)), steps);
@@ -1937,7 +2173,7 @@ export default function DrawPage() {
         );
       }
     },
-    [steps, history]
+    [steps, past]
   );
 
   const togglePlay = useCallback(() => {
@@ -1949,13 +2185,13 @@ export default function DrawPage() {
         return {
           ...r,
           index: 0,
-          plate: stateAt(r.plate, history.past, r.index, 0),
+          comp: stepComposition(r.comp, past, r.index, 0),
           playing: true,
         };
       }
       return { ...r, playing: !r.playing };
     });
-  }, [steps, history]);
+  }, [steps, past]);
 
   /**
    * The clock.
@@ -1976,7 +2212,7 @@ export default function DrawPage() {
       setRewind({
         ...rewind,
         index: n,
-        plate: stateAt(rewind.plate, history.past, rewind.index, n),
+        comp: stepComposition(rewind.comp, past, rewind.index, n),
         playing: n < steps,
       });
       if (n >= steps) {
@@ -1988,16 +2224,29 @@ export default function DrawPage() {
       }
     }, stepMs);
     return () => window.clearTimeout(id);
-  }, [rewind, steps, history, stepMs]);
+  }, [rewind, steps, past, stepMs]);
 
   /**
    * What reverting to the previewed state would cost, computed against the LIVE
-   * plate so the number in the button is the number the button will do.
+   * journal so the number in the button is the number the button will do.
+   *
+   * The moves are the inverses of every act between, latest first — see
+   * `composer.revertMoves` for why a symmetric difference of two plates is not
+   * available once the drawing is a tree.
    */
-  const revert = useMemo(
-    () => (rewind === null ? null : revertTo(plate, history, rewind.index)),
-    [rewind, history, plate]
-  );
+  const revert = useMemo(() => {
+    if (rewind === null) return null;
+    const moves = revertMoves(past, steps, rewind.index);
+    if (moves.length === 0) return null;
+    let changed = 0;
+    for (const m of moves) if (m.kind === "paint") changed += m.stroke.edits.length;
+    return {
+      moves,
+      rolledBack: steps - clampAct(rewind.index, steps),
+      discardedRedo: session.journal.future.length,
+      changed,
+    };
+  }, [rewind, past, steps, session]);
 
   /**
    * REVERT: one more gesture, not a truncation.
@@ -2032,13 +2281,12 @@ export default function DrawPage() {
     }
     disarm();
     const at = rewind.index;
-    plateRef.current = applyPlateEdits(plateRef.current, revert.stroke.edits, "do");
-    setPlate(plateRef.current);
-    setHistory((h) => commit(h, revert.stroke));
-    setEvents((e) => pushEvents(e, 0));
+    const next = journalAct(session, revert.moves, `reverted to state ${at}`);
+    compRef.current = next.composition;
+    setSession(next);
     setRewind(null);
     setAnnounce(
-      `reverted to state ${at} — ${revert.rolledBack} gesture${
+      `reverted to state ${at} — ${revert.rolledBack} act${
         revert.rolledBack === 1 ? "" : "s"
       } rolled back over ${revert.changed} cell${
         revert.changed === 1 ? "" : "s"
@@ -2076,8 +2324,16 @@ export default function DrawPage() {
        */
       mark?: StrokeMark<Address>
     ) => {
+      // The same refusal the brush gets, said in the same words: a preset is a
+      // gesture and it lands in the selected layer like any other.
+      const target = paintTarget(compRef.current);
+      if (!target.ok) {
+        setAnnounce(target.said);
+        return;
+      }
+      const into = target.value.layer;
       const edits = planPlateEdits(
-        plateRef.current,
+        into.plate,
         book,
         cells.map((c) => book.addr[c]),
         colours
@@ -2086,14 +2342,110 @@ export default function DrawPage() {
         setAnnounce(nothing);
         return;
       }
-      plateRef.current = applyPlateEdits(plateRef.current, edits, "do");
-      setPlate(plateRef.current);
-      setHistory((h) => commit(h, mark === undefined ? { edits } : { edits, mark }));
-      setEvents((e) => pushEvents(e, spent));
+      const stroke = mark === undefined ? { edits } : { edits, mark };
+      // `journalAct` APPLIES as well as records, and the effect on `compRef`
+      // puts the ref back in step on the next render — so there is exactly one
+      // place the composition is written and no chance of the two disagreeing.
+      setSession((s) =>
+        journalAct(
+          { ...s, composition: compRef.current },
+          [{ kind: "paint", layer: into.id, stroke }],
+          said(edits.length),
+          spent
+        )
+      );
       setAnnounce(said(edits.length));
     },
     [book]
   );
+
+  // ── the layers panel ────────────────────────────────────────────────────
+
+  /**
+   * An operation that may decline, applied or said.
+   *
+   * Every structural control funnels through here, so a refusal is surfaced in
+   * the layer model's OWN words — "L2 is locked" and "L2 is inside a locked
+   * layer" are different sentences and the difference is the whole point of
+   * them. The page never composes its own version of a refusal it was handed.
+   */
+  const run = useCallback((out: Outcome<Session>, said?: string) => {
+    if (!out.ok) {
+      setAnnounce(out.said);
+      return;
+    }
+    compRef.current = out.value.composition;
+    setSession(out.value);
+    const note = out.value.journal.past[out.value.journal.past.length - 1]?.note;
+    setAnnounce(said ?? note ?? "done");
+  }, []);
+
+  /** A control that always succeeds. `addLayer` is the only one. */
+  const runSession = useCallback((next: Session, said: string) => {
+    compRef.current = next.composition;
+    setSession(next);
+    setAnnounce(said);
+  }, []);
+
+  /**
+   * SELECT, VISIBLE and LOCKED are not journalled, and that is `layers.ts`'s
+   * decision rather than this page's: toggling a switch destroys nothing, its
+   * inverse is the same button, and the button is on screen showing its own
+   * state. Undo exists for work you cannot trivially put back.
+   *
+   * They take and return a `Composition` rather than a `Session` for exactly
+   * that reason — the signature says which kind of operation it is — so these
+   * three keep the journal untouched by construction.
+   */
+  const pickLayer = useCallback((id: LayerId | null) => {
+    setSession((s) => ({ ...s, composition: selectLayer(s.composition, id) }));
+  }, []);
+
+  /**
+   * The switch is flipped against `compRef`, and the sentence is composed
+   * OUTSIDE the state updater.
+   *
+   * It was inside one, and that is a real defect rather than a style point: an
+   * updater must be pure, React is free to call it twice, and it is not
+   * guaranteed to run before the next line — so the live region announced the
+   * PREVIOUS action, one press behind, for the whole of a session. Caught by
+   * driving the page rather than by reading it.
+   */
+  const flipVisible = useCallback((id: LayerId) => {
+    const composition = toggleVisible(compRef.current, id);
+    compRef.current = composition;
+    const l = findLayer(composition, id);
+    const eff = l === null ? null : effectiveOf(composition, id);
+    const own = switchesOf(composition, id);
+    setAnnounce(
+      l === null
+        ? "that layer is not in the drawing"
+        : `${l.name} ${own.visible ? "shown" : "hidden"}${
+            eff !== null && own.visible && !eff.shown
+              ? " — still not on the plate, because it is inside a hidden layer"
+              : ""
+          }`
+    );
+    setSession((s) => ({ ...s, composition }));
+  }, []);
+
+  const flipLocked = useCallback((id: LayerId) => {
+    const composition = toggleLocked(compRef.current, id);
+    compRef.current = composition;
+    const l = findLayer(composition, id);
+    const eff = l === null ? null : effectiveOf(composition, id);
+    const own = switchesOf(composition, id);
+    setAnnounce(
+      l === null
+        ? "that layer is not in the drawing"
+        : `${l.name} ${own.locked ? "locked" : "unlocked"}${
+            eff !== null && !own.locked && !eff.editable
+              ? " — still not editable, because it is inside a locked layer"
+              : ""
+          }`
+    );
+    setSession((s) => ({ ...s, composition }));
+  }, []);
 
   /**
    * The anchored figure, committed.
@@ -2111,7 +2463,7 @@ export default function DrawPage() {
       return;
     }
     const n = progressionIndex(events, progOrigin, 0);
-    const shown = resolvePlate(plateRef.current, book);
+    const shown = flattenComposition(compRef.current, book);
     const colours = stampColours(
       { tool, scheme, base: prog.at(base, n), adjust },
       shown,
@@ -2669,10 +3021,9 @@ export default function DrawPage() {
         // started while one stands.
         if (rewind !== null) {
           closeRewind(
-            `${rewind.kind} closed — the drawing is exactly as it was, ${resolvePlate(
-              plateRef.current,
-              book
-            ).size} cells on the plate`
+            `${rewind.kind} closed — the drawing is exactly as it was, ${
+              flattenComposition(compRef.current, book).size
+            } cells on the plate`
           );
           return;
         }
@@ -2985,7 +3336,108 @@ export default function DrawPage() {
     return { baked, cells, overlay };
   }, [canvas, reliefSurface, reliefOn, reading]);
 
+  /**
+   * The payload's ADDRESS statement, which only a one-layer document may make.
+   *
+   * `payloadFromPaint`'s `plate` field says the drawing at every depth it was
+   * painted at, and a reader that predates layers PREFERS it to the flattened
+   * cell list. One layer can say it exactly. A stack cannot: the union of the
+   * plates is precisely the merge `layers.ts` refuses — a lower layer's fine
+   * detail would punch back through an upper layer's wash on the next load — so
+   * a stack says nothing here and the legacy reader falls back to `cells`, which
+   * is the true composite at the exported depth. Less, and true, rather than
+   * more and wrong.
+   */
+  const legacyAddresses = useMemo(() => {
+    const sole = soleLayer(comp);
+    return sole === null ? undefined : plateEntries(sole.plate, book);
+  }, [comp, book]);
+
+  const fileTitle = useCallback(
+    (relief: boolean) =>
+      `FOURFOLD — ${
+        canvas.view.mode === "sector" ? `sector ${canvas.view.sector}` : "hexagon"
+      }, depth ${depth}, ${mode}-fold brush, ${schemeName}${
+        band === null ? "" : `, band ${band}`
+      }${relief ? `, ${reading} relief` : ""}`,
+    [canvas, depth, mode, schemeName, band, reading]
+  );
+
+  /**
+   * THE DOCUMENT, with its layers intact — what `emit.ts` writes and reads.
+   *
+   * ONE of these, and it is what the layers panel COPIES, PASTES, EXPORTS and
+   * IMPORTS, scoped by a parameter for a single row. Two builders would have
+   * been two chances for a copied layer and a saved layer to disagree about
+   * what a layer is; see the header of `emit.ts`, which makes the same argument
+   * about its own `serialise`.
+   *
+   * The payload still carries the FLATTENED picture as `cells`, so a reader that
+   * predates layers sees the drawing rather than nothing, and `emit.serialise`
+   * adds the layer tree beside it.
+   */
+  const emitDoc = useCallback(() => {
+    const { baked, cells, overlay } = bakedFrame();
+    const geom = new Map(cells.map((c, i) => [i, c] as const));
+    const shown =
+      canvas.view.mode === "sector"
+        ? canvas.shown
+        : Array.from({ length: cells.length }, (_, i) => i);
+    const picture = flattenComposition(comp, book);
+    return {
+      width: canvas.geom.width,
+      height: canvas.geom.height,
+      cells: geom,
+      shown,
+      background: PLATE_BG,
+      unpainted: showTiling ? TILE : null,
+      tileSeam: SEAM,
+      paintSeam: PAINT_SEAM,
+      weldPaint: weld,
+      seamWidth: canvas.geom.seamWidth,
+      title: fileTitle(baked !== null),
+      layers: emitLayersOf(comp, book),
+      overlay,
+      animation: null,
+      payload: payloadFromPaint(
+        "hexagon",
+        depth,
+        convention,
+        picture,
+        baked === null ? undefined : { on: true, reading },
+        legacyAddresses,
+        canvas.view.mode === "sector" ? { sector: canvas.view.sector } : undefined
+      ),
+    };
+  }, [
+    bakedFrame,
+    canvas,
+    comp,
+    book,
+    showTiling,
+    weld,
+    depth,
+    convention,
+    reading,
+    fileTitle,
+    legacyAddresses,
+  ]);
+
+  /**
+   * The still, saved.
+   *
+   * TWO WRITERS, and which one runs is decided by `layers.soleLayer` rather than
+   * by a preference. A document that has not grown a stack is a single childless
+   * layer, and for it this writes the bytes it has ALWAYS written — same
+   * function, same payload, byte for byte — so every file this program has ever
+   * produced and every test that reads one is untouched. A document that HAS
+   * grown a stack cannot be said by that format at all, so it goes through
+   * `emit.serialise`, which states the layers and carries the flattened picture
+   * beside them for a reader that predates them.
+   */
   const svgText = useCallback(() => {
+    const sole = soleLayer(comp);
+    if (sole === null) return serialiseEmit(emitDoc());
     const { baked, cells, overlay } = bakedFrame();
     return artworkSvg({
       width: canvas.geom.width,
@@ -2999,30 +3451,26 @@ export default function DrawPage() {
       // The polygons are the plate AS SHOWN, at this depth; the payload below
       // carries the addresses so a load gets back the depths this view cannot
       // draw. A viewer that only looks at the picture sees exactly the screen.
-      paint: resolvePlate(plateRef.current, book),
+      paint: resolvePlate(sole.plate, book),
       background: PLATE_BG,
       unpainted: showTiling ? TILE : null,
       tileSeam: SEAM,
       paintSeam: PAINT_SEAM,
       weldPaint: weld,
       seamWidth: canvas.geom.seamWidth,
-      title: `FOURFOLD — ${
-        canvas.view.mode === "sector" ? `sector ${canvas.view.sector}` : "hexagon"
-      }, depth ${depth}, ${mode}-fold brush, ${schemeName}${
-        band === null ? "" : `, band ${band}`
-      }${baked === null ? "" : `, ${reading} relief`}`,
+      title: fileTitle(baked !== null),
       // What makes the file loadable: the plate stated as cells rather than
       // inferred from shapes. See `artfile.ts`.
       payload: payloadFromPaint(
         "hexagon",
         depth,
         convention,
-        resolvePlate(plateRef.current, book),
+        resolvePlate(sole.plate, book),
         baked === null ? undefined : { on: true, reading },
         // `undefined` — so the field is omitted and the bytes are unchanged —
         // whenever every painted address is at the exported depth, which is
         // every drawing that never left the depth it was started at.
-        plateEntries(plateRef.current, book),
+        plateEntries(sole.plate, book),
         // Likewise omitted in hexagon view, which is the whole plate and needs
         // nothing said about it.
         canvas.view.mode === "sector" ? { sector: canvas.view.sector } : undefined
@@ -3030,6 +3478,8 @@ export default function DrawPage() {
       overlay,
     });
   }, [
+    comp,
+    emitDoc,
     bakedFrame,
     canvas,
     book,
@@ -3037,18 +3487,259 @@ export default function DrawPage() {
     weld,
     depth,
     convention,
-    mode,
-    schemeName,
-    band,
     reading,
+    fileTitle,
   ]);
+
+  /**
+   * COPY AND EXPORT ARE ONE OPERATION. So are PASTE AND IMPORT.
+   *
+   * `emit.serialise` takes the scope as a PARAMETER, so "the whole document" and
+   * "this row and everything under it" are the same call with a different
+   * argument — and the clipboard and the file are the same call with a different
+   * destination. There is exactly one producer below and exactly one consumer,
+   * and the transports are four lines each at the bottom of this section. Two
+   * serialisation paths would have been two chances for a pasted layer and a
+   * saved layer to disagree about what a layer is; see the header of `emit.ts`,
+   * which makes the argument this code is the other half of.
+   */
+  const svgOfScope = useCallback(
+    (layer?: LayerId) =>
+      serialiseEmit(emitDoc(), layer === undefined ? undefined : { layer }),
+    [emitDoc]
+  );
+
+  /**
+   * Text back into ONE layer, ready to be grafted.
+   *
+   * A document with several top-level layers becomes ONE node holding them all —
+   * `layers.graft`, which is what makes "paste a composition onto a layer" mean
+   * what the panel says it means: what lands is a single child whose own
+   * children are that document's layers, intact to any depth. A document that
+   * IS one layer arrives as that layer, so copying a row and pasting it onto
+   * another gives a sub-layer and not a wrapper around one.
+   *
+   * A file with no layer tree — every drawing this program wrote before layers
+   * existed — is read by `artfile` instead and arrives as a single layer, so
+   * IMPORT accepts an old drawing rather than refusing it on a technicality.
+   */
+  const nodeFromSvg = useCallback(
+    (
+      text: string,
+      label: string
+      // The switches travel BESIDE the node, keyed by the ids `stackFromEmit`
+      // minted, because a `Layer` does not carry them — see `layers.Switches`.
+      // `pasteInto` takes this map and `reid` re-keys it onto the fresh ids, so
+      // a hidden layer imported arrives hidden.
+    ): { node: Layer; switches: ReadonlyMap<LayerId, Switches> } | null => {
+      const doc = parseEmit(text);
+      if (doc !== null && doc.layers.length > 0) {
+        // The FILE'S own book: a layer names cells by index, and an index means
+        // nothing without the depth that issued it.
+        const fileBook = addressBook(
+          buildHexagon(doc.payload.depth, doc.payload.convention)
+        );
+        const built = stackFromEmit(doc.layers, fileBook, 1);
+        return {
+          node:
+            built.stack.length === 1
+              ? built.stack[0]
+              : graft(built.stack, label, built.nextId).layer,
+          switches: built.switches,
+        };
+      }
+      const legacy = extractArt(text);
+      if (legacy === null) return null;
+      const plate =
+        legacy.canvas === "triangle"
+          ? plateIntoSector(
+              plateFromArtPayload(
+                legacy,
+                addressBook(buildFigure(legacy.depth, legacy.convention))
+              ),
+              0
+            )
+          : plateFromArtPayload(
+              legacy,
+              addressBook(buildHexagon(legacy.depth, legacy.convention))
+            );
+      // A drawing made before layers existed hid and locked nothing.
+      return {
+        node: { id: layerId(0), name: label, plate, children: [] },
+        switches: new Map(),
+      };
+    },
+    []
+  );
+
+  /**
+   * Graft one or more documents onto a row, as one session.
+   *
+   * Threaded through a local rather than through `setSession` per file, so
+   * importing four SVGs is four rungs of one journal rather than four renders
+   * that each read a stale composition. `pasteInto` mints fresh ids for every
+   * pasted subtree from the document's own counter, so the same clipboard
+   * pasted twice gives two independent trees and no id can appear twice.
+   */
+  const graftTexts = useCallback(
+    (texts: readonly { text: string; label: string }[], into: LayerId | null) => {
+      let out: Session = {
+        ...session,
+        composition: selectLayer(session.composition, into),
+      };
+      let taken = 0;
+      let refused: string | null = null;
+      for (const { text, label } of texts) {
+        const arriving = nodeFromSvg(text, label);
+        if (arriving === null) {
+          refused = refused ?? `${label} is not a drawing this program can read`;
+          continue;
+        }
+        // Re-seated on the ORIGINAL target before each graft. `pasteInto`
+        // selects what it just pasted, which is right for one paste and wrong
+        // for four: importing four files put the second inside the first,
+        // the third inside the second and so on, building a chain nobody
+        // asked for. Four files onto one row means four siblings.
+        const step = pasteInto(
+          { ...out, composition: selectLayer(out.composition, into) },
+          arriving.node,
+          arriving.switches
+        );
+        if (!step.ok) {
+          refused = refused ?? step.said;
+          continue;
+        }
+        out = step.value;
+        taken += 1;
+      }
+      if (taken === 0) {
+        setAnnounce(refused ?? "nothing was pasted");
+        return;
+      }
+      compRef.current = out.composition;
+      setSession(out);
+      const host = into === null ? null : findLayer(session.composition, into);
+      setAnnounce(
+        `pasted ${taken} layer${taken === 1 ? "" : "s"} ${
+          host === null ? "on top of the drawing" : `into ${host.name}`
+        }${refused === null ? "" : ` — ${refused}`}`
+      );
+    },
+    [session, nodeFromSvg]
+  );
+
+  /**
+   * The clipboard, written in BOTH flavours where the browser allows it.
+   *
+   * `image/svg+xml` so another drawing program takes the picture, `text/plain`
+   * so a text editor takes the markup — one blob, two labels, and the panel's
+   * paste reads either. Chromium refuses a `ClipboardItem` carrying a type
+   * outside its own short list, and SVG is outside it, so a refusal falls back
+   * to plain text rather than failing: the round trip inside this program still
+   * works, because the markup IS the document.
+   *
+   * A REFUSED CLIPBOARD SAYS SO. The permission can be denied outright, and a
+   * paste that quietly did nothing would be indistinguishable from a paste of an
+   * empty clipboard — so the sentence names the refusal and points at the two
+   * controls that need no permission at all.
+   */
+  const toClipboard = useCallback(async (text: string, said: string) => {
+    const blob = () => new Blob([text], { type: "image/svg+xml" });
+    try {
+      if (typeof ClipboardItem === "function" && navigator.clipboard?.write) {
+        try {
+          await navigator.clipboard.write([
+            new ClipboardItem({
+              "image/svg+xml": blob(),
+              "text/plain": new Blob([text], { type: "text/plain" }),
+            }),
+          ]);
+          setAnnounce(`${said} — as SVG and as text`);
+          return;
+        } catch {
+          // Falls through to plain text: see above.
+        }
+      }
+      await navigator.clipboard.writeText(text);
+      setAnnounce(`${said} — as text; this browser would not take the SVG flavour`);
+    } catch {
+      setAnnounce(
+        "the browser refused the clipboard — allow clipboard access for this page, or use EXPORT, which needs no permission"
+      );
+    }
+  }, []);
+
+  /**
+   * The clipboard, read TEXT FIRST — which is the opposite of the obvious order
+   * and the whole reason paste works.
+   *
+   * MEASURED, because it is not guessable: Chromium SANITISES the
+   * `image/svg+xml` flavour on the way out of the clipboard. It reparses the
+   * markup, re-serialises it, and STRIPS EVERY COMMENT — which is where the
+   * `fourfold:art:1` payload lives, and the payload is the authority for which
+   * cells and which layers. Copying a one-layer document and reading the two
+   * flavours back gives 63 531 bytes with the payload as `text/plain` and
+   * 63 327 bytes WITHOUT it as `image/svg+xml`. Preferring the richer type — the
+   * obvious thing, and what this did first — silently produced a paste that
+   * refused every document this program had just written.
+   *
+   * So the SVG flavour is still WRITTEN, because that is what makes the copy
+   * useful in another drawing program, and it is read only if there is no plain
+   * text at all.
+   */
+  const fromClipboard = useCallback(async (): Promise<string | null> => {
+    try {
+      if (navigator.clipboard?.read) {
+        const items = await navigator.clipboard.read();
+        for (const item of items) {
+          for (const type of ["text/plain", "image/svg+xml"]) {
+            if (!item.types.includes(type)) continue;
+            return await (await item.getType(type)).text();
+          }
+        }
+      }
+      return await navigator.clipboard.readText();
+    } catch {
+      setAnnounce(
+        "the browser refused the clipboard — allow clipboard access for this page, or use IMPORT, which needs no permission"
+      );
+      return null;
+    }
+  }, []);
+
+  const copyScope = useCallback(
+    (layer?: LayerId) => {
+      const name =
+        layer === undefined ? null : (findLayer(comp, layer)?.name ?? null);
+      void toClipboard(
+        svgOfScope(layer),
+        layer === undefined
+          ? `copied the whole composition — ${docCensus.total} layer${
+              docCensus.total === 1 ? "" : "s"
+            }`
+          : `copied ${name ?? "the layer"}`
+      );
+    },
+    [comp, svgOfScope, toClipboard, docCensus]
+  );
+
+  const pasteScope = useCallback(
+    (into: LayerId | null) => {
+      void (async () => {
+        const text = await fromClipboard();
+        if (text === null) return;
+        graftTexts([{ text, label: "Pasted" }], into);
+      })();
+    },
+    [fromClipboard, graftTexts]
+  );
 
   /**
    * The file's name. A framed sector still says `triangle`, because that is what
    * it is and what every file this program has ever written called it.
    */
   const nameFor = useCallback(
-    (ext: "svg" | "png", suffix = "") =>
+    (ext: "svg" | "png" | "gif", suffix = "") =>
       exportName({
         kind: (canvas.view.mode === "sector" ? "triangle" : "hexagon") + suffix,
         depth,
@@ -3073,6 +3764,51 @@ export default function DrawPage() {
     window.setTimeout(() => URL.revokeObjectURL(url), 5000);
   };
 
+  /** EXPORT is COPY with a file for a destination. Same text, same call. */
+  const exportComposition = useCallback(() => {
+    const name = nameFor("svg", "-layers");
+    download(
+      new Blob([svgOfScope()], { type: "image/svg+xml;charset=utf-8" }),
+      name
+    );
+    setAnnounce(
+      `exported ${name} — ${docCensus.total} layer${
+        docCensus.total === 1 ? "" : "s"
+      }, ${docCensus.addresses} address${
+        docCensus.addresses === 1 ? "" : "es"
+      }; import it back or drop it on the canvas`
+    );
+  }, [nameFor, svgOfScope, docCensus]);
+
+  /** IMPORT is PASTE with files for a source. Several at once, one journal. */
+  const importFiles = useCallback(
+    (picked: FileList) => {
+      void (async () => {
+        const list = Array.from(picked).slice(0, MAX_IMPORT);
+        const read: { text: string; label: string }[] = [];
+        for (const file of list) {
+          if (file.size > MAX_ART_BYTES) continue;
+          try {
+            read.push({
+              text: await file.text(),
+              label: file.name.replace(/\.svg$/i, ""),
+            });
+          } catch {
+            // A file the browser will not hand over is reported by the count
+            // below rather than by a sentence of its own: the person picked
+            // several and wants to know how many landed.
+          }
+        }
+        if (read.length === 0) {
+          setAnnounce("nothing to import — those files could not be read");
+          return;
+        }
+        graftTexts(read, comp.selected);
+      })();
+    },
+    [graftTexts, comp.selected]
+  );
+
   const exportSvg = () => {
     const name = nameFor("svg");
     download(new Blob([svgText()], { type: "image/svg+xml;charset=utf-8" }), name);
@@ -3091,27 +3827,45 @@ export default function DrawPage() {
    * can be measured on the real drawing rather than argued about. See
    * `replay.ts`, and `test/replay.test.ts`, which measures it.
    */
+  /**
+   * The replay AS DATA — the frames, the polygons and the wash — computed once.
+   *
+   * Lifted out so the animated SVG and the animated GIF are written from ONE
+   * walk of the journal rather than two. Two callers each doing their own walk
+   * would be two chances to disagree about which gesture landed where, and the
+   * disagreement would be invisible until somebody put the two files side by
+   * side. Nothing here is new: it is the first half of `animationText`, moved.
+   */
+  const animationModel = useCallback(() => {
+    if (past.length === 0) return null;
+    const { baked, cells, overlay } = bakedFrame();
+    const shown = canvas.view.mode === "sector" ? canvas.shown : undefined;
+    // One forward walk of the whole JOURNAL, composited onto this depth. The
+    // preview steps one act at a time; a file needs all of them at once. An
+    // act that only moved a layer changed no cell, and `animationSteps`
+    // already drops a step that changed nothing in frame, so a reorder costs
+    // the animation neither a rule nor a beat.
+    const states = everyComposition(comp, past).map((c) =>
+      flattenComposition(c, book)
+    );
+    const frames: AnimationStep[] = animationSteps(
+      states,
+      actStrokes(past),
+      book,
+      // An erase is drawn in the fill an unpainted cell wears, so a step can
+      // TAKE colour away without any element ever having to be removed.
+      showTiling ? TILE : PLATE_BG,
+      shown
+    );
+    if (frames.length === 0) return null;
+    return { baked, cells, overlay, shown, states, frames };
+  }, [comp, past, bakedFrame, canvas, book, showTiling]);
+
   const animationText = useCallback(
     (grouping: "orbit" | "cell") => {
-      const past = history.past;
-      if (past.length === 0) return null;
-      const { baked, cells, overlay } = bakedFrame();
-      const shown = canvas.view.mode === "sector" ? canvas.shown : undefined;
-      // One forward walk of the whole history, resolved onto this depth. The
-      // preview steps one gesture at a time; a file needs all of them at once.
-      const states = everyState(plateRef.current, past).map((p) =>
-        resolvePlate(p, book)
-      );
-      const frames: AnimationStep[] = animationSteps(
-        states,
-        past,
-        book,
-        // An erase is drawn in the fill an unpainted cell wears, so a step can
-        // TAKE colour away without any element ever having to be removed.
-        showTiling ? TILE : PLATE_BG,
-        shown
-      );
-      if (frames.length === 0) return null;
+      const model = animationModel();
+      if (model === null) return null;
+      const { baked, cells, overlay, shown, states, frames } = model;
       return {
         census: animationCensus(frames),
         text: animatedSvg({
@@ -3141,7 +3895,7 @@ export default function DrawPage() {
             convention,
             states[states.length - 1],
             baked === null ? undefined : { on: true, reading },
-            plateEntries(plateRef.current, book),
+            legacyAddresses,
             canvas.view.mode === "sector"
               ? { sector: canvas.view.sector }
               : undefined
@@ -3149,17 +3903,17 @@ export default function DrawPage() {
           ground: states[0],
           steps: frames,
           stepMs,
-          holdMs: HOLD_MS,
-          fadeMs: FADE_MS,
+          // Derived from THIS replay's step length and gesture count — see
+          // `replay.animationTiming`.
+          ...animationTiming(stepMs, frames.length),
           grouping,
         }),
       };
     },
     [
-      history,
-      bakedFrame,
+      animationModel,
+      legacyAddresses,
       canvas,
-      book,
       showTiling,
       weld,
       depth,
@@ -3189,6 +3943,103 @@ export default function DrawPage() {
       }, one CSS rule per gesture; ${Math.round(bytes.size / 1024)} kB`
     );
   };
+
+  /**
+   * The same replay, as a GIF.
+   *
+   * Written from `animationModel` — the SAME frames the SVG is written from —
+   * so the two files are two encodings of one thing rather than two readings of
+   * the drawing. What differs is what the format can hold: no fade, because a
+   * fade in a GIF is frames and every intermediate opacity is a new colour, and
+   * no antialiasing, because the palette is exact and coverage would spend it
+   * on edge ramps. See `lib/gif.ts`.
+   *
+   * Driven a slice at a time off a `MessageChannel` rather than run straight
+   * through. A depth-5 plate at 1024 px is nearly two seconds of arithmetic and
+   * a frozen page for two seconds is a page that looks broken; a `setTimeout`
+   * would be throttled to once a second the moment the tab went to the
+   * background, and a worker would need `worker-src blob:`, which this app does
+   * not grant. A message port is neither throttled nor a new origin.
+   */
+  const exportGif = useCallback(() => {
+    if (gifBusy) return;
+    const model = animationModel();
+    if (model === null) {
+      setAnnounce("nothing to animate — no committed gesture changed a cell in this frame");
+      return;
+    }
+    const { cells, overlay, shown, states, frames } = model;
+    const run = gifSteps({
+      viewWidth: canvas.geom.width,
+      viewHeight: canvas.geom.height,
+      width: gifWidth,
+      cells,
+      shown,
+      background: PLATE_BG,
+      unpainted: showTiling ? TILE : null,
+      tileSeam: SEAM,
+      paintSeam: PAINT_SEAM,
+      weldPaint: weld,
+      seamWidth: canvas.geom.seamWidth,
+      overlay,
+      ground: states[0],
+      steps: frames,
+      stepMs,
+      // The SAME hold the SVG gets, so the two encodings of one replay loop at
+      // the same rate. A GIF carries no fade — see the note above.
+      holdMs: animationTiming(stepMs, frames.length).holdMs,
+    });
+    setGifBusy(true);
+    setGifAt(0);
+    setAnnounce(
+      `writing a GIF — ${frames.length} frame${frames.length === 1 ? "" : "s"} at ${gifWidth} px`
+    );
+
+    const channel = new MessageChannel();
+    // A slice is bounded by TIME rather than by a step count, because one
+    // gesture at depth 2 and one at depth 5 are three orders of magnitude
+    // apart. Twelve milliseconds leaves a sixty-hertz frame its budget.
+    const SLICE_MS = 12;
+    channel.port1.onmessage = () => {
+      const until = performance.now() + SLICE_MS;
+      for (;;) {
+        const next = run.next();
+        if (next.done === true) {
+          channel.port1.close();
+          channel.port2.close();
+          const r = next.value;
+          setGifBusy(false);
+          setGifAt(1);
+          const name = nameFor("gif", "-replay");
+          download(new Blob([r.bytes], { type: "image/gif" }), name);
+          setAnnounce(
+            `exported ${name} — ${r.frames} frame${r.frames === 1 ? "" : "s"}, ` +
+              `${r.width}×${r.height}, ${(r.cycleMs / 1000).toFixed(1)} s a loop, ` +
+              (r.exact
+                ? `${r.palette} colour${r.palette === 1 ? "" : "s"}, exact — no quantisation; `
+                : `${r.distinct} colours reduced to ${r.palette}, the most a GIF can hold; `) +
+              `${Math.round(r.bytes.length / 1024)} kB`
+          );
+          return;
+        }
+        if (performance.now() >= until) {
+          setGifAt(next.value.done / next.value.total);
+          channel.port2.postMessage(0);
+          return;
+        }
+      }
+    };
+    channel.port2.postMessage(0);
+  }, [
+    gifBusy,
+    gifWidth,
+    animationModel,
+    canvas,
+    showTiling,
+    weld,
+    stepMs,
+    nameFor,
+  ]);
 
   const exportPng = () => {
     const url = URL.createObjectURL(
@@ -3299,6 +4150,9 @@ export default function DrawPage() {
         // painted across four depths arrives with all four. The view is then set
         // to that sector, so a person who saved a triangle opens a triangle.
         const old = payload.canvas === "triangle";
+        const fileBook = old
+          ? null
+          : addressBook(buildHexagon(payload.depth, payload.convention));
         const loaded = old
           ? plateIntoSector(
               plateFromArtPayload(
@@ -3307,10 +4161,33 @@ export default function DrawPage() {
               ),
               0
             )
-          : plateFromArtPayload(
-              payload,
-              addressBook(buildHexagon(payload.depth, payload.convention))
-            );
+          : plateFromArtPayload(payload, fileBook as AddressBook);
+
+        // THE LAYERS, when the file states any.
+        //
+        // Read back through the same `emit.parse` the panel's IMPORT uses —
+        // there is one reader, and a dropped file and a pasted clipboard take
+        // the identical path through it. A file with no layer tree, which is
+        // every file written before this one, becomes the single layer
+        // `fromPlate` has always made of it, so nothing about loading an old
+        // drawing changed.
+        const parsed = payload.comp === undefined ? null : parseEmit(text);
+        const stack =
+          parsed === null || fileBook === null || parsed.layers.length === 0
+            ? null
+            : stackFromEmit(parsed.layers, fileBook, 1);
+        const restored: Composition =
+          stack === null
+            ? fromPlate(loaded)
+            : {
+                layers: stack.stack,
+                selected: stack.stack[stack.stack.length - 1]?.id ?? null,
+                nextId: stack.nextId,
+                // The file's `hidden`/`locked`, keyed by the ids just minted.
+                // They come back beside the stack rather than inside it — a
+                // `Layer` does not carry them; see `layers.Switches`.
+                switches: stack.switches,
+              };
 
         const framed = old ? 0 : payload.view?.sector;
         if (framed === undefined) {
@@ -3324,8 +4201,14 @@ export default function DrawPage() {
         }
 
         reset(
-          loaded,
-          `loaded ${loaded.size} address${loaded.size === 1 ? "" : "es"} — ${
+          restored,
+          `loaded ${loaded.size} address${loaded.size === 1 ? "" : "es"}${
+            stack === null
+              ? ""
+              : ` across ${census(restored).total} layer${
+                  census(restored).total === 1 ? "" : "s"
+                }`
+          } — ${
             old
               ? `a triangle file, migrated into sector 0 of the plate`
               : framed === undefined
@@ -3333,7 +4216,7 @@ export default function DrawPage() {
               : `sector ${framed} framed`
           }, depth ${payload.depth}, ${payload.convention}${
             payload.plate === undefined ? "" : ", addressed"
-          } · history reset to the loaded plate`
+          } · history reset to the loaded drawing`
         );
         return;
       }
@@ -3361,7 +4244,7 @@ export default function DrawPage() {
       const imported = new Map<Address, string>();
       for (const [i, s] of got.matched) imported.set(book.addr[i], s.hex);
       reset(
-        imported,
+        fromPlate(imported),
         `imported ${got.matched.size} of ${got.total} cells — this file was not made here${
           got.unmatched === 0 ? "" : `, ${got.unmatched} shapes matched no cell`
         }`
@@ -3641,6 +4524,29 @@ export default function DrawPage() {
             </p>
           </section>
 
+          {/* WHICH SHEET the brush lands on — so it belongs in the STRUCTURE
+              column, under the two controls that say what the brush IS and what
+              is framed. The address tree says WHERE paint sits; the layer tree
+              says WHICH SHEET it sits on, and they are orthogonal. */}
+          <LayersPanel
+            session={session}
+            book={book}
+            frozen={previewing}
+            onSelect={pickLayer}
+            onToggleVisible={flipVisible}
+            onToggleLocked={flipLocked}
+            onRename={(id, name) => run(renameLayer(session, id, name))}
+            onAdd={() => runSession(addLayer(session), "added a layer")}
+            onDelete={() => run(removeLayer(session))}
+            onClear={() => run(clearLayer(session))}
+            onArrange={(dir) => run(arrangeLayer(session, dir))}
+            onPromote={() => run(promote(session))}
+            onDemote={() => run(demote(session))}
+            onCopy={copyScope}
+            onPaste={pasteScope}
+            onExport={exportComposition}
+            onImport={importFiles}
+          />
           <section className={styles.section}>
             <div className={styles.sectionHead}>
               <h2 className={styles.sectionTitle}>Brush symmetry</h2>
@@ -3970,6 +4876,7 @@ export default function DrawPage() {
               </>
             )}
           </section>
+
           </div>
 
           <div className={styles.railCol}>
@@ -4707,6 +5614,52 @@ export default function DrawPage() {
                       >
                         save svg animation
                       </button>
+
+                      <label className={styles.rewindField}>
+                        <span className={styles.benchKey}>gif</span>
+                        <select
+                          className={styles.rewindSelect}
+                          value={gifWidth}
+                          disabled={gifBusy}
+                          onChange={(e) => {
+                            const px = Number(e.target.value);
+                            setGifWidth(px);
+                            setAnnounce(
+                              `GIF width ${px} px — ${px}×${Math.round(
+                                (px * canvas.geom.height) / canvas.geom.width
+                              )}, ${steps} frame${steps === 1 ? "" : "s"}`
+                            );
+                          }}
+                          aria-label="width of the exported GIF, in pixels"
+                        >
+                          {GIF_WIDTHS.map((px) => (
+                            <option key={px} value={px}>
+                              {px} px
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <button
+                        type="button"
+                        className={styles.rewindAction}
+                        onClick={exportGif}
+                        disabled={gifBusy}
+                        aria-busy={gifBusy}
+                        aria-label={
+                          gifBusy
+                            ? `writing the GIF — ${Math.round(gifAt * 100)} per cent done`
+                            : `save the replay as an animated GIF — ${gifWidth} pixels wide, one frame per gesture, palette taken from the drawing`
+                        }
+                      >
+                        {gifBusy ? `gif — ${Math.round(gifAt * 100)}%` : "save gif"}
+                        {gifBusy && (
+                          <span
+                            className={styles.gifFuse}
+                            style={{ width: `${Math.round(gifAt * 100)}%` }}
+                            aria-hidden="true"
+                          />
+                        )}
+                      </button>
                     </>
                   )}
 
@@ -4750,7 +5703,12 @@ export default function DrawPage() {
                       are untouched — closing this leaves the drawing exactly as
                       it was. The exported animation is a{" "}
                       <b>separate file</b>: one <code>&lt;g&gt;</code> per orbit
-                      carrying <i>one</i> CSS animation, not one per cell.
+                      carrying <i>one</i> CSS animation, not one per cell. The{" "}
+                      <b>GIF</b> is the same replay at the same step, one frame
+                      per gesture, with the palette taken from the drawing
+                      rather than quantised — so the colours are exact unless
+                      the relief is on, which puts a composition past the 256 a
+                      GIF can hold.
                     </>
                   ) : revert === null ? (
                     <>
@@ -4884,7 +5842,7 @@ export default function DrawPage() {
                   type="button"
                   className={`${styles.iconBtn} ${styles.hudBtn}`}
                   onClick={doUndo}
-                  disabled={history.past.length === 0 || previewing}
+                  disabled={past.length === 0 || previewing}
                   title="undo the last gesture (⌘Z)"
                   aria-label="undo the last gesture"
                 >
@@ -4894,7 +5852,7 @@ export default function DrawPage() {
                   type="button"
                   className={`${styles.iconBtn} ${styles.hudBtn}`}
                   onClick={doRedo}
-                  disabled={history.future.length === 0 || previewing}
+                  disabled={session.journal.future.length === 0 || previewing}
                   title="redo the last undone gesture (⌘⇧Z)"
                   aria-label="redo the last undone gesture"
                 >
