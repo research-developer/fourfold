@@ -109,9 +109,15 @@
  * ── The graft: paste is not a merge ─────────────────────────────────────
  *
  * Pasting a whole composition onto a layer makes it ONE new child of that layer,
- * with its own children intact all the way down. Nothing is flattened, nothing
- * is spliced, no depth limit is imposed. `graft` turns a `Stack` into a single
- * `Layer` and is the only place that conversion happens.
+ * with its own children intact all the way down. Nothing is flattened and
+ * nothing is spliced. `graft` turns a `Stack` into a single `Layer` and is the
+ * only place that conversion happens.
+ *
+ * THE ONE LIMIT IS THE FILE'S, and it used to be missing here: this paragraph
+ * said "no depth limit is imposed" while `artfile.ts` enforced
+ * `MAX_LAYER_DEPTH` in its READER, so a document could be nested past the
+ * ceiling, saved without complaint, and then refused on the way back in. See
+ * `roomFor`.
  *
  * Paste is BY VALUE: `reid` deep-copies the subtree with fresh ids, so pasting
  * the same clipboard twice gives two independent subtrees and no id can appear
@@ -145,6 +151,39 @@
  * Because neither is journalled, they are typed apart: an operation that
  * journals takes and returns a `Session`, and one that does not takes and
  * returns a `Composition`. The signature says which kind it is.
+ *
+ * ── WHY THE SWITCHES ARE NOT ON THE LAYER ───────────────────────────────
+ *
+ * That last paragraph was for a long time a claim the code did not keep, and
+ * the way it failed is worth writing down because the shape recurs.
+ *
+ * `Move.place` carries `node: Layer` — it has to, so that undoing a delete puts
+ * back the exact subtree, ids and plates and all. While `Layer` also carried
+ * `visible` and `locked`, EVERY STRUCTURAL ACT FROZE A COPY OF THE SWITCHES,
+ * and undo wrote that copy back over whatever had been toggled since:
+ *
+ *   arrange(L2, "down")          journal snapshots node: L2(visible: true)
+ *   setVisible(comp, L2, false)  deliberately not journalled
+ *   undo(...)                    → L2.visible === true. The hide is gone.
+ *
+ * The type system could not see it. `setVisible: Composition → Composition` and
+ * `arrange: Session → Session` look independent, and they are not, because a
+ * `Session` contains a `Composition` which contains snapshots of `Layer`.
+ *
+ * A BRACKET AROUND `applyAct` — read the live switches of every layer a `place`
+ * move names, apply, write them back — was tried and MEASURED, and it is not
+ * enough. It repairs the two reorder cases and fails the third: lock a layer,
+ * delete it, undo, redo, undo. At the redo the layer leaves the tree carrying
+ * its lock and there is nowhere to put it; at the undo the only surviving
+ * record is the rung's frozen snapshot, which says unlocked. The bracket
+ * restores FROM THE LIVE TREE, and the live tree does not hold the layer at
+ * either boundary. No amount of per-move care fixes that, because the fact
+ * being restored has to outlive the layer's absence.
+ *
+ * So the switches were moved OFF `Layer` and onto `Composition.switches`, a map
+ * from `LayerId` to `Switches`. A `Move` cannot reach them, so undo cannot
+ * disturb them, so the paragraph above is now true by construction and not by a
+ * restore step that four call sites have to remember.
  *
  * ── Selection is an IDENTITY, and paths are how you locate ──────────────
  *
@@ -180,7 +219,7 @@ import {
   type EditDirection,
   type Stroke,
 } from "./strokes";
-import type { ArtPayload } from "./artfile";
+import { MAX_LAYER_DEPTH, MAX_LAYERS, type ArtPayload } from "./artfile";
 
 // ── the tree ─────────────────────────────────────────────────────────────
 
@@ -207,23 +246,47 @@ export function idNumber(id: LayerId): number | null {
 }
 
 /**
- * One layer: a name, two switches, a plate of its own, and a stack of children.
+ * One layer: a name, a plate of its own, and a stack of children.
  *
  * `plate` and `children` coexist, which is what makes "paste onto a layer" mean
  * what the product says it means — the target keeps its identity and its paint
  * and gains a child. See the header for where its own paint sits.
  *
- * `visible` and `locked` are this layer's OWN switches. The inherited answers
- * are `Effective`, and they are never stored here.
+ * NO SWITCHES. `visible` and `locked` are in `Composition.switches`, keyed by
+ * id, and the reason is the whole of the section above: a `Move` carries a
+ * `Layer`, so a switch on a `Layer` is a switch the journal restores. See
+ * `Switches`.
  */
 export interface Layer {
   readonly id: LayerId;
   readonly name: string;
-  readonly visible: boolean;
-  readonly locked: boolean;
   readonly plate: AddressPlate;
   readonly children: Stack;
 }
+
+/**
+ * A layer's OWN two switches, as the panel shows them.
+ *
+ * NOT stored on the `Layer`, and that placement is the entire point. A `place`
+ * move carries the layer it moved — children, plates and all — so that undo can
+ * put back the exact tree. While the switches rode on the `Layer`, every
+ * structural act froze a copy of them and undo wrote that copy back over
+ * whatever the person had since toggled. Hiding a layer and then undoing an
+ * unrelated reorder unhid it; locking one and undoing a redone delete unlocked
+ * it. Keyed off the tree and onto the document, there is nothing for a rung to
+ * carry and the claim is true by construction rather than by a restore step.
+ *
+ * The inherited answers are `Effective`, and they are never stored anywhere.
+ */
+export interface Switches {
+  readonly visible: boolean;
+  readonly locked: boolean;
+}
+
+/** Shown and unlocked: what a layer with no entry in `switches` is. */
+export const OPEN: Switches = { visible: true, locked: false };
+
+const isOpen = (s: Switches): boolean => s.visible && !s.locked;
 
 /**
  * An ordered list of layers, BOTTOM FIRST.
@@ -255,6 +318,25 @@ export interface Composition {
   readonly selected: LayerId | null;
   /** The id counter. Monotone; see `act` for why undo never rolls it back. */
   readonly nextId: number;
+  /**
+   * Every layer whose switches differ from `OPEN`, keyed by id. See `Switches`.
+   *
+   * CANONICAL: an entry equal to `OPEN` is deleted rather than stored, so two
+   * documents that look the same have the same map and a file written from
+   * either is byte-identical. An ordinary drawing's map is empty.
+   *
+   * KEYED BY ID AND NOT BY POSITION, so a switch survives every reorder, graft
+   * and promotion — the same argument `selected` makes for being an identity.
+   * An entry OUTLIVES the layer leaving the tree, which is what makes deleting
+   * a locked layer and undoing that delete give back a locked layer. Ids are
+   * minted from a monotone counter and `reid` re-mints a pasted subtree, so a
+   * stale entry can never be picked up by a different layer; it is a couple of
+   * booleans per layer the document has ever hidden or locked, and it is not
+   * pruned because the only safe time to prune is when the id appears in
+   * neither the tree nor any rung of the journal, which is a walk of the whole
+   * journal per act to reclaim sixteen bytes.
+   */
+  readonly switches: ReadonlyMap<LayerId, Switches>;
 }
 
 /**
@@ -280,14 +362,7 @@ export const pastedName = (name: string): string => `${name} copy`;
 
 /** An empty layer with the given id and name. Never a group; children come later. */
 function bare(id: LayerId, name: string): Layer {
-  return {
-    id,
-    name,
-    visible: true,
-    locked: false,
-    plate: new Map<Address, string>(),
-    children: [],
-  };
+  return { id, name, plate: new Map<Address, string>(), children: [] };
 }
 
 /**
@@ -309,6 +384,7 @@ export function fromPlate(
     layers: [{ ...bare(id, name), plate }],
     selected: id,
     nextId: 2,
+    switches: new Map(),
   };
 }
 
@@ -362,21 +438,35 @@ export function graft(
  * one, so two layers sharing a plate object can never observe each other. That
  * is what makes pasting a depth-5 document cost a few dozen small objects
  * instead of tens of thousands of map entries.
+ *
+ * The switches are RE-KEYED rather than left behind. They are addressed by id
+ * and this mints new ids, so `from` — the switches of the document the subtree
+ * came out of — is read against the OLD id and written against the new one.
+ * Without it a hidden layer would arrive from the clipboard shown, which is the
+ * same loss this file's switch design exists to prevent, one door along.
+ * Returns only the entries that differ from `OPEN`, so the map stays canonical.
  */
 export function reid(
   layer: Layer,
-  nextId: number
-): { layer: Layer; nextId: number } {
-  let n = nextId;
-  const id = layerId(n);
-  n += 1;
-  const children: Layer[] = [];
-  for (const c of layer.children) {
-    const done = reid(c, n);
-    children.push(done.layer);
-    n = done.nextId;
-  }
-  return { layer: { ...layer, id, children }, nextId: n };
+  nextId: number,
+  from: ReadonlyMap<LayerId, Switches> = new Map()
+): { layer: Layer; nextId: number; switches: ReadonlyMap<LayerId, Switches> } {
+  const switches = new Map<LayerId, Switches>();
+  const go = (l: Layer, n: number): { layer: Layer; nextId: number } => {
+    const id = layerId(n);
+    let at = n + 1;
+    const was = from.get(l.id);
+    if (was !== undefined && !isOpen(was)) switches.set(id, was);
+    const children: Layer[] = [];
+    for (const c of l.children) {
+      const done = go(c, at);
+      children.push(done.layer);
+      at = done.nextId;
+    }
+    return { layer: { ...l, id, children }, nextId: at };
+  };
+  const done = go(layer, nextId);
+  return { layer: done.layer, nextId: done.nextId, switches };
 }
 
 // ── walking ──────────────────────────────────────────────────────────────
@@ -449,12 +539,13 @@ export function walk(comp: Composition): Visit[] {
     for (let k = 0; k < stack.length; k++) {
       const layer = stack[k];
       const path = [...prefix, k];
+      const own = comp.switches.get(layer.id) ?? OPEN;
       const effective: Effective = {
-        shown: ancestorShown && layer.visible,
-        editable: !ancestorLocked && !layer.locked,
+        shown: ancestorShown && own.visible,
+        editable: !ancestorLocked && !own.locked,
       };
-      out.push({ layer, path, depth: prefix.length, effective });
-      go(layer.children, path, effective.shown, ancestorLocked || layer.locked);
+      out.push({ layer, path, depth: prefix.length, own, effective });
+      go(layer.children, path, effective.shown, ancestorLocked || own.locked);
     }
   };
   go(comp.layers, [], true, false);
@@ -466,8 +557,20 @@ export interface Visit {
   readonly path: Path;
   /** 0 for a top-level layer. `path.length - 1`, carried so readers need not. */
   readonly depth: number;
+  /** This layer's OWN switches — what the panel's buttons show. */
+  readonly own: Switches;
   readonly effective: Effective;
 }
+
+/**
+ * A layer's OWN switches. `OPEN` for a layer nobody has hidden or locked.
+ *
+ * Answers for an id the document does not hold, deliberately: an entry outlives
+ * the layer's absence from the tree, which is what makes undoing a delete give
+ * back the switches the layer had. Use `effectiveOf` for what to obey.
+ */
+export const switchesOf = (comp: Composition, id: LayerId): Switches =>
+  comp.switches.get(id) ?? OPEN;
 
 /**
  * The inherited answers for one layer, or `null` when it is not in the document.
@@ -483,8 +586,9 @@ export function effectiveOf(comp: Composition, id: LayerId): Effective | null {
   let stack: Stack = comp.layers;
   for (const k of path) {
     const layer = stack[k];
-    shown = shown && layer.visible;
-    anyLocked = anyLocked || layer.locked;
+    const own = comp.switches.get(layer.id) ?? OPEN;
+    shown = shown && own.visible;
+    anyLocked = anyLocked || own.locked;
     stack = layer.children;
   }
   return { shown, editable: !anyLocked };
@@ -493,7 +597,7 @@ export function effectiveOf(comp: Composition, id: LayerId): Effective | null {
 // ── flattening ───────────────────────────────────────────────────────────
 
 /**
- * The flatten cache, keyed by the STACK's identity.
+ * The flatten cache, keyed by the STACK's identity and then the SWITCHES'.
  *
  * Keyed on `comp.layers` rather than on the composition, and that is not an
  * accident: `select` returns a new `Composition` that keeps the same `layers`
@@ -502,10 +606,22 @@ export function effectiveOf(comp: Composition, id: LayerId): Effective | null {
  * stack, so identity is an exact generation counter with no version number to
  * forget to bump — the same argument `plate.ts` makes for its own `VIEWS` map.
  *
- * The inner key is the address book's `id`, so two depths a user is toggling
- * between are both resident.
+ * TWO KEYS AND NOT ONE, because hiding a layer no longer touches the stack.
+ * While the switches rode on the `Layer`, `setVisible` rebuilt the stack and
+ * one key was an exact generation counter for both facts; now a toggle builds a
+ * new `switches` map and leaves `layers` alone, so a single key on `layers`
+ * would hand back the board from before the toggle and hiding a layer would do
+ * nothing on screen. Both maps are rebuilt exactly when they change, so the
+ * PAIR of identities is still an exact generation counter, and `select` — which
+ * shares both — still costs nothing.
+ *
+ * The innermost key is the address book's `id`, so two depths a user is
+ * toggling between are both resident.
  */
-const FLAT = new WeakMap<Stack, Map<string, ReadonlyMap<number, string>>>();
+const FLAT = new WeakMap<
+  Stack,
+  WeakMap<ReadonlyMap<LayerId, Switches>, Map<string, ReadonlyMap<number, string>>>
+>();
 
 /**
  * The board: cell index → colour, at this book's depth, with the whole stack
@@ -563,15 +679,20 @@ export function flatten(
   comp: Composition,
   book: AddressBook
 ): ReadonlyMap<number, string> {
-  let perBook = FLAT.get(comp.layers);
+  let perSwitches = FLAT.get(comp.layers);
+  if (perSwitches === undefined) {
+    perSwitches = new WeakMap();
+    FLAT.set(comp.layers, perSwitches);
+  }
+  let perBook = perSwitches.get(comp.switches);
   if (perBook === undefined) {
     perBook = new Map();
-    FLAT.set(comp.layers, perBook);
+    perSwitches.set(comp.switches, perBook);
   }
   const hit = perBook.get(book.id);
   if (hit !== undefined) return hit;
   const built = new Map<number, string>();
-  composite(comp.layers, book, built, book.addr.length);
+  composite(comp.layers, comp.switches, book, built, book.addr.length);
   perBook.set(book.id, built);
   return built;
 }
@@ -590,6 +711,7 @@ export function flatten(
  */
 function composite(
   stack: Stack,
+  switches: ReadonlyMap<LayerId, Switches>,
   book: AddressBook,
   out: Map<number, string>,
   full: number
@@ -598,8 +720,8 @@ function composite(
     const layer = stack[k];
     // A hidden layer prunes its whole subtree: its children inherit the hiding
     // whatever their own switches say, so there is nothing below to look at.
-    if (!layer.visible) continue;
-    if (composite(layer.children, book, out, full)) return true;
+    if (switches.get(layer.id)?.visible === false) continue;
+    if (composite(layer.children, switches, book, out, full)) return true;
     if (layer.plate.size !== 0) {
       for (const [i, hex] of resolvePlate(layer.plate, book)) {
         if (!out.has(i)) out.set(i, hex);
@@ -682,6 +804,32 @@ export interface Act {
   readonly moves: readonly Move[];
   /** What the panel says it did, and says it undid. */
   readonly note: string;
+  /**
+   * COLOURING EVENTS this act spent — what the colour progression counts.
+   *
+   * IN THE RUNG, and that placement is the fix to a real desynchronisation
+   * rather than a tidy-up. The count used to live in a second stack beside the
+   * journal, pushed by whichever call site remembered: the brush pushed what it
+   * spent, a revert pushed zero, a preset pushed what it spent — and CLEAR
+   * pushed NOTHING, because `page.tsx` called `clearLayer` through the same
+   * `run` every structural control uses. So a clear added a journal rung with
+   * no matching event rung, and undoing it popped the event rung belonging to a
+   * DIFFERENT gesture. The progression index was then wrong for the rest of the
+   * session — every later stroke silently the wrong hue, and unrecoverable
+   * without NEW. Measured: two journal rungs against one event rung, and an
+   * index of 3 that undoing a clear took to 0.
+   *
+   * An invariant maintained by four call sites remembering is not an invariant.
+   * Here the two stacks are ONE stack: they are pushed together, trimmed
+   * together by the same `HISTORY_LIMIT`, and moved together by undo and redo,
+   * because there is only one thing to move. `composer.eventsOf` reads the log
+   * back out.
+   *
+   * ZERO for everything structural — an add, a reorder, a rename, a paste, a
+   * clear, a revert — because none of them spends a colour. That is the default,
+   * so a new operation cannot get it wrong by forgetting.
+   */
+  readonly events: number;
 }
 
 export interface Journal {
@@ -812,7 +960,12 @@ export function applyMove(
   }
 }
 
-/** Every move of an act, in order for `do` and reversed for `undo`. */
+/**
+ * Every move of an act, in order for `do` and reversed for `undo`.
+ *
+ * NOTHING here restores a switch, and nothing needs to: `visible` and `locked`
+ * live in `Composition.switches` and no `Move` can reach them. See the header.
+ */
 function applyAct(
   comp: Composition,
   act: Act,
@@ -855,9 +1008,15 @@ function reseat(comp: Composition): Composition {
  * and nothing collides. Rolling the counter back would mean a layer added after
  * an undo could mint an id a rung in the journal still names.
  */
-export function act(session: Session, moves: readonly Move[], note: string): Session {
+export function act(
+  session: Session,
+  moves: readonly Move[],
+  note: string,
+  /** Colouring events this act spent. Zero for everything structural; see `Act`. */
+  events = 0
+): Session {
   if (moves.length === 0) return session;
-  const entry: Act = { moves, note };
+  const entry: Act = { moves, note, events };
   const past = [...session.journal.past, entry];
   return {
     composition: applyAct(session.composition, entry, "do"),
@@ -922,7 +1081,8 @@ export type Refusal =
   | "no-neighbour"
   | "into-itself"
   | "unknown-layer"
-  | "blank-name";
+  | "blank-name"
+  | "too-deep";
 
 export interface Refused {
   readonly ok: false;
@@ -934,6 +1094,85 @@ export type Outcome<T> = { readonly ok: true; readonly value: T } | Refused;
 
 const no = (why: Refusal, said: string): Refused => ({ ok: false, why, said });
 const yes = <T>(value: T): Outcome<T> => ({ ok: true, value });
+
+// ── what a file can hold ─────────────────────────────────────────────────
+
+/**
+ * THE MODEL OBEYS THE FILE FORMAT'S LIMITS, and it did not used to.
+ *
+ * `artfile.ts` has always enforced `MAX_LAYER_DEPTH` and `MAX_LAYERS`, and it
+ * enforced them IN THE READER ONLY. This file's header said the opposite in as
+ * many words — "no depth limit is imposed" — so pasting thirty-three deep built
+ * a document that saved without complaint and then refused to load: the work is
+ * gone at the moment the person tries to get it back, which is the worst shape
+ * a loss can take, because they find out after they have closed it.
+ *
+ * The limits are IMPORTED rather than restated, so the two files cannot drift
+ * apart. They are checked where a tree can GROW deeper or wider — `pasteInto`,
+ * `demote` and `moveLayer` — and refused as an ordinary `Outcome`, which is
+ * what the machinery is already for: the page says the sentence in its live
+ * region and nothing is lost. Nothing that only moves a layer sideways is
+ * checked, because it cannot break either limit.
+ *
+ * These are a limit on what an UNTRUSTED FILE may ask this program to walk, and
+ * nobody nests thirty-two deep by hand; the refusal is a backstop, not a
+ * feature. See `artfile.MAX_LAYER_DEPTH`.
+ */
+const subtreeDepth = (l: Layer): number => {
+  let deepest = 1;
+  for (const c of l.children) deepest = Math.max(deepest, 1 + subtreeDepth(c));
+  return deepest;
+};
+
+const subtreeCount = (l: Layer): number => {
+  let n = 1;
+  for (const c of l.children) n += subtreeCount(c);
+  return n;
+};
+
+/**
+ * Why `node` may not sit beneath `under` levels of ancestor, or `null` to allow.
+ *
+ * `under` is how many layers would stand ABOVE the node once it lands — 0 for a
+ * new top-level layer — so the deepest layer of the arriving subtree ends at
+ * `under + subtreeDepth(node)`, which is the number the format measures.
+ */
+function roomFor(node: Layer, under: number): Refused | null {
+  const deep = under + subtreeDepth(node);
+  if (deep > MAX_LAYER_DEPTH) {
+    return no(
+      "too-deep",
+      `that would nest ${deep} layers deep, and a drawing this program can save holds ${MAX_LAYER_DEPTH} — move it somewhere shallower`
+    );
+  }
+  return null;
+}
+
+/**
+ * Why `node` may not JOIN this document at `under` levels down, or `null`.
+ *
+ * Depth AND breadth, because a paste is the one operation that adds layers.
+ * `demote` and `moveLayer` only move layers the document already holds, so they
+ * check the depth alone — the count cannot change.
+ */
+function roomToAdd(comp: Composition, node: Layer, under: number): Refused | null {
+  const deep = roomFor(node, under);
+  if (deep !== null) return deep;
+  const total = countLayers(comp.layers) + subtreeCount(node);
+  if (total > MAX_LAYERS) {
+    return no(
+      "too-deep",
+      `that would make ${total} layers, and a drawing this program can save holds ${MAX_LAYERS}`
+    );
+  }
+  return null;
+}
+
+const countLayers = (stack: Stack): number => {
+  let n = 0;
+  for (const l of stack) n += 1 + countLayers(l.children);
+  return n;
+};
 
 // ── selection ────────────────────────────────────────────────────────────
 
@@ -962,10 +1201,37 @@ export const hasSelection = (comp: Composition): boolean =>
 
 // ── where paint goes ─────────────────────────────────────────────────────
 
+/**
+ * PROOF THAT THE BRUSH MAY WRITE HERE — a layer, where it sits, and a phantom
+ * that only `paintTarget` can mint.
+ *
+ * The phantom is what makes this a capability rather than a pair of fields. The
+ * live paint path used to be `paintInto(comp, id, edits)` taking a bare
+ * `LayerId`, which will paint into a locked or a hidden layer without a word;
+ * the app was correct only because `page.tsx` happened to re-check
+ * `paintTarget` on every application. That is discipline in a caller, and the
+ * next caller does not inherit it. Meanwhile the function that DID check —
+ * `commitPaint`, with a twenty-five line comment headed "THE DRAG CONTRACT,
+ * spelled out because a caller will get this wrong otherwise" — was referenced
+ * nowhere but in comments.
+ *
+ * So the check moved into the type. `paintInto` takes a `Target`, a `Target`
+ * comes only from `paintTarget`, and `paintTarget` refuses a locked or hidden
+ * layer. Painting somewhere you may not is no longer something a caller can
+ * express.
+ */
+declare const CHECKED: unique symbol;
+
 export interface Target {
   readonly layer: Layer;
   readonly path: Path;
+  /** Phantom. Never read, never written, and unconstructable outside this file. */
+  readonly [CHECKED]: true;
 }
+
+/** The one mint. Private, so `paintTarget` is the only door. */
+const target = (layer: Layer, path: Path): Target =>
+  ({ layer, path }) as Target;
 
 /**
  * The layer a stroke would land in, or why it would not.
@@ -1001,10 +1267,11 @@ export function paintTarget(comp: Composition): Outcome<Target> {
   if (eff === null) {
     return no("unknown-layer", "the selected layer is no longer in the drawing");
   }
+  const own = switchesOf(comp, layer.id);
   if (!eff.editable) {
     return no(
       "locked",
-      layer.locked
+      own.locked
         ? `${layer.name} is locked — unlock it to paint into it`
         : `${layer.name} is inside a locked layer — unlock the parent to paint into it`
     );
@@ -1012,60 +1279,50 @@ export function paintTarget(comp: Composition): Outcome<Target> {
   if (!eff.shown) {
     return no(
       "hidden",
-      layer.visible
+      own.visible
         ? `${layer.name} is inside a hidden layer — show the parent to paint into it`
         : `${layer.name} is hidden — show it to paint into it`
     );
   }
-  return yes({ layer, path });
+  return yes(target(layer, path));
 }
 
 /**
- * Paint into one layer WITHOUT journalling it.
+ * Paint into a CHECKED layer, without journalling it.
  *
  * The live half of a drag: `page.tsx` applies edit after edit as the pointer
- * moves and commits ONE gesture at the end, exactly as it does today with a
- * plate ref. This is that apply. The commit is `commitPaint`.
+ * moves and journals ONE gesture at the end.
+ *
+ * THE DRAG CONTRACT, spelled out because a caller will get this wrong
+ * otherwise. Ask `paintTarget` for a `Target`, apply each application here as
+ * the pointer moves, accumulate the gesture with `strokes.mergeEdits`, and
+ * journal the merged stroke with `act` at the end, naming the layer the gesture
+ * STARTED on. Two things follow from that shape and both matter:
+ *
+ *   RE-CHECK PER APPLICATION. `paintTarget` is cheap and the answer can change
+ *   mid-drag — a layer can be locked or hidden from the panel while the pointer
+ *   is down — so ask again each time rather than once at the start. The type
+ *   makes you hold a `Target`; it cannot make you hold a fresh one.
+ *
+ *   THE EDITS ARE ALREADY APPLIED when you journal. Journalling them does not
+ *   re-apply them here, and if a caller does apply them twice that is harmless:
+ *   `applyPlateEdits` writes `to` outright rather than transforming what it
+ *   finds, so re-applying an edit that has already landed is the identity.
+ *
+ * WHY A `Target` AND NOT A `LayerId`: see `Target`. This used to take a bare
+ * id, which paints into a locked or hidden layer without a word, and the
+ * function that did the checking was dead code referenced only from comments.
  */
 export function paintInto(
   comp: Composition,
-  id: LayerId,
+  into: Target,
   edits: readonly PlateEdit[]
 ): Composition {
   if (edits.length === 0) return comp;
-  return applyMove(comp, { kind: "paint", layer: id, stroke: { edits: [...edits] } }, "do");
-}
-
-/**
- * Commit a finished gesture into the selected layer.
- *
- * Re-checks the target rather than trusting the caller, so a layer locked
- * mid-drag cannot receive the commit.
- *
- * THE DRAG CONTRACT, spelled out because a caller will get this wrong otherwise:
- * apply each application live with `paintInto` as the pointer moves, accumulate
- * the gesture with `strokes.mergeEdits` exactly as `page.tsx` already does, and
- * hand the merged stroke here at the end. The edits are applied a SECOND time by
- * this call and that is harmless, because `applyEdits` writes `to` outright
- * rather than transforming what it finds — re-applying an edit that has already
- * landed is the identity. So there is no "journal without applying" door to
- * leave open, and no way for the two to fall out of step.
- */
-export function commitPaint(
-  session: Session,
-  stroke: Stroke<Address>,
-  note?: string
-): Outcome<Session> {
-  const target = paintTarget(session.composition);
-  if (!target.ok) return target;
-  if (stroke.edits.length === 0) return no("empty", "nothing changed");
-  const layer = target.value.layer;
-  return yes(
-    act(
-      session,
-      [{ kind: "paint", layer: layer.id, stroke }],
-      note ?? `painted ${stroke.edits.length} cells on ${layer.name}`
-    )
+  return applyMove(
+    comp,
+    { kind: "paint", layer: into.layer.id, stroke: { edits: [...edits] } },
+    "do"
   );
 }
 
@@ -1162,7 +1419,7 @@ export function clearLayer(session: Session): Outcome<Session> {
   if (eff !== null && !eff.editable) {
     return no(
       "locked",
-      layer.locked
+      switchesOf(comp, layer.id).locked
         ? `${layer.name} is locked — unlock it to clear it`
         : `${layer.name} is inside a locked layer — unlock the parent to clear it`
     );
@@ -1227,10 +1484,7 @@ export function setVisible(
   id: LayerId,
   visible: boolean
 ): Composition {
-  const layers = mapLayer(comp.layers, id, (l) =>
-    l.visible === visible ? l : { ...l, visible }
-  );
-  return layers === comp.layers ? comp : { ...comp, layers };
+  return setSwitches(comp, id, { ...switchesOf(comp, id), visible });
 }
 
 /** Set a layer's OWN lock. Not journalled; see the header. */
@@ -1239,21 +1493,42 @@ export function setLocked(
   id: LayerId,
   locked: boolean
 ): Composition {
-  const layers = mapLayer(comp.layers, id, (l) =>
-    l.locked === locked ? l : { ...l, locked }
-  );
-  return layers === comp.layers ? comp : { ...comp, layers };
+  return setSwitches(comp, id, { ...switchesOf(comp, id), locked });
 }
 
-export const toggleVisible = (comp: Composition, id: LayerId): Composition => {
-  const l = find(comp, id);
-  return l === null ? comp : setVisible(comp, id, !l.visible);
-};
+/**
+ * Both switches at once. THE ONLY WRITER of `Composition.switches`.
+ *
+ * Refuses an id the document does not hold, so the map cannot grow entries for
+ * layers that were never here — the leak it is allowed is the one described on
+ * the field, and no wider.
+ *
+ * Canonicalises: an entry equal to `OPEN` is DELETED rather than stored, so
+ * hiding a layer and showing it again returns the identical document rather
+ * than one carrying a redundant entry. Two drawings that look the same
+ * therefore have equal maps, and a file written from either matches byte for
+ * byte. Returns the same object when nothing moved, which is what keeps the
+ * flatten cache warm through a no-op toggle.
+ */
+export function setSwitches(
+  comp: Composition,
+  id: LayerId,
+  want: Switches
+): Composition {
+  if (find(comp, id) === null) return comp;
+  const now = switchesOf(comp, id);
+  if (now.visible === want.visible && now.locked === want.locked) return comp;
+  const switches = new Map(comp.switches);
+  if (isOpen(want)) switches.delete(id);
+  else switches.set(id, { visible: want.visible, locked: want.locked });
+  return { ...comp, switches };
+}
 
-export const toggleLocked = (comp: Composition, id: LayerId): Composition => {
-  const l = find(comp, id);
-  return l === null ? comp : setLocked(comp, id, !l.locked);
-};
+export const toggleVisible = (comp: Composition, id: LayerId): Composition =>
+  setVisible(comp, id, !switchesOf(comp, id).visible);
+
+export const toggleLocked = (comp: Composition, id: LayerId): Composition =>
+  setLocked(comp, id, !switchesOf(comp, id).locked);
 
 // ── arranging ────────────────────────────────────────────────────────────
 
@@ -1376,6 +1651,10 @@ export function demote(session: Session): Outcome<Session> {
   // it. Working that out here rather than after the removal is why the two
   // moves can be written down in one go.
   const hostPath: Path = [...path.slice(0, -1), k - 1];
+  // Indenting is the one control that deepens a tree one press at a time, so it
+  // is where a person actually reaches the format's ceiling. See `roomFor`.
+  const room = roomFor(layer, hostPath.length);
+  if (room !== null) return room;
   return yes(
     act(
       session,
@@ -1449,6 +1728,10 @@ export function moveLayer(
   if (hostPath === null) return no("unknown-layer", "that parent is not in the drawing");
   const host = parent === null ? taken.layers : (at(taken, hostPath)?.children ?? []);
   const k = index < 0 ? 0 : index > host.length ? host.length : index;
+  // Measured against the tree the insertion will actually meet, which is why it
+  // sits after the removal rather than before it. See `roomFor`.
+  const room = roomFor(layer, hostPath.length);
+  if (room !== null) return room;
   return yes(
     act(
       session,
@@ -1477,6 +1760,28 @@ export function copyLayer(comp: Composition, id: LayerId): Layer | null {
 }
 
 /**
+ * The switches of a subtree, keyed by ITS OWN ids — the other half of a copy.
+ *
+ * A `Layer` no longer carries its switches (see `Switches`), so a clipboard
+ * that carried only the layer would paste a hidden subtree back shown. This is
+ * what `pasteInto` takes as `from`. Only entries that differ from `OPEN`, so an
+ * ordinary copy carries an empty map.
+ */
+export function switchesIn(
+  comp: Composition,
+  node: Layer
+): ReadonlyMap<LayerId, Switches> {
+  const out = new Map<LayerId, Switches>();
+  const go = (l: Layer): void => {
+    const own = comp.switches.get(l.id);
+    if (own !== undefined && !isOpen(own)) out.set(l.id, own);
+    for (const c of l.children) go(c);
+  };
+  go(node);
+  return out;
+}
+
+/**
  * The whole document as one layer, for the clipboard.
  *
  * This is what makes "paste a composition onto a layer" one operation rather
@@ -1491,9 +1796,13 @@ export function copyComposition(comp: Composition, name = "Composition"): Layer 
  * Paste a subtree ONTO the selected layer, as its topmost child.
  *
  * The graft, in full: what lands is ONE new child whose own children are intact
- * all the way down. Nothing is flattened, nothing is spliced, and no depth limit
- * is imposed — a composition pasted onto a layer that is itself three deep sits
- * at four and works exactly as it did at one.
+ * all the way down. Nothing is flattened and nothing is spliced — a composition
+ * pasted onto a layer that is itself three deep sits at four and works exactly
+ * as it did at one.
+ *
+ * REFUSES what the file format would not accept back, on depth and on total
+ * count alike. See `roomFor`: a paste that saves and then will not load is a
+ * loss discovered at the worst possible moment.
  *
  * With NOTHING selected it goes on top of the document, which is the only other
  * place it could sensibly go and is what a person means when they paste into an
@@ -1503,7 +1812,19 @@ export function copyComposition(comp: Composition, name = "Composition"): Layer 
  * Ids are minted fresh for the whole subtree, so pasting twice gives two
  * independent trees; plates are shared by reference and never copied.
  */
-export function pasteInto(session: Session, node: Layer): Outcome<Session> {
+export function pasteInto(
+  session: Session,
+  node: Layer,
+  /**
+   * The switches of the document `node` came OUT of, keyed by its own ids.
+   *
+   * Passed in rather than read off the layer because a `Layer` no longer holds
+   * them — see `Switches`. `reid` re-keys these onto the fresh ids, so a hidden
+   * layer pasted arrives hidden. Omitted means the whole subtree is `OPEN`,
+   * which is right for a node built from nothing.
+   */
+  from: ReadonlyMap<LayerId, Switches> = new Map()
+): Outcome<Session> {
   const comp = session.composition;
   const host = selectedLayer(comp);
   if (host !== null) {
@@ -1512,14 +1833,23 @@ export function pasteInto(session: Session, node: Layer): Outcome<Session> {
       return no("locked", `${host.name} is locked — unlock it to paste into it`);
     }
   }
-  const fresh = reid({ ...node, name: pastedName(node.name) }, comp.nextId);
   const hostPath = host === null ? null : pathOf(comp, host.id);
   const path: Path =
     host === null || hostPath === null
       ? [comp.layers.length]
       : [...hostPath, host.children.length];
+  const room = roomToAdd(comp, node, path.length - 1);
+  if (room !== null) return room;
+  const fresh = reid({ ...node, name: pastedName(node.name) }, comp.nextId, from);
   const next = act(
-    { ...session, composition: { ...comp, nextId: fresh.nextId } },
+    {
+      ...session,
+      composition: {
+        ...comp,
+        nextId: fresh.nextId,
+        switches: new Map([...comp.switches, ...fresh.switches]),
+      },
+    },
     [{ kind: "place", op: "insert", at: path, node: fresh.layer }],
     host === null
       ? `pasted ${fresh.layer.name} on top of the drawing`
@@ -1543,10 +1873,13 @@ export function pasteInto(session: Session, node: Layer): Outcome<Session> {
  *   node        the layer itself, as stored. Immutable; do not copy it.
  *   path        where it sits. `path.length - 1` is `depth`.
  *   depth       0 for a top-level layer. Carried so a writer can indent.
- *   effective   the INHERITED answers. `shown` is what to obey; a layer's own
- *               `visible` is what the panel shows, and they are different when
- *               an ancestor is hidden. Do not read `node.visible` to decide
- *               whether to draw.
+ *   own         this layer's OWN two switches, as the panel's buttons show
+ *               them. They are NOT on `node` — see `Switches` for why — so a
+ *               writer reads them here or from `switchesOf`.
+ *   effective   the INHERITED answers. `shown` is what to obey; `own.visible`
+ *               is what the panel shows, and they are different when an
+ *               ancestor is hidden. Do not read `own.visible` to decide whether
+ *               to draw.
  *   colours     every distinct `#rrggbb` in this layer's OWN plate, ascending.
  *               Its children have their own slices with their own colours; use
  *               `subtreeColours` for the union.
@@ -1562,6 +1895,7 @@ export interface LayerSlice {
   readonly node: Layer;
   readonly path: Path;
   readonly depth: number;
+  readonly own: Switches;
   readonly effective: Effective;
   readonly colours: readonly string[];
   readonly addresses: number;
@@ -1573,6 +1907,7 @@ export function slices(comp: Composition): readonly LayerSlice[] {
     node: v.layer,
     path: v.path,
     depth: v.depth,
+    own: v.own,
     effective: v.effective,
     colours: coloursOf(v.layer),
     addresses: v.layer.plate.size,

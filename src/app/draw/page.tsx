@@ -62,17 +62,12 @@ import {
   brushSpan,
   brushStamp,
   defaultDragMode,
-  EMPTY_EVENTS,
   eventCount,
   progressionIndex,
-  pushEvents,
-  redoEvents,
   stampColours,
   TOOLS,
-  undoEvents,
   upcomingBases,
   type DragMode,
-  type EventLog,
   type Tool,
 } from "@/lib/brush";
 import { buildFigure, type Convention } from "@/lib/figure";
@@ -123,6 +118,7 @@ import {
   animatedSvg,
   animationCensus,
   animationSteps,
+  animationTiming,
   type AnimationStep,
 } from "@/lib/replay";
 import { gifSteps } from "@/lib/gif";
@@ -150,6 +146,7 @@ import {
   renameLayer,
   select as selectLayer,
   soleLayer,
+  switchesOf,
   toggleLocked,
   toggleVisible,
   undo as undoSession,
@@ -158,12 +155,13 @@ import {
   type LayerId,
   type Outcome,
   type Session,
+  type Switches,
 } from "@/lib/layers";
 import {
-  actPaints,
   actStrokes,
   clampAct,
   emitLayersOf,
+  eventsOf,
   everyComposition,
   revertMoves,
   stackFromEmit,
@@ -392,13 +390,13 @@ const STEP_MS_DEFAULT = 250;
  * How long the finished plate holds before the exported animation loops, and
  * how long a gesture takes to come up.
  *
- * The hold is not decoration: without it the last stroke is on screen for one
- * step and the loop reads as a flicker rather than as a drawing that was
- * finished. The fade is short enough to read as a stroke LANDING rather than as
- * a dissolve, and it is what stops a fast replay looking like a strobe.
+ * BOTH ARE DERIVED from the step length and the number of gestures rather than
+ * fixed here, because a fixed 90 ms fade is longer than the fastest 80 ms step
+ * — every reveal overlapping the next — and a fixed 1.8 s hold is 63% of a
+ * thirteen-gesture loop at 80 ms and 7% of a hundred-gesture loop at 250 ms.
+ * `replay.animationTiming` owns the rule, and the SVG and the GIF both read it,
+ * so the two exports cannot disagree about how long anything lasts.
  */
-const HOLD_MS = 1800;
-const FADE_MS = 90;
 
 /**
  * The widths a GIF may be written at, and why the plate's own is not among them.
@@ -907,7 +905,19 @@ export default function DrawPage() {
   );
   const comp = session.composition;
   const past = session.journal.past;
-  const [events, setEvents] = useState<EventLog>(EMPTY_EVENTS);
+  /**
+   * The colouring-event log, DERIVED from the journal rather than kept beside
+   * it.
+   *
+   * It used to be a second `useState` that four call sites pushed to, and the
+   * one that forgot — CLEAR, which goes through `run` like every other
+   * structural control — added a journal rung with no event rung, so a later
+   * undo popped a rung belonging to another gesture and every subsequent
+   * progression stroke was the wrong hue. `Act.events` now carries the count,
+   * so the two stacks are one stack and cannot be pushed apart. See
+   * `layers.Act`.
+   */
+  const events = useMemo(() => eventsOf(session.journal), [session.journal]);
   const [hover, setHover] = useState<number | null>(null);
   const [cursor, setCursor] = useState<number | null>(null);
   const [showGuides, setShowGuides] = useState(true);
@@ -1042,9 +1052,10 @@ export default function DrawPage() {
    *
    * Recorded at the first application and used at the commit, so a gesture that
    * began on one layer finishes on it — clicking a panel row mid-drag cannot
-   * split one stroke across two sheets. `commitPaint` re-checks the CURRENT
-   * target and would refuse a layer locked mid-drag, which is why the commit
-   * below journals the move itself rather than going through it.
+   * split one stroke across two sheets. An ID and not a `layers.Target`,
+   * deliberately: a `Target` is proof that the brush may write there NOW, and
+   * `paintAt` re-earns that on every application; this is only the name the
+   * finished gesture is journalled under.
    */
   const paintingInto = useRef<LayerId | null>(null);
   /**
@@ -1614,8 +1625,9 @@ export default function DrawPage() {
     // A preview is a window onto a journal that is about to stop existing.
     setRewind(null);
     setLiveEvents(0);
+    // The event log is the journal, and `newSession` empties it — so there is
+    // no second stack here to remember to clear.
     setSession(newSession(next));
-    setEvents(EMPTY_EVENTS);
     setProgOrigin(0);
     setHover(null);
     setCursor(null);
@@ -1898,7 +1910,11 @@ export default function DrawPage() {
         }
         return;
       }
-      const into = target.value.layer.id;
+      // The CHECKED target, re-asked on every application — a layer can be
+      // locked or hidden from the panel while the pointer is down. `paintInto`
+      // takes this rather than a bare id, so painting somewhere the brush may
+      // not is not expressible; see `layers.Target`.
+      const into = target.value;
       const stamp = clipStamp(
         brushStamp(canvas.surface, canvas.bands, i, shape),
         keepCell
@@ -1942,7 +1958,9 @@ export default function DrawPage() {
         if (g.length === 0) continue;
         pendingGroups.current.push(g.map((c) => book.addr[c]));
       }
-      paintingInto.current = into;
+      // The gesture belongs to the layer it STARTED on, and `endStroke`
+      // journals against that id rather than against wherever it ended.
+      paintingInto.current = into.layer.id;
       compRef.current = paintInto(compRef.current, into, edits);
       pending.current = mergeEdits(pending.current, edits);
       setSession((s) => ({ ...s, composition: compRef.current }));
@@ -1996,20 +2014,20 @@ export default function DrawPage() {
       const stroke = mark === undefined ? { edits } : { edits, mark };
       const name = findLayer(compRef.current, into)?.name ?? "the layer";
       // The edits are ALREADY applied — `paintAt` wrote them into the ref as the
-      // pointer moved — so this journals the same move rather than going through
-      // `commitPaint`, which would re-check the target and apply them a second
-      // time. Re-applying is the identity (see `layers.commitPaint`), but the
+      // pointer moved, each one through a freshly checked `layers.Target` — so
+      // this journals the same move rather than applying anything again. The
       // gesture belongs to the layer it STARTED on, and that is `into`.
+      // The events ride IN the rung, so they cannot be pushed apart from the
+      // stroke — that is what makes the progression index recoverable, and it
+      // is now a property of the type rather than of this line. See `layers.Act`.
       setSession((s) =>
         journalAct(
           { ...s, composition: compRef.current },
           [{ kind: "paint", layer: into, stroke }],
-          `painted ${edits.length} cells on ${name}`
+          `painted ${edits.length} cells on ${name}`,
+          used
         )
       );
-      // Pushed together with the stroke and never apart from it: the two stacks
-      // being the same height is what makes the progression index recoverable.
-      setEvents((e) => pushEvents(e, used));
       const verb =
         tool === "erase" ? "erased" : tool === "adjust" ? adjustName : "painted";
       setAnnounce(
@@ -2050,13 +2068,15 @@ export default function DrawPage() {
     }
     compRef.current = step.session.composition;
     setSession(step.session);
-    if (actPaints(step.act)) setEvents(undoEvents(events));
+    // Nothing to do for the event log: it IS the journal, so it moved with it.
+    // This used to be a guarded `setEvents(undoEvents(events))`, and the guard
+    // was the bug — an act nobody counted popped somebody else's rung.
     setAnnounce(
       `undid ${step.act.note} — ${
         flattenComposition(step.session.composition, book).size
       } cells on the plate`
     );
-  }, [previewing, session, events, book]);
+  }, [previewing, session, book]);
 
   const doRedo = useCallback(() => {
     if (previewing) {
@@ -2070,13 +2090,12 @@ export default function DrawPage() {
     }
     compRef.current = step.session.composition;
     setSession(step.session);
-    if (actPaints(step.act)) setEvents(redoEvents(events));
     setAnnounce(
       `redid ${step.act.note} — ${
         flattenComposition(step.session.composition, book).size
       } cells on the plate`
     );
-  }, [previewing, session, events, book]);
+  }, [previewing, session, book]);
 
   // ── the past, previewed ─────────────────────────────────────────────────
 
@@ -2265,7 +2284,6 @@ export default function DrawPage() {
     const next = journalAct(session, revert.moves, `reverted to state ${at}`);
     compRef.current = next.composition;
     setSession(next);
-    setEvents((e) => pushEvents(e, 0));
     setRewind(null);
     setAnnounce(
       `reverted to state ${at} — ${revert.rolledBack} act${
@@ -2332,10 +2350,10 @@ export default function DrawPage() {
         journalAct(
           { ...s, composition: compRef.current },
           [{ kind: "paint", layer: into.id, stroke }],
-          said(edits.length)
+          said(edits.length),
+          spent
         )
       );
-      setEvents((e) => pushEvents(e, spent));
       setAnnounce(said(edits.length));
     },
     [book]
@@ -2398,11 +2416,12 @@ export default function DrawPage() {
     compRef.current = composition;
     const l = findLayer(composition, id);
     const eff = l === null ? null : effectiveOf(composition, id);
+    const own = switchesOf(composition, id);
     setAnnounce(
       l === null
         ? "that layer is not in the drawing"
-        : `${l.name} ${l.visible ? "shown" : "hidden"}${
-            eff !== null && l.visible && !eff.shown
+        : `${l.name} ${own.visible ? "shown" : "hidden"}${
+            eff !== null && own.visible && !eff.shown
               ? " — still not on the plate, because it is inside a hidden layer"
               : ""
           }`
@@ -2415,11 +2434,12 @@ export default function DrawPage() {
     compRef.current = composition;
     const l = findLayer(composition, id);
     const eff = l === null ? null : effectiveOf(composition, id);
+    const own = switchesOf(composition, id);
     setAnnounce(
       l === null
         ? "that layer is not in the drawing"
-        : `${l.name} ${l.locked ? "locked" : "unlocked"}${
-            eff !== null && !l.locked && !eff.editable
+        : `${l.name} ${own.locked ? "locked" : "unlocked"}${
+            eff !== null && !own.locked && !eff.editable
               ? " — still not editable, because it is inside a locked layer"
               : ""
           }`
@@ -3504,7 +3524,14 @@ export default function DrawPage() {
    * IMPORT accepts an old drawing rather than refusing it on a technicality.
    */
   const nodeFromSvg = useCallback(
-    (text: string, label: string): Layer | null => {
+    (
+      text: string,
+      label: string
+      // The switches travel BESIDE the node, keyed by the ids `stackFromEmit`
+      // minted, because a `Layer` does not carry them — see `layers.Switches`.
+      // `pasteInto` takes this map and `reid` re-keys it onto the fresh ids, so
+      // a hidden layer imported arrives hidden.
+    ): { node: Layer; switches: ReadonlyMap<LayerId, Switches> } | null => {
       const doc = parseEmit(text);
       if (doc !== null && doc.layers.length > 0) {
         // The FILE'S own book: a layer names cells by index, and an index means
@@ -3513,9 +3540,13 @@ export default function DrawPage() {
           buildHexagon(doc.payload.depth, doc.payload.convention)
         );
         const built = stackFromEmit(doc.layers, fileBook, 1);
-        return built.stack.length === 1
-          ? built.stack[0]
-          : graft(built.stack, label, built.nextId).layer;
+        return {
+          node:
+            built.stack.length === 1
+              ? built.stack[0]
+              : graft(built.stack, label, built.nextId).layer,
+          switches: built.switches,
+        };
       }
       const legacy = extractArt(text);
       if (legacy === null) return null;
@@ -3532,13 +3563,10 @@ export default function DrawPage() {
               legacy,
               addressBook(buildHexagon(legacy.depth, legacy.convention))
             );
+      // A drawing made before layers existed hid and locked nothing.
       return {
-        id: layerId(0),
-        name: label,
-        visible: true,
-        locked: false,
-        plate,
-        children: [],
+        node: { id: layerId(0), name: label, plate, children: [] },
+        switches: new Map(),
       };
     },
     []
@@ -3562,8 +3590,8 @@ export default function DrawPage() {
       let taken = 0;
       let refused: string | null = null;
       for (const { text, label } of texts) {
-        const node = nodeFromSvg(text, label);
-        if (node === null) {
+        const arriving = nodeFromSvg(text, label);
+        if (arriving === null) {
           refused = refused ?? `${label} is not a drawing this program can read`;
           continue;
         }
@@ -3574,7 +3602,8 @@ export default function DrawPage() {
         // asked for. Four files onto one row means four siblings.
         const step = pasteInto(
           { ...out, composition: selectLayer(out.composition, into) },
-          node
+          arriving.node,
+          arriving.switches
         );
         if (!step.ok) {
           refused = refused ?? step.said;
@@ -3874,8 +3903,9 @@ export default function DrawPage() {
           ground: states[0],
           steps: frames,
           stepMs,
-          holdMs: HOLD_MS,
-          fadeMs: FADE_MS,
+          // Derived from THIS replay's step length and gesture count — see
+          // `replay.animationTiming`.
+          ...animationTiming(stepMs, frames.length),
           grouping,
         }),
       };
@@ -3955,7 +3985,9 @@ export default function DrawPage() {
       ground: states[0],
       steps: frames,
       stepMs,
-      holdMs: HOLD_MS,
+      // The SAME hold the SVG gets, so the two encodings of one replay loop at
+      // the same rate. A GIF carries no fade — see the note above.
+      holdMs: animationTiming(stepMs, frames.length).holdMs,
     });
     setGifBusy(true);
     setGifAt(0);
@@ -4151,6 +4183,10 @@ export default function DrawPage() {
                 layers: stack.stack,
                 selected: stack.stack[stack.stack.length - 1]?.id ?? null,
                 nextId: stack.nextId,
+                // The file's `hidden`/`locked`, keyed by the ids just minted.
+                // They come back beside the stack rather than inside it — a
+                // `Layer` does not carry them; see `layers.Switches`.
+                switches: stack.switches,
               };
 
         const framed = old ? 0 : payload.view?.sector;

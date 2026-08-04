@@ -397,7 +397,7 @@ function Row({
   onCopy: (layer?: LayerId) => void;
   onPaste: (into: LayerId | null) => void;
 }) {
-  const { layer, depth, effective, group, spine } = row;
+  const { layer, depth, own, effective, group, spine } = row;
   const cells = layerCells(layer, book);
   const swatches = [...new Set(layer.plate.values())].sort().slice(0, 6);
   /**
@@ -410,9 +410,9 @@ function Row({
    * cannot come from different questions.
    */
   const inherited: { said: string; glyph: string } | null =
-    !effective.shown && layer.visible
+    !effective.shown && own.visible
       ? { said: "inside a hidden layer", glyph: EYE_SHUT }
-      : !effective.editable && !layer.locked
+      : !effective.editable && !own.locked
       ? { said: "inside a locked layer", glyph: LOCK_SHUT }
       : null;
 
@@ -493,8 +493,8 @@ function Row({
           }, ${cells} cell${cells === 1 ? "" : "s"}${
             group ? `, ${layer.children.length} sub-layers` : ""
           }${inherited === null ? "" : `, ${inherited.said}`}${
-            layer.visible ? "" : ", hidden"
-          }${layer.locked ? ", locked" : ""}${selected ? " — selected" : ""}`}
+            own.visible ? "" : ", hidden"
+          }${own.locked ? ", locked" : ""}${selected ? " — selected" : ""}`}
         >
           <span className={styles.layerLabel}>{layer.name}</span>
           {/* THE INHERITED STATE IS A BADGE, not a sentence.
@@ -518,36 +518,36 @@ function Row({
         <button
           type="button"
           className={styles.layerAct}
-          aria-pressed={layer.locked}
+          aria-pressed={own.locked}
           onClick={() => onToggleLocked(layer.id)}
           title={
-            layer.locked
+            own.locked
               ? `unlock ${layer.name}`
               : `lock ${layer.name} — the brush will refuse it`
           }
-          aria-label={`${layer.locked ? "unlock" : "lock"} ${layer.name}${
-            !effective.editable && !layer.locked
+          aria-label={`${own.locked ? "unlock" : "lock"} ${layer.name}${
+            !effective.editable && !own.locked
               ? " — it is also inside a locked layer"
               : ""
           }`}
         >
-          <Glyph d={layer.locked ? LOCK_SHUT : LOCK_OPEN} />
+          <Glyph d={own.locked ? LOCK_SHUT : LOCK_OPEN} />
         </button>
         <button
           type="button"
           className={styles.layerAct}
-          aria-pressed={!layer.visible}
+          aria-pressed={!own.visible}
           onClick={() => onToggleVisible(layer.id)}
-          title={layer.visible ? `hide ${layer.name}` : `show ${layer.name}`}
-          aria-label={`${layer.visible ? "hide" : "show"} ${layer.name}${
-            !effective.shown && layer.visible
+          title={own.visible ? `hide ${layer.name}` : `show ${layer.name}`}
+          aria-label={`${own.visible ? "hide" : "show"} ${layer.name}${
+            !effective.shown && own.visible
               ? " — it is also inside a hidden layer"
               : ""
           }`}
         >
           <Glyph
-            d={layer.visible ? EYE_OPEN : EYE_SHUT}
-            extra={layer.visible ? EYE_PUPIL : undefined}
+            d={own.visible ? EYE_OPEN : EYE_SHUT}
+            extra={own.visible ? EYE_PUPIL : undefined}
           />
         </button>
         <button

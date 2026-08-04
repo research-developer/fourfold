@@ -24,17 +24,23 @@ import {
   type AddressBook,
   type AddressPlate,
 } from "../src/lib/plate";
-import { encodeArt, extractArt, type ArtPayload } from "../src/lib/artfile";
+import {
+  encodeArt,
+  extractArt,
+  MAX_LAYER_DEPTH,
+  type ArtLayer,
+  type ArtPayload,
+} from "../src/lib/artfile";
 import { HISTORY_LIMIT } from "../src/lib/strokes";
 import {
   act,
   addLayer,
+  applyMove,
   arrange,
   at,
   canArrange,
   census,
   clearLayer,
-  commitPaint,
   copyComposition,
   copyLayer,
   coloursOf,
@@ -50,6 +56,7 @@ import {
   layerId,
   moveLayer,
   newSession,
+  OPEN,
   paintInto,
   paintTarget,
   paletteOf,
@@ -66,6 +73,8 @@ import {
   slices,
   soleLayer,
   subtreeColours,
+  switchesIn,
+  switchesOf,
   toggleVisible,
   undo,
   walk,
@@ -73,6 +82,8 @@ import {
   type Layer,
   type LayerId,
   type Session,
+  type Switches,
+  type Target,
 } from "../src/lib/layers";
 
 const GOLD = "#d4a017";
@@ -83,32 +94,58 @@ const GREEN = "#2f8f4e";
 const book2 = addressBook(buildHexagon(2));
 const book1 = addressBook(buildHexagon(1));
 
-/** A layer, written out, so a composition can be stated rather than built. */
+/**
+ * A layer, written out, so a composition can be stated rather than built.
+ *
+ * `visible` and `locked` are accepted here and STORED BESIDE the layer, because
+ * they live on the composition now and not on the layer — see
+ * `layers.Switches`. `C` collects them by walking the tree it is handed and
+ * looking each layer up by OBJECT IDENTITY, so `L(2, …, { visible: false })`
+ * still reads as one line and there is no ordering or clearing to get wrong.
+ */
+const SW = new WeakMap<Layer, Switches>();
+
 const L = (
   n: number,
   entries: [Address, string][] = [],
-  extra: Partial<Omit<Layer, "id">> = {}
-): Layer => ({
-  id: layerId(n),
-  name: `L${n}`,
-  visible: true,
-  locked: false,
-  plate: new Map(entries),
-  children: [],
-  ...extra,
-});
+  extra: Partial<Omit<Layer, "id">> & Partial<Switches> = {}
+): Layer => {
+  const { visible = true, locked = false, ...rest } = extra;
+  const layer: Layer = {
+    id: layerId(n),
+    name: `L${n}`,
+    plate: new Map(entries),
+    children: [],
+    ...rest,
+  };
+  if (!visible || locked) SW.set(layer, { visible, locked });
+  return layer;
+};
 
-const C = (layers: Layer[], selected: LayerId | null = null): Composition => ({
-  layers,
-  selected,
-  nextId: 1000,
-});
+const C = (layers: Layer[], selected: LayerId | null = null): Composition => {
+  const switches = new Map<LayerId, Switches>();
+  const go = (stack: readonly Layer[]): void => {
+    for (const l of stack) {
+      const own = SW.get(l);
+      if (own !== undefined) switches.set(l.id, own);
+      go(l.children);
+    }
+  };
+  go(layers);
+  return { layers, selected, nextId: 1000, switches };
+};
 
 /** The board as a sorted list, so two composites compare exactly. */
 const board = (m: ReadonlyMap<number, string>) =>
   [...m.entries()].sort((a, b) => a[0] - b[0]);
 
-/** A tree as plain data, so undo can be checked against the thing it restored. */
+/**
+ * A tree as plain data, so undo can be checked against the thing it restored.
+ *
+ * The switches are read off the COMPOSITION and folded in here, so a comparison
+ * of two shapes still covers them — they moved off the layer, they did not stop
+ * mattering.
+ */
 interface Shape {
   id: string;
   name: string;
@@ -117,15 +154,18 @@ interface Shape {
   plate: [string, string][];
   children: Shape[];
 }
-const shape = (l: Layer): Shape => ({
-  id: l.id,
-  name: l.name,
-  visible: l.visible,
-  locked: l.locked,
-  plate: [...l.plate.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)),
-  children: l.children.map(shape),
-});
-const shapes = (c: Composition): Shape[] => c.layers.map(shape);
+const shape = (c: Composition, l: Layer): Shape => {
+  const own = switchesOf(c, l.id);
+  return {
+    id: l.id,
+    name: l.name,
+    visible: own.visible,
+    locked: own.locked,
+    plate: [...l.plate.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)),
+    children: l.children.map((k) => shape(c, k)),
+  };
+};
+const shapes = (c: Composition): Shape[] => c.layers.map((l) => shape(c, l));
 
 /** The cell index of an address on a book, for reading the board back. */
 const cell = (book: AddressBook, a: Address): number => {
@@ -251,7 +291,7 @@ describe("visibility", () => {
     ]);
     expect(flatten(comp, book2).get(cell(book2, "s0:AA"))).toBe(GOLD);
     // The child's OWN switch was not touched on the way down.
-    expect(find(comp, layerId(3))?.visible).toBe(true);
+    expect(switchesOf(comp, layerId(3)).visible).toBe(true);
   });
 
   it("unhiding a parent restores exactly what was showing before", () => {
@@ -272,7 +312,7 @@ describe("visibility", () => {
     const comp = C([
       L(1, [], { visible: false, children: [L(2, [], { locked: true })] }),
     ]);
-    expect(find(comp, layerId(2))?.visible).toBe(true);
+    expect(switchesOf(comp, layerId(2)).visible).toBe(true);
     expect(effectiveOf(comp, layerId(2))).toEqual({ shown: false, editable: false });
     expect(effectiveOf(comp, layerId(1))).toEqual({ shown: false, editable: true });
   });
@@ -280,8 +320,125 @@ describe("visibility", () => {
   it("toggling is not journalled — it changes no address", () => {
     const s = newSession(C([L(1, [["s0:AA", GOLD]])], layerId(1)));
     const flipped = toggleVisible(s.composition, layerId(1));
-    expect(flipped.layers[0].visible).toBe(false);
+    expect(switchesOf(flipped, layerId(1)).visible).toBe(false);
     expect(s.journal.past).toHaveLength(0);
+  });
+});
+
+// ── the switches survive the journal ─────────────────────────────────────
+
+/**
+ * THE SWITCHES ARE NOT THE JOURNAL'S TO RESTORE, and these are the cases that
+ * pin it down.
+ *
+ * The header argues that `visible` and `locked` are deliberately NOT journalled
+ * — toggling one destroys nothing and its inverse is the same button. That
+ * argument is only true if undo LEAVES THEM ALONE. It did not: a `place` move
+ * carried a whole `Layer`, a `Layer` carried the two switches, and so every
+ * structural act froze a copy of them that undo wrote back over the live ones.
+ * Hiding a layer and then undoing an unrelated reorder silently unhid it — the
+ * exact failure the header argues against, inverted, and invisible to `tsc`
+ * because `setVisible: Composition → Composition` and `arrange: Session →
+ * Session` look independent while a `Session` contains a `Composition`
+ * containing snapshots of `Layer`.
+ *
+ * The switches now live in `Composition.switches`, outside every `Move`, so
+ * there is nothing for a rung to carry and nothing to write back.
+ */
+describe("undo never touches a switch", () => {
+  it("keeps a layer hidden across the undo of its own reorder", () => {
+    const s0 = newSession(C([L(1), L(2)], layerId(2)));
+    const moved = arrange(s0, "down");
+    expect(moved.ok).toBe(true);
+    if (!moved.ok) return;
+    // Deliberately NOT journalled — that is the whole design.
+    const hidden = {
+      ...moved.value,
+      composition: setVisible(moved.value.composition, layerId(2), false),
+    };
+    const back = undo(hidden);
+    expect(switchesOf(back.session.composition, layerId(2)).visible).toBe(false);
+    // and the reorder itself really was taken back
+    expect(back.session.composition.layers.map((l) => l.id)).toEqual([
+      layerId(1),
+      layerId(2),
+    ]);
+  });
+
+  it("keeps a CHILD hidden across the undo of its parent's reorder", () => {
+    const s0 = newSession(
+      C([L(1), L(2, [], { children: [L(3, [["s0:AA", GOLD]])] })], layerId(2))
+    );
+    const moved = arrange(s0, "down");
+    expect(moved.ok).toBe(true);
+    if (!moved.ok) return;
+    const hidden = {
+      ...moved.value,
+      composition: setVisible(moved.value.composition, layerId(3), false),
+    };
+    const back = undo(hidden);
+    expect(switchesOf(back.session.composition, layerId(3)).visible).toBe(false);
+    expect(flatten(back.session.composition, book2).size).toBe(0);
+  });
+
+  it("keeps a lock across redo-then-undo of a delete", () => {
+    const s0 = newSession(C([L(1), L(2)], layerId(2)));
+    const gone = removeLayer(s0);
+    expect(gone.ok).toBe(true);
+    if (!gone.ok) return;
+    const back = undo(gone.value);
+    const locked = {
+      ...back.session,
+      composition: setLocked(back.session.composition, layerId(2), true),
+    };
+    // Delete it again, then take that back. The lock was set while the layer
+    // stood in the tree and no rung between then and now names it.
+    const again = redo(locked);
+    const restored = undo(again.session);
+    expect(switchesOf(restored.session.composition, layerId(2)).locked).toBe(true);
+  });
+
+  /**
+   * The hazard the two-key flatten cache exists for.
+   *
+   * While the switches rode on the `Layer`, `setVisible` rebuilt the stack and a
+   * cache keyed on `comp.layers` was an exact generation counter for both facts.
+   * A toggle now leaves `layers` ALONE and builds a new `switches` map, so a
+   * cache keyed on the stack alone would hand back the board from before the
+   * toggle and hiding a layer would do nothing on screen.
+   */
+  it("re-composites when only the switches moved, sharing the same stack", () => {
+    const comp = C([L(1, [["s0:AA", GOLD]]), L(2, [["s0:AB", RED]])]);
+    expect(flatten(comp, book2).size).toBe(2);
+    const hidden = setVisible(comp, layerId(2), false);
+    // The stack really is the same array — this is the case that used to lie.
+    expect(hidden.layers).toBe(comp.layers);
+    expect(flatten(hidden, book2).size).toBe(1);
+    expect(flatten(hidden, book2).get(cell(book2, "s0:AA"))).toBe(GOLD);
+    // and back again
+    expect(flatten(setVisible(hidden, layerId(2), true), book2).size).toBe(2);
+  });
+
+  it("a no-op toggle returns the identical document, so the cache stays warm", () => {
+    const comp = C([L(1, [["s0:AA", GOLD]])]);
+    expect(setVisible(comp, layerId(1), true)).toBe(comp);
+    // Hiding and showing again is the identity, entry and all — the map is
+    // canonical, so a redundant `{visible:true,locked:false}` is never stored.
+    const round = setVisible(setVisible(comp, layerId(1), false), layerId(1), true);
+    expect(round.switches.size).toBe(0);
+  });
+
+  it("a deleted layer's switches are still its own when it comes back", () => {
+    const s0 = newSession(C([L(1), L(2, [], { children: [L(3)] })], layerId(2)));
+    const hidden = {
+      ...s0,
+      composition: setVisible(s0.composition, layerId(3), false),
+    };
+    const gone = removeLayer(hidden);
+    expect(gone.ok).toBe(true);
+    if (!gone.ok) return;
+    const back = undo(gone.value);
+    expect(switchesOf(back.session.composition, layerId(3)).visible).toBe(false);
   });
 });
 
@@ -358,61 +515,110 @@ describe("painting reaches exactly one layer", () => {
     colour: string
   ) => planPlateEdits(plate, book2, addrs, addrs.map(() => colour));
 
+  /**
+   * The checked target, or a loud failure.
+   *
+   * A `Target` cannot be written down — `paintTarget` is the only mint, which
+   * is the whole of the guard — so every test that paints goes through here,
+   * exactly as the page does.
+   */
+  const mustTarget = (comp: Composition): Target => {
+    const t = paintTarget(comp);
+    if (!t.ok) throw new Error(`paintTarget refused: ${t.said}`);
+    return t.value;
+  };
+
   it("lands in the selected layer and nowhere else", () => {
-    let comp = C([L(1), L(2)], layerId(2));
-    comp = paintInto(comp, layerId(2), lay(new Map(), ["s0:AA"], RED));
-    expect(find(comp, layerId(1))?.plate.size).toBe(0);
-    expect(find(comp, layerId(2))?.plate.get("s0:AA")).toBe(RED);
+    const comp = C([L(1), L(2)], layerId(2));
+    const after = paintInto(comp, mustTarget(comp), lay(new Map(), ["s0:AA"], RED));
+    expect(find(after, layerId(1))?.plate.size).toBe(0);
+    expect(find(after, layerId(2))?.plate.get("s0:AA")).toBe(RED);
   });
 
   it("commits as one undoable rung, and undo puts the plate back", () => {
     const start = newSession(C([L(1)], layerId(1)));
     const edits = lay(new Map(), ["s0:AA", "s0:AB"], RED);
-    const out = commitPaint(start, { edits });
-    expect(out.ok).toBe(true);
-    if (!out.ok) return;
-    expect(find(out.value.composition, layerId(1))?.plate.size).toBe(2);
-    const back = undo(out.value);
+    const live = paintInto(start.composition, mustTarget(start.composition), edits);
+    const out = act(
+      { ...start, composition: live },
+      [{ kind: "paint", layer: layerId(1), stroke: { edits } }],
+      "painted"
+    );
+    expect(find(out.composition, layerId(1))?.plate.size).toBe(2);
+    const back = undo(out);
     expect(find(back.session.composition, layerId(1))?.plate.size).toBe(0);
     const again = redo(back.session);
     expect(find(again.session.composition, layerId(1))?.plate.size).toBe(2);
   });
 
+  /**
+   * The half of the drag contract that stops the live apply and the journalled
+   * commit from falling out of step: an edit carries the colour it wrote, so
+   * landing it twice is landing it once.
+   */
   it("re-applies a live gesture harmlessly, which is the drag contract", () => {
     const start = newSession(C([L(1)], layerId(1)));
     const edits = lay(new Map(), ["s0:AA", "s0:AB"], RED);
-    // The drag: applied live, application by application.
-    const live = paintInto(start.composition, layerId(1), edits);
-    // The commit: the same edits again, against the composition they landed on.
-    const out = commitPaint({ ...start, composition: live }, { edits });
-    expect(out.ok).toBe(true);
-    if (!out.ok) return;
-    expect([...(find(out.value.composition, layerId(1))?.plate ?? new Map())]).toEqual(
-      [...(find(live, layerId(1))?.plate ?? new Map())]
+    const once = paintInto(start.composition, mustTarget(start.composition), edits);
+    const twice = paintInto(once, mustTarget(once), edits);
+    expect([...(find(twice, layerId(1))?.plate ?? new Map())]).toEqual(
+      [...(find(once, layerId(1))?.plate ?? new Map())]
     );
-    // And one press still takes the whole gesture back to where it started.
-    expect(find(undo(out.value).session.composition, layerId(1))?.plate.size).toBe(0);
   });
 
-  it("declines to commit into a layer that was locked mid-gesture", () => {
-    const start = newSession(C([L(1)], layerId(1)));
-    const locked = {
-      ...start,
-      composition: setLocked(start.composition, layerId(1), true),
-    };
-    const out = commitPaint(locked, { edits: lay(new Map(), ["s0:AA"], RED) });
-    expect(out.ok).toBe(false);
+  /**
+   * THE GUARD IS THE TYPE NOW.
+   *
+   * `paintInto` used to take a bare `LayerId` and would paint into a locked or
+   * hidden layer without a word; the app was correct only because the page
+   * re-checked `paintTarget` itself, and the function that DID check —
+   * `commitPaint` — was dead, referenced nowhere but in comments. There is no
+   * way to reach `paintInto` past these refusals now, because a `Target` is
+   * unconstructable outside `layers.ts`.
+   */
+  it("refuses a target on a locked layer, so there is nothing to paint with", () => {
+    const start = C([L(1)], layerId(1));
+    const locked = setLocked(start, layerId(1), true);
+    const t = paintTarget(locked);
+    expect(t.ok).toBe(false);
+    if (t.ok) return;
+    expect(t.why).toBe("locked");
+  });
+
+  it("refuses a target on a hidden layer too", () => {
+    const start = C([L(1)], layerId(1));
+    const t = paintTarget(setVisible(start, layerId(1), false));
+    expect(t.ok).toBe(false);
+    if (t.ok) return;
+    expect(t.why).toBe("hidden");
+  });
+
+  it("refuses a target inside a locked PARENT, and says which", () => {
+    const comp = C([L(1, [], { locked: true, children: [L(2)] })], layerId(2));
+    const t = paintTarget(comp);
+    expect(t.ok).toBe(false);
+    if (t.ok) return;
+    expect(t.why).toBe("locked");
+    expect(t.said).toMatch(/inside a locked layer/);
   });
 
   it("carries a stroke's mark through untouched, for the replay", () => {
     const start = newSession(C([L(1)], layerId(1)));
-    const out = commitPaint(start, {
-      edits: lay(new Map(), ["s0:AA"], RED),
-      mark: { mode: 6, groups: [["s0:AA"]] },
-    });
-    expect(out.ok).toBe(true);
-    if (!out.ok) return;
-    const move = out.value.journal.past[0].moves[0];
+    const out = act(
+      start,
+      [
+        {
+          kind: "paint",
+          layer: layerId(1),
+          stroke: {
+            edits: lay(new Map(), ["s0:AA"], RED),
+            mark: { mode: 6, groups: [["s0:AA"]] },
+          },
+        },
+      ],
+      "painted"
+    );
+    const move = out.journal.past[0].moves[0];
     expect(move.kind).toBe("paint");
     if (move.kind === "paint") expect(move.stroke.mark?.mode).toBe(6);
   });
@@ -849,6 +1055,137 @@ describe("paste is a graft and never a flatten", () => {
     expect(made.layer.children).toHaveLength(2);
     expect(made.nextId).toBe(51);
   });
+
+  it("carries a pasted subtree's OWN switches onto its fresh ids", () => {
+    const source = C([L(1, [], { children: [L(2, [], { visible: false })] })]);
+    const node = copyLayer(source, layerId(1));
+    expect(node).not.toBe(null);
+    if (node === null) return;
+    const out = pasteInto(
+      newSession(emptyComposition()),
+      node,
+      switchesIn(source, node)
+    );
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    // The ids were re-minted, so the hidden one is found by name rather than id.
+    const hidden = walk(out.value.composition).find((v) => v.layer.name === "L2");
+    expect(hidden?.own.visible).toBe(false);
+  });
+});
+
+// ── the model obeys the file format ──────────────────────────────────────
+
+/**
+ * WHAT THE MODEL PERMITS, THE FILE MUST ACCEPT.
+ *
+ * `artfile.ts` has always enforced `MAX_LAYER_DEPTH` and `MAX_LAYERS`, and it
+ * enforced them in the READER only, while this file's header said in as many
+ * words that "no depth limit is imposed". So a document could be built past the
+ * ceiling, saved without complaint, and then refused on the way back in — the
+ * work is lost at the moment the person tries to open it, which is the worst
+ * shape a loss can take because they find out after they have closed it.
+ *
+ * The limits are imported from `artfile.ts` rather than restated, so these
+ * tests measure the two files agreeing rather than a number written twice.
+ */
+describe("a document the file format would refuse is refused here", () => {
+  /** A chain `deep` layers tall: one layer, one child, all the way down. */
+  const chain = (deep: number): Layer => {
+    let node = L(deep);
+    for (let k = deep - 1; k >= 1; k--) node = L(k, [], { children: [node] });
+    return node;
+  };
+
+  it("refuses a paste that would nest past the format's ceiling", () => {
+    const s = newSession(C([L(900)], layerId(900)));
+    // One host layer plus a chain of MAX_LAYER_DEPTH lands one too deep.
+    const out = pasteInto(s, chain(MAX_LAYER_DEPTH));
+    expect(out.ok).toBe(false);
+    if (out.ok) return;
+    expect(out.why).toBe("too-deep");
+    expect(out.said).toMatch(new RegExp(String(MAX_LAYER_DEPTH)));
+  });
+
+  it("allows a paste that lands exactly ON the ceiling", () => {
+    const s = newSession(C([L(900)], layerId(900)));
+    const out = pasteInto(s, chain(MAX_LAYER_DEPTH - 1));
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(census(out.value.composition).deepest).toBe(MAX_LAYER_DEPTH);
+  });
+
+  /**
+   * THE BOUNDARY, MEASURED AGAINST THE READER AT BOTH ENDS.
+   *
+   * The claim is not "the model has a limit" but "the model's limit is the
+   * file's limit", so it is checked by round-tripping through `artfile.ts`
+   * rather than against a number restated here: the deepest document paste now
+   * allows must load, and one layer deeper — the document paste now refuses —
+   * must not. If either file moves its ceiling alone, this fails.
+   */
+  /** The document's NESTING, as the file states it — which is what the reader
+   *  measures. Ids and children only: the limit is about the shape of the walk,
+   *  and paint plays no part in it. */
+  const asArtLayers = (stack: readonly Layer[]): ArtLayer[] =>
+    stack.map((l) => ({
+      id: l.id,
+      ...(l.children.length === 0 ? {} : { children: asArtLayers(l.children) }),
+    }));
+
+  const loads = (comp: Composition): boolean => {
+    const payload: ArtPayload = {
+      version: 1,
+      canvas: "hexagon",
+      depth: 2,
+      convention: "apex",
+      cells: [],
+      comp: { layers: asArtLayers(comp.layers) },
+    };
+    return extractArt(encodeArt(payload)) !== null;
+  };
+
+  it("what paste now allows, the reader accepts", () => {
+    const s = newSession(C([L(900)], layerId(900)));
+    const out = pasteInto(s, chain(MAX_LAYER_DEPTH - 1));
+    expect(out.ok).toBe(true);
+    if (!out.ok) return;
+    expect(census(out.value.composition).deepest).toBe(MAX_LAYER_DEPTH);
+    expect(loads(out.value.composition)).toBe(true);
+  });
+
+  it("what paste now refuses, the reader would have rejected", () => {
+    // The document the old code built happily and could never load again.
+    const overDeep = C([L(900, [], { children: [chain(MAX_LAYER_DEPTH)] })]);
+    expect(census(overDeep).deepest).toBe(MAX_LAYER_DEPTH + 1);
+    expect(loads(overDeep)).toBe(false);
+  });
+
+  it("refuses an indent that would nest past the ceiling", () => {
+    // A chain MAX_LAYER_DEPTH tall with a sibling below its root: indenting the
+    // root into that sibling would put its deepest layer one over.
+    const s = newSession(
+      C([L(800), chain(MAX_LAYER_DEPTH)], layerId(1))
+    );
+    const out = demote(s);
+    expect(out.ok).toBe(false);
+    if (out.ok) return;
+    expect(out.why).toBe("too-deep");
+  });
+
+  it("refuses a moveLayer that would nest past the ceiling", () => {
+    const s = newSession(C([L(800), chain(MAX_LAYER_DEPTH)], layerId(1)));
+    const out = moveLayer(s, layerId(1), layerId(800), 0);
+    expect(out.ok).toBe(false);
+    if (out.ok) return;
+    expect(out.why).toBe("too-deep");
+  });
+
+  it("still allows an indent that stays inside the ceiling", () => {
+    const s = newSession(C([L(800), chain(3)], layerId(1)));
+    const out = demote(s);
+    expect(out.ok).toBe(true);
+  });
 });
 
 // ── migration ────────────────────────────────────────────────────────────
@@ -867,8 +1204,7 @@ describe("migration from a single plate", () => {
     expect(comp.layers[0].children).toHaveLength(0);
     expect(comp.layers[0].plate).toBe(plate);
     expect(comp.layers[0].name).toBe("Layer 1");
-    expect(comp.layers[0].visible).toBe(true);
-    expect(comp.layers[0].locked).toBe(false);
+    expect(switchesOf(comp, comp.layers[0].id)).toEqual(OPEN);
     expect(comp.selected).toBe(comp.layers[0].id);
   });
 
@@ -975,7 +1311,7 @@ describe("the serialiser's interface", () => {
 
   it("carries the EFFECTIVE answer, not the layer's own switch", () => {
     const child = slices(doc()).find((s) => s.node.id === layerId(3));
-    expect(child?.node.visible).toBe(true);
+    expect(child?.own.visible).toBe(true);
     expect(child?.effective.shown).toBe(false);
   });
 
@@ -1187,11 +1523,25 @@ describe("the operations are total", () => {
     expect(act(s, [], "nothing")).toBe(s);
   });
 
+  /**
+   * The journal coming apart is the one failure a drawing program cannot
+   * recover from, so it is loud. Reached through `applyMove` rather than
+   * `paintInto`, because `paintInto` now takes a checked `Target` and one
+   * naming an absent layer cannot be constructed — which is the point of it.
+   */
   it("a paint into a layer that is not there is loud, not silent", () => {
     const s = C([L(1)]);
-    expect(() => paintInto(s, layerId(9), [{ cell: "s0:AA", from: null, to: RED }])).toThrow(
-      /no layer/
-    );
+    expect(() =>
+      applyMove(
+        s,
+        {
+          kind: "paint",
+          layer: layerId(9),
+          stroke: { edits: [{ cell: "s0:AA", from: null, to: RED }] },
+        },
+        "do"
+      )
+    ).toThrow(/no layer/);
   });
 
   it("holds an empty document without special-casing it", () => {
@@ -1206,7 +1556,11 @@ describe("the operations are total", () => {
   it("applies plate edits through `plate.ts` and nothing else", () => {
     const start: AddressPlate = new Map([["s0:AA", GOLD]]);
     const edits = planPlateEdits(start, book2, ["s0:AA"], [null]);
-    const comp = paintInto(C([L(1, [], { plate: start })]), layerId(1), edits);
+    const doc = C([L(1, [], { plate: start })], layerId(1));
+    const t = paintTarget(doc);
+    expect(t.ok).toBe(true);
+    if (!t.ok) return;
+    const comp = paintInto(doc, t.value, edits);
     const direct = applyPlateEdits(start, edits, "do");
     expect([...(find(comp, layerId(1))?.plate ?? new Map())]).toEqual([...direct]);
   });

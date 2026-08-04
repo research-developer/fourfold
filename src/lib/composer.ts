@@ -45,14 +45,19 @@
 import {
   applyMove,
   layerId,
+  OPEN,
+  switchesOf,
   type Act,
   type Composition,
   type Effective,
+  type Journal,
   type Layer,
   type LayerId,
   type Move,
   type Stack,
+  type Switches,
 } from "./layers";
+import type { EventLog } from "./brush";
 import {
   resolvePlate,
   type Address,
@@ -192,6 +197,27 @@ export const actPaints = (act: Act): boolean =>
   act.moves.some((m) => m.kind === "paint");
 
 /**
+ * The colour progression's event log, READ OFF THE JOURNAL.
+ *
+ * There is no second stack to keep in step any more — `Act.events` is the whole
+ * record, so this is a projection rather than a copy, and it cannot be pushed
+ * apart from the history it shadows. Undo and redo move both because they move
+ * one; `HISTORY_LIMIT` trims both because it trims one; and an act that nobody
+ * remembered to count spends zero rather than nothing, which is the case
+ * (`clearLayer`) that used to slide every later stroke's hue.
+ *
+ * Derived on demand rather than stored, on exactly the argument `Effective`
+ * makes in `layers.ts`: a value computed from the authority cannot disagree
+ * with it.
+ */
+export function eventsOf(journal: Journal): EventLog {
+  return {
+    past: journal.past.map((a) => a.events),
+    future: journal.future.map((a) => a.events),
+  };
+}
+
+/**
  * The journal as the list of GESTURES the replay was written against.
  *
  * One stroke per act, holding every paint move's edits in order. An act that
@@ -236,8 +262,11 @@ export function emitLayersOf(
 ): readonly EmitLayer[] {
   const one = (l: Layer): EmitLayer => {
     const out: EmitLayer = { id: l.id, name: l.name };
-    if (!l.visible) out.hidden = true;
-    if (l.locked) out.locked = true;
+    // The layer's OWN switches, read off the composition — they are not on the
+    // layer, and `layers.Switches` says why.
+    const own = switchesOf(comp, l.id);
+    if (!own.visible) out.hidden = true;
+    if (own.locked) out.locked = true;
     if (l.plate.size !== 0) out.paint = resolvePlate(l.plate, book);
     if (l.children.length !== 0) out.children = l.children.map(one);
     return out;
@@ -263,8 +292,14 @@ export function stackFromEmit(
   list: readonly EmitLayer[],
   book: AddressBook,
   nextId: number
-): { stack: Stack; nextId: number } {
+): { stack: Stack; nextId: number; switches: ReadonlyMap<LayerId, Switches> } {
   let n = nextId;
+  // Returned ALONGSIDE the stack rather than written into it: a `Layer` does
+  // not hold its switches (see `layers.Switches`), so the file's `hidden` and
+  // `locked` come back keyed by the ids minted here, and the caller carries
+  // them into the document — `pasteInto` takes exactly this map as `from`.
+  // A file that hides nothing yields an empty map.
+  const switches = new Map<LayerId, Switches>();
   const one = (l: EmitLayer): Layer => {
     const id = layerId(n);
     n += 1;
@@ -275,20 +310,16 @@ export function stackFromEmit(
         if (addr !== undefined) plate.set(addr, hex);
       }
     }
+    if (l.hidden === true || l.locked === true) {
+      switches.set(id, { visible: l.hidden !== true, locked: l.locked === true });
+    }
     // The children are read AFTER this layer's own id is minted, so the ids
     // ascend in paint order and a file reads the way the panel does.
     const children = l.children === undefined ? [] : l.children.map(one);
-    return {
-      id,
-      name: l.name ?? l.id,
-      visible: l.hidden !== true,
-      locked: l.locked === true,
-      plate,
-      children,
-    };
+    return { id, name: l.name ?? l.id, plate, children };
   };
   const stack = list.map(one);
-  return { stack, nextId: n };
+  return { stack, nextId: n, switches };
 }
 
 /**
@@ -332,6 +363,15 @@ export interface PanelRow {
   readonly layer: Layer;
   /** 0 for a top-level layer. How far the row is indented. */
   readonly depth: number;
+  /**
+   * This layer's OWN two switches — what the row's buttons show and toggle.
+   *
+   * Different from `effective`, which is the inherited answer: a visible layer
+   * inside a hidden parent has `own.visible` true and `effective.shown` false,
+   * and the row says both things. Read off the composition because a `Layer`
+   * does not carry them; see `layers.Switches`.
+   */
+  readonly own: Switches;
   readonly effective: Effective;
   /** True when this row holds sub-layers, listed ABOVE it. */
   readonly group: boolean;
@@ -386,9 +426,10 @@ export function panelRows(comp: Composition): readonly PanelRow[] {
   ): void => {
     for (let k = stack.length - 1; k >= 0; k--) {
       const layer = stack[k];
+      const own = comp.switches.get(layer.id) ?? OPEN;
       const effective: Effective = {
-        shown: ancestorShown && layer.visible,
-        editable: !ancestorLocked && !layer.locked,
+        shown: ancestorShown && own.visible,
+        editable: !ancestorLocked && !own.locked,
       };
       // `k > 0` — there is a sibling BELOW this one, so the guide for this
       // level continues past the rows of this subtree.
@@ -397,11 +438,12 @@ export function panelRows(comp: Composition): readonly PanelRow[] {
         depth + 1,
         [...spine, k > 0],
         effective.shown,
-        ancestorLocked || layer.locked
+        ancestorLocked || own.locked
       );
       out.push({
         layer,
         depth,
+        own,
         effective,
         group: layer.children.length > 0,
         spine,

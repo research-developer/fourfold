@@ -20,19 +20,25 @@
 import { describe, expect, it } from "vitest";
 import { buildHexagon } from "../src/lib/hexagon";
 import { addressBook, type Address, type AddressBook } from "../src/lib/plate";
+import { progressionIndex } from "../src/lib/brush";
+import { HISTORY_LIMIT } from "../src/lib/strokes";
 import {
   act,
   addLayer,
   arrange,
+  clearLayer,
   emptyComposition,
   find,
   flatten,
   fromPlate,
   layerId,
   newSession,
+  OPEN,
   pasteInto,
+  redo,
   removeLayer,
-
+  switchesOf,
+  undo,
   type Composition,
   type Layer,
   type Move,
@@ -44,6 +50,7 @@ import {
   actStrokes,
   clampAct,
   emitLayersOf,
+  eventsOf,
   everyComposition,
   idsIn,
   invertMove,
@@ -69,13 +76,19 @@ const paint = (layer: string, cell: string, from: string | null, to: string | nu
 
 /** The shape of a tree, as a string, so two trees can be compared by eye. */
 function shape(comp: Composition): string {
+  // The switches are read off the COMPOSITION — they are not on the layer any
+  // more, and `layers.Switches` says why.
   const go = (list: readonly Layer[]): string =>
     list
       .map(
-        (l) =>
-          `${l.id}:${l.name}${l.visible ? "" : "-hid"}${l.locked ? "-lock" : ""}` +
+        (l) => {
+          const own = switchesOf(comp, l.id);
+          return (
+          `${l.id}:${l.name}${own.visible ? "" : "-hid"}${own.locked ? "-lock" : ""}` +
           `{${[...l.plate.entries()].sort().map(([a, c]) => `${a}=${c}`).join(",")}}` +
           (l.children.length === 0 ? "" : `(${go(l.children)})`)
+          );
+        }
       )
       .join(" ");
   return go(comp.layers);
@@ -205,8 +218,6 @@ describe("reverting", () => {
     const node: Layer = {
       id: layerId(9),
       name: "N",
-      visible: true,
-      locked: false,
       plate: new Map(),
       children: [],
     };
@@ -280,28 +291,31 @@ describe("the composition, through the file", () => {
     const inner: Layer = {
       id: layerId(3),
       name: "Inner",
-      visible: true,
-      locked: true,
       plate: plate(["s2:AA", "#333333"]),
       children: [],
     };
     const outer: Layer = {
       id: layerId(2),
       name: "Outer",
-      visible: false,
-      locked: false,
       plate: plate(["s1:BB", "#222222"]),
       children: [inner],
     };
     const ground: Layer = {
       id: layerId(1),
       name: "Ground",
-      visible: true,
-      locked: false,
       plate: plate(["s0:AA", "#111111"]),
       children: [],
     };
-    return { layers: [ground, outer], selected: ground.id, nextId: 4 };
+    return {
+      layers: [ground, outer],
+      selected: ground.id,
+      nextId: 4,
+      // The two switches, on the composition where they belong.
+      switches: new Map([
+        [outer.id, { visible: false, locked: false }],
+        [inner.id, { visible: true, locked: true }],
+      ]),
+    };
   }
 
   it("carries every OWN switch out and back, and no inherited one", () => {
@@ -315,11 +329,14 @@ describe("the composition, through the file", () => {
     expect(child?.hidden).toBeUndefined();
     expect(child?.locked).toBe(true);
 
-    const back = stackFrom(out);
-    expect(back[0].visible).toBe(true);
-    expect(back[1].visible).toBe(false);
-    expect(back[1].children[0].visible).toBe(true);
-    expect(back[1].children[0].locked).toBe(true);
+    // The switches come back BESIDE the stack, keyed by the ids just minted.
+    const built = stackFromEmitAt(out, 1);
+    const own = (l: Layer) => built.switches.get(l.id) ?? OPEN;
+    const back = built.stack;
+    expect(own(back[0]).visible).toBe(true);
+    expect(own(back[1]).visible).toBe(false);
+    expect(own(back[1].children[0]).visible).toBe(true);
+    expect(own(back[1].children[0]).locked).toBe(true);
   });
 
   it("carries names, nesting and paint out and back", () => {
@@ -334,8 +351,11 @@ describe("the composition, through the file", () => {
   it("composites to the same picture after the round trip", () => {
     const comp = nested();
     const before = flatten(comp, BOOK);
-    const back = stackFrom(emitLayersOf(comp, BOOK));
-    const after = flatten({ layers: back, selected: null, nextId: 99 }, BOOK);
+    const built = stackFromEmitAt(emitLayersOf(comp, BOOK), 1);
+    const after = flatten(
+      { layers: built.stack, selected: null, nextId: 99, switches: built.switches },
+      BOOK
+    );
     expect([...after.entries()].sort()).toEqual([...before.entries()].sort());
   });
 
@@ -368,8 +388,6 @@ describe("the composition, through the file", () => {
     const one: Layer = {
       id: layerId(0),
       name: "Doc",
-      visible: true,
-      locked: false,
       plate: new Map(),
       children: node,
     };
@@ -400,8 +418,6 @@ describe("counting a subtree", () => {
     const l: Layer = {
       id: layerId(1),
       name: "L",
-      visible: true,
-      locked: false,
       // One coarse address, which resolves onto four cells at depth 2.
       plate: plate(["s0:A", "#111111"]),
       children: [],
@@ -416,16 +432,12 @@ describe("counting a subtree", () => {
     const inner: Layer = {
       id: layerId(2),
       name: "in",
-      visible: true,
-      locked: false,
       plate: plate(["s0:AA", "#222222"]),
       children: [],
     };
     const outer: Layer = {
       id: layerId(1),
       name: "out",
-      visible: true,
-      locked: false,
       plate: plate(["s0:AA", "#111111"], ["s0:AB", "#111111"]),
       children: [inner],
     };
@@ -446,8 +458,6 @@ describe("the panel's rows", () => {
     const bare = (n: number, name: string, children: Layer[] = []): Layer => ({
       id: layerId(n),
       name,
-      visible: true,
-      locked: false,
       plate: new Map(),
       children,
     });
@@ -455,6 +465,7 @@ describe("the panel's rows", () => {
       layers: [bare(1, "ground"), bare(2, "mid", [bare(3, "kid")]), bare(4, "top")],
       selected: null,
       nextId: 5,
+      switches: new Map(),
     };
   }
 
@@ -500,17 +511,13 @@ describe("the panel's rows", () => {
     const comp = tree();
     const hidden: Composition = {
       ...comp,
-      layers: [
-        comp.layers[0],
-        { ...comp.layers[1], visible: false, locked: true },
-        comp.layers[2],
-      ],
+      switches: new Map([[comp.layers[1].id, { visible: false, locked: true }]]),
     };
     const rows = panelRows(hidden);
     const kid = rows.find((r) => r.layer.name === "kid") as PanelRow;
     // Its OWN switches are untouched; the inherited answers are both false.
-    expect(kid.layer.visible).toBe(true);
-    expect(kid.layer.locked).toBe(false);
+    expect(kid.own.visible).toBe(true);
+    expect(kid.own.locked).toBe(false);
     expect(kid.effective.shown).toBe(false);
     expect(kid.effective.editable).toBe(false);
     const top = rows.find((r) => r.layer.name === "top") as PanelRow;
@@ -550,6 +557,103 @@ describe("the panel's rows", () => {
     if (!gone.ok) return;
     expect(gone.value.composition.layers).toHaveLength(0);
     expect(panelRows(gone.value.composition)).toHaveLength(0);
+  });
+});
+
+// ── the colour progression's counter ─────────────────────────────────────
+
+/**
+ * ONE STACK, NOT TWO.
+ *
+ * The colouring-event count used to live in a second stack beside the journal,
+ * pushed by whichever call site remembered. Three did — a stroke pushed what it
+ * spent, a revert pushed zero, a preset pushed what it spent — and CLEAR did
+ * not, because the page calls `clearLayer` through the same `run` every
+ * structural control uses. So a clear added a journal rung with no matching
+ * event rung, and the next undo popped a rung belonging to a DIFFERENT gesture.
+ * Measured before the fix: two journal rungs against one event rung, and a
+ * progression index of 3 that undoing the clear took to 0 — every later stroke
+ * silently the wrong hue, and unrecoverable without NEW.
+ *
+ * `Act.events` carries the count now, so the log is a PROJECTION of the journal
+ * and the two cannot be pushed apart. These tests measure that they never are.
+ */
+describe("the event log is the journal", () => {
+  const RED = "#c0392b";
+  const GOLD = "#d4a017";
+
+  /** A session holding one painted layer, selected. */
+  const painted = (): Session => {
+    const s = newSession(fromPlate(plate(["s0:AA", RED])));
+    return s;
+  };
+
+  /** One paint act spending `events` colouring events. */
+  const stroke = (s: Session, cell: string, events: number): Session =>
+    act(
+      s,
+      [
+        {
+          kind: "paint",
+          layer: s.composition.layers[0].id,
+          stroke: { edits: [{ cell: cell as Address, from: null, to: GOLD }] },
+        },
+      ],
+      "painted",
+      events
+    );
+
+  it("gives every journalled act exactly one event rung, CLEAR included", () => {
+    let s = stroke(painted(), "s0:AB", 3);
+    const cleared = clearLayer(s);
+    expect(cleared.ok).toBe(true);
+    if (!cleared.ok) return;
+    s = cleared.value;
+    // Two acts, two rungs. This is the count that used to come out 2 against 1.
+    expect(s.journal.past).toHaveLength(2);
+    expect(eventsOf(s.journal).past).toHaveLength(2);
+  });
+
+  it("spends nothing on a clear, so undoing one does not move the index", () => {
+    let s = stroke(painted(), "s0:AB", 3);
+    const before = progressionIndex(eventsOf(s.journal), 0);
+    expect(before).toBe(3);
+
+    const cleared = clearLayer(s);
+    expect(cleared.ok).toBe(true);
+    if (!cleared.ok) return;
+    s = cleared.value;
+    // A clear spends no colour, so the index does not move when it lands...
+    expect(progressionIndex(eventsOf(s.journal), 0)).toBe(before);
+    // ...nor when it is taken back. It used to fall to 0 here, for good.
+    expect(progressionIndex(eventsOf(undo(s).session.journal), 0)).toBe(before);
+  });
+
+  it("moves the count with the gesture through undo and redo", () => {
+    const s = stroke(stroke(painted(), "s0:AB", 3), "s0:AC", 2);
+    expect(progressionIndex(eventsOf(s.journal), 0)).toBe(5);
+    const back = undo(s);
+    expect(progressionIndex(eventsOf(back.session.journal), 0)).toBe(3);
+    expect(eventsOf(back.session.journal).future).toEqual([2]);
+    const again = redo(back.session);
+    expect(progressionIndex(eventsOf(again.session.journal), 0)).toBe(5);
+  });
+
+  it("counts nothing for every structural act, by default", () => {
+    let s = addLayer(newSession(emptyComposition()));
+    s = addLayer(s);
+    const moved = arrange(s, "down");
+    expect(moved.ok).toBe(true);
+    if (!moved.ok) return;
+    expect(eventsOf(moved.value.journal).past.every((n) => n === 0)).toBe(true);
+    expect(progressionIndex(eventsOf(moved.value.journal), 0)).toBe(0);
+  });
+
+  it("trims both stacks together, because there is only one", () => {
+    let s = newSession(fromPlate(plate(["s0:AA", RED])));
+    for (let k = 0; k < HISTORY_LIMIT + 4; k++) s = stroke(s, "s0:AB", 1);
+    expect(s.journal.past).toHaveLength(HISTORY_LIMIT);
+    expect(eventsOf(s.journal).past).toHaveLength(HISTORY_LIMIT);
   });
 });
 
