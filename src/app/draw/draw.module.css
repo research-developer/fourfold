@@ -6,12 +6,14 @@
    ============================================================ */
 
 .page {
+  /* The one token this page defines for itself; the rest come from
+     globals.css. There were five more here — --d-spine, --d-boundary and the
+     three --d-median-* — set at the top where a token block goes and read by
+     nothing in src/. The mirror families that once used them draw their own
+     colours in BrushDial.tsx and DrawBoard.tsx now. Two of the five were also
+     the only place this file spelled the amber out as a hex literal instead of
+     reaching for var(--warn), so that goes with them. */
   --d-rot: #a78bfa;
-  --d-spine: #67e8f9;
-  --d-boundary: #f59e0b;
-  --d-median-a: #67e8f9;
-  --d-median-b: #4ade80;
-  --d-median-c: #f59e0b;
 
   max-width: 1560px;
   margin: 0 auto;
@@ -1773,6 +1775,8 @@
 }
 
 .rewindAction {
+  position: relative;
+  overflow: hidden;
   flex: none;
   font-size: 9px;
   letter-spacing: 0.14em;
@@ -1784,6 +1788,25 @@
 .rewindAction:hover:not(:disabled) {
   border-color: var(--preview-accent);
   background: rgba(167, 139, 250, 0.12);
+}
+
+/**
+ * How far the GIF has got.
+ *
+ * A width driven from React rather than a CSS animation, and that is the point:
+ * `.armFuse` counts DOWN a known duration, which a keyframe can do on its own,
+ * and this one reports WORK, which nothing but the work itself knows about. A
+ * bar that animated smoothly to a guessed finish would be a lie a person could
+ * catch. The button also carries the per cent as text, because a progress bar
+ * with no number is not readable by a screen reader.
+ */
+.gifFuse {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--preview-accent);
+  transition: width 90ms linear;
 }
 
 /**
@@ -3148,7 +3171,11 @@
   .marching,
   .commitBtn,
   .helpScrim,
-  .helpPanel {
+  .helpPanel,
+  /* The save menu was simply missed: it slides and fades in on open like the
+     help panel beside it, and unlike the two exemptions below it displays
+     nothing — it is decoration on an element that is already there. */
+  .menu {
     animation: none;
   }
   /* The fuse keeps its animation: it is not decoration, it is the only display

@@ -82,12 +82,33 @@
  *
  * The shortest encoding was measured and NOT taken: wrap the drawing in
  * `transform="matrix(u, 0, u/2, −u√3/2, 0, 0)"` and every position becomes a
- * small exact integer — 19 030 bytes gzipped at depth 5, a further 22% off. It
- * is rejected because that matrix is a shear. Its singular values are √1.5 and
- * √0.5, so a stroke of one width comes out 1.22 wide in one direction and 0.71
- * in another: the hairline that shows the tiling would be 73% heavier along one
- * axis than another. A file that is smaller and draws a different picture is
- * not smaller.
+ * small exact integer — 19 030 bytes gzipped at depth 5, a further 22% off.
+ *
+ * The reason to reject it is NOT that the matrix is a shear and would draw the
+ * hairline 73% heavier along one axis than another. That is true, and it is
+ * answered by `vector-effect="non-scaling-stroke"` in about 150 bytes, so it is
+ * a solvable objection rather than a decisive one. Two things are decisive:
+ *
+ *   EXACTNESS DIES. The entry `−u·√3/2` is irrational and has to be written at
+ *   finite precision, so every cell's y becomes `b ×` a rounded number and the
+ *   error grows with the row index rather than staying bounded. At depth 5 the
+ *   unit is 16, the entry is 13.856406…, and writing it to the file's own two
+ *   decimals costs 0.0036 per row; `b` reaches 64 there, so the last row lands
+ *   0.23 units from where it belongs. That is more than ten times
+ *   `artfile.GEOMETRY_PRECISION`, so it destroys the invariant this module is
+ *   built on — that the anchor plus the prototype reproduces the number
+ *   `artworkSvg` writes EXACTLY — and it does it worse the further down the
+ *   picture you look. `test/emit.test.ts` measures the 0.23.
+ *
+ *   IT BREAKS THIS REPO'S OWN READERS. `artfile.importByGeometry` and
+ *   `resolvedShapes` both compare a file's coordinates against the canvas's
+ *   own, and neither applies a transform — nothing in this codebase composes a
+ *   CTM. Under a matrix every coordinate in the file is in lattice units and
+ *   every coordinate they match against is in pixels, so a file this program
+ *   wrote would import as zero matched cells from this program.
+ *
+ * A file that is smaller and draws a different picture is not smaller, and one
+ * its own loader cannot read is not a file.
  *
  * ── The markup is indented, and that is nearly free ─────────────────────
  *
@@ -105,10 +126,16 @@
  * palette with it.
  *
  * Every flag written into the markup is the layer's OWN. `hidden` becomes
- * `display:none`, which hides the descendants when the file is rendered while
- * leaving each of them saying what it says — so a round trip through a hidden
- * parent does not permanently mark the children hidden. Same for `opacity`,
- * which SVG already composites down the tree.
+ * `display="none"` and `opacity` becomes `opacity="…"`, both of which SVG
+ * already composites down the tree, so the rendered file hides or fades the
+ * descendants of a hidden or faded group without any of them being written as
+ * hidden or faded themselves.
+ *
+ * That the round trip does not permanently mark the children is a property of
+ * the PAYLOAD and not of those attributes: `parse` never reads `display` or
+ * `opacity` out of the markup at all — every flag it returns comes from the
+ * payload comment, where each layer states its own. The attributes are how the
+ * file DRAWS; the payload is what it MEANS.
  *
  * ── Reading is text and regex only ──────────────────────────────────────
  *
@@ -121,6 +148,7 @@
  */
 
 import {
+  attrOf,
   encodeArt,
   extractArt,
   formatRanges,
@@ -256,10 +284,15 @@ export type EmitScope = { readonly layer: string } | undefined;
  * Two is the answer for every ordinary drawing — the figure has two cell shapes
  * and that is the whole point of this module. It is a LIMIT rather than an
  * assertion because the relief bakes a per-ring scale into the vertices and
- * genuinely destroys the congruence: at depth 4 a relieved plate has 1134
- * distinct shapes among 1536 cells, and a prototype per shape would be a bigger
- * file than plain polygons. Past this limit the emitter writes polygons, which
- * is the honest thing to do about a picture whose cells are not congruent.
+ * genuinely destroys the congruence: at depth 4 a relieved plate has 1130
+ * distinct shapes among 1536 cells — and 278 among 384 at depth 3, in both
+ * readings — so a prototype per shape would be a bigger file than plain
+ * polygons. Those counts are reproduced by `test/emit.test.ts` rather than
+ * remembered here; they were 1134 and 282 when this was first written, and a
+ * comment that says "measured" has to still measure.
+ *
+ * Past this limit the emitter writes polygons, which is the honest thing to do
+ * about a picture whose cells are not congruent.
  *
  * Eight rather than two so a canvas that ever has a handful of shapes — a mixed
  * depth, a decorated rim — still gets the saving.
@@ -286,12 +319,36 @@ const escapeText = (s: string) =>
 
 const escapeAttr = (s: string) => escapeText(s).replace(/"/g, "&quot;");
 
+/** What `escapeAttr` writes, plus the two numeric forms XML also allows. */
+const NAMED: Record<string, string> = { quot: '"', gt: ">", lt: "<", amp: "&" };
+
+/**
+ * An escaped attribute or text run, back as the characters it stands for.
+ *
+ * ONE pass, so an entity that appears in the OUTPUT of decoding another one is
+ * left alone: `&amp;lt;` is the four characters `&lt;` and not a `<`, which a
+ * chain of `.replace` calls gets right only by accident of ordering.
+ *
+ * The numeric forms are here because they round trip through this module and
+ * without them they round trip WRONG rather than not at all. A title written by
+ * another tool as `a &#60; b` came back as the literal text `a &#60; b`, and
+ * re-serialising it escaped the ampersand: `a &amp;#60; b`, which renders as
+ * `a &#60; b`. A saved file that says something different from the file it was
+ * loaded from is the one failure this module exists to prevent, and it does not
+ * matter that both files are well formed.
+ */
 const unescapeAttr = (s: string) =>
-  s
-    .replace(/&quot;/g, '"')
-    .replace(/&gt;/g, ">")
-    .replace(/&lt;/g, "<")
-    .replace(/&amp;/g, "&");
+  s.replace(
+    /&(?:(quot|gt|lt|amp)|#(\d{1,7})|#[xX]([0-9a-fA-F]{1,6}));/g,
+    (whole, name: string | undefined, dec: string | undefined, hex: string | undefined) => {
+      if (name !== undefined) return NAMED[name];
+      const code = dec === undefined ? parseInt(hex as string, 16) : Number(dec);
+      // A code point no character has, or one no document may contain, is left
+      // as the text it was written as rather than guessed at.
+      if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return whole;
+      return String.fromCodePoint(code);
+    }
+  );
 
 /** Three decimals for an alpha, exactly as `artworkSvg` writes one. */
 const fmtAlpha = (n: number): string => {
@@ -367,6 +424,15 @@ function shapeOf(cell: ArtCell): { sig: string; ax: number; ay: number } {
  * has. The variants are `u2`, `d2`, and so on, in discovery order, so a reader
  * meeting `#u2` knows it is an up triangle and that there is more than one way
  * to write one at two decimals.
+ *
+ * `taken` IS SEEDED WITH EVERY LAYER ID THE DOCUMENT WILL WRITE, and that is
+ * not a nicety. `artfile.RESERVED_IDS` keeps a layer from being called `u`, `d`,
+ * `tiling` or `paint`, but this function also mints `u2`, `d2`, `p` and `ux`,
+ * and a layer called `u2` is a perfectly legal payload — so the document came
+ * out with two `id="u2"`, round tripped happily, and handed a renderer a
+ * `<use href="#u2">` with two answers. An enumerable list of forbidden names
+ * has to be extended every time this function learns a new one, which is a rule
+ * that can fall behind. Reading the ids the document ACTUALLY holds cannot.
  */
 function prototypeId(sig: string, taken: ReadonlySet<string>): string {
   const mid = sig.split(" ")[1];
@@ -382,6 +448,141 @@ function prototypeId(sig: string, taken: ReadonlySet<string>): string {
 /** The full `points` text a cell would be written as, unfactored. */
 const pointsOf = (cell: ArtCell): string =>
   cell.verts.map((v) => `${fmtCoord(v[0])},${fmtCoord(v[1])}`).join(" ");
+
+// ── the document's own name ──────────────────────────────────────────────
+
+/**
+ * The id this document goes by, and the prefix on everything it puts into a
+ * namespace it does not own.
+ *
+ * ── Why a file needs a name at all ───────────────────────────────────────
+ *
+ * `<style>` INSIDE AN INLINE SVG IS A DOCUMENT-LEVEL STYLESHEET. It is not
+ * scoped to the `<svg>` it sits in, and `@keyframes` is not scoped to anything
+ * at all — not even `@scope` scopes an animation name, because animation names
+ * are resolved in one global namespace per document. So a file that wrote
+ * `.k0`, `.tile`, `[data-reveal]` and `@keyframes r0` was writing NINE generic
+ * global selectors into whatever page inlined it. Two of these on one page and
+ * the first artwork renders in the second one's palette, because both define
+ * `.k0` and the later one wins. Worse, a host page's own `<h1 data-reveal="3">`
+ * — a perfectly ordinary thing to write — picked up `opacity: 0`, an infinite
+ * iteration count and `animation-name: r3`, so the heading vanished and flashed
+ * on a three-second loop for as long as the page was open.
+ *
+ * Every selector is therefore written under `#ff……`, and every keyframe name
+ * carries it as a prefix. A page can inline as many of these as it likes.
+ *
+ * ── Why a hash and not a counter ─────────────────────────────────────────
+ *
+ * The id has to be a pure function of the file, because `serialise(parse(t))`
+ * must be `t` to the byte and a counter or a clock would break that on the
+ * second call. It is taken from the PAYLOAD, which is the document's whole
+ * model-side statement of itself, so two files with the same id are two files
+ * with the same drawing — and the fixed `ff` stem keeps it a legal CSS id
+ * selector, which a bare hex hash starting with a digit would not be.
+ *
+ * FNV-1a because it is four lines and this is a name, not a checksum: nothing
+ * is authenticated by it and nothing is looked up by it.
+ */
+function rootIdOf(payloadText: string, free: (id: string) => boolean): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < payloadText.length; i++) {
+    h ^= payloadText.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  const stem = `ff${(h >>> 8).toString(16).padStart(6, "0")}`;
+  if (free(stem)) return stem;
+  // A layer that happens to be named exactly this. Astronomically unlikely and
+  // cheap to answer, and the answer has to be deterministic like everything
+  // else here.
+  for (let n = 2; n < 1000; n++) if (free(`${stem}-${n}`)) return `${stem}-${n}`;
+  // Unreachable: `MAX_LAYERS` is 8192 and this asks 999 distinct questions of a
+  // set that would have to contain every one of the answers.
+  return `${stem}-x`;
+}
+
+/**
+ * How wide the payload comment is allowed to get before it wraps.
+ *
+ * The payload used to be ONE LINE, and at depth 5 that line was 92 056
+ * characters. A file this module spends 11% of its raw bytes indenting, on the
+ * argument that a person can open it and read it, cannot also ship a line that
+ * makes an editor hang — the two claims are the same claim and only one of them
+ * was being kept.
+ *
+ * Nothing about the FORMAT has to change to fix it. `artfile.MARKER_HEAD`
+ * already allows any run of whitespace after the version, `extractArt` finds
+ * the end of the body with `indexOf("-->")` rather than with a line-anchored
+ * pattern, and `JSON.parse` does not care where the whitespace between tokens
+ * is. `test/emit.test.ts` checks all three rather than trusting them.
+ *
+ * ── Why 320 and not 110 ──────────────────────────────────────────────────
+ *
+ * Because a line break inside the payload is NOT free the way the markup's
+ * indentation is, and the difference is large enough to change the answer. The
+ * indentation sits between elements, where deflate was going to restart a match
+ * anyway; a break inside the payload lands in the middle of the longest, most
+ * repetitive run in the file — thousands of `[index,"#rrggbb"],` — and cuts one
+ * match into two. Measured, depth 4, gzipped bytes against the same file with
+ * every newline removed:
+ *
+ *   payload on one line   1.022      ← the markup indent alone
+ *   wrapped at 110        1.103
+ *   wrapped at 200        1.064
+ *   wrapped at 320        1.045
+ *   wrapped at 500        1.043
+ *
+ * The cost is per BREAK — about 4.6 gzipped bytes each at depth 4 — and not per
+ * byte of whitespace, so aligning the breaks to the repeating unit does not
+ * help and dropping the indent barely does; both were tried. Wrapping at 110
+ * would have quintupled this module's entire readability tax to buy a payload
+ * that is machine data either way, and would have broken the ≤5% ceiling the
+ * test holds it to. 320 removes the failure that was actually reported — no
+ * editor stalls on a 347-character line, and it wraps to three screen lines
+ * rather than to a thousand — and keeps the invariant.
+ */
+const PAYLOAD_COLUMNS = 320;
+
+/**
+ * The payload comment, broken at commas that are not inside a JSON string.
+ *
+ * Only outside a string: a raw newline inside a JSON string literal is not
+ * JSON, so wrapping anywhere else would produce a payload that no longer
+ * parses. The scan tracks the same state `artfile.commentSafe` tracks, and for
+ * the same reason.
+ */
+function wrapPayload(line: string): string {
+  // Continuations line up under the `<!--` that opened the comment.
+  const cont = `\n${INDENT}`;
+  let out = "";
+  let col = INDENT.length;
+  let inString = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    out += ch;
+    col++;
+    if (inString) {
+      if (ch === "\\") {
+        // An escape is two characters and neither can end the string.
+        out += line[i + 1] ?? "";
+        col++;
+        i++;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === "," && col >= PAYLOAD_COLUMNS) {
+      out += cont;
+      col = INDENT.length;
+    }
+  }
+  return out;
+}
 
 // ── serialise ────────────────────────────────────────────────────────────
 
@@ -468,8 +669,11 @@ export function serialise(doc: EmitDoc, scope?: EmitScope): string {
   }
 
   // ── prototypes ──
+  // Seeded with every id the layer tree will write, so nothing minted below can
+  // collide with one. See `prototypeId`.
+  const layerIds = idsOf(scoped.layers);
   const protoOf = new Map<string, string>();
-  const ids = new Set<string>();
+  const ids = new Set<string>(layerIds);
   for (const c of geom.values()) {
     const s = shapeOf(c).sig;
     if (protoOf.has(s)) continue;
@@ -509,8 +713,19 @@ export function serialise(doc: EmitDoc, scope?: EmitScope): string {
   const out: string[] = [];
   const w = fmtCoord(scoped.width);
   const h = fmtCoord(scoped.height);
+  const payloadLine = encodeArt({ ...scoped.payload, comp: compositionOf(scoped) });
+  const root = rootIdOf(payloadLine, (id) => !layerIds.has(id) && !layerIds.has(`${id}-t`));
+  const titleId = `${root}-t`;
+  // `role="img"` makes the six thousand `<use>` elements presentational in one
+  // word, which is what they are. `aria-labelledby` names the picture off the
+  // `<title>` rather than leaving the name to be computed from it: that
+  // computation is in the spec and has been unreliable in Safari with
+  // VoiceOver, and a file that ends up on someone else's screen is exactly the
+  // case where "should work" is not enough. `lang` is on the root because the
+  // title and the description below are English sentences.
   out.push(
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}" role="img">`
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${w} ${h}" width="${w}" height="${h}"` +
+      ` id="${root}" role="img" lang="en" aria-labelledby="${titleId}">`
   );
   // No tag ever appears inside this line, even spelled out: the reader below
   // blanks comments before it tokenises, but a file is also read by eye and by
@@ -522,10 +737,9 @@ export function serialise(doc: EmitDoc, scope?: EmitScope): string {
       `Colour is a CSS class, one rule per colour. Layers are nested groups. ` +
       `Self contained: no script, no external reference. -->`
   );
-  out.push(
-    `${INDENT}${encodeArt({ ...scoped.payload, comp: compositionOf(scoped) })}`
-  );
-  out.push(`${INDENT}<title>${escapeText(scoped.title)}</title>`);
+  out.push(`${INDENT}${wrapPayload(payloadLine)}`);
+  out.push(`${INDENT}<title id="${titleId}">${escapeText(scoped.title)}</title>`);
+  out.push(`${INDENT}<desc>${escapeText(descOf(scoped))}</desc>`);
 
   if (factored && protoOf.size > 0) {
     out.push(`${INDENT}<defs>`);
@@ -535,7 +749,7 @@ export function serialise(doc: EmitDoc, scope?: EmitScope): string {
     out.push(`${INDENT}</defs>`);
   }
 
-  const css = styleRules(scoped, klass);
+  const css = styleRules(scoped, klass, root);
   if (css.length > 0) {
     out.push(`${INDENT}<style>`);
     for (const rule of css) out.push(`${INDENT.repeat(2)}${rule}`);
@@ -605,10 +819,18 @@ function emitLayers(
   for (const l of layers) {
     const attrs: string[] = [`id="${l.id}"`];
     if (l.name !== undefined) attrs.push(`data-name="${escapeAttr(l.name)}"`);
-    // The layer's OWN flag. SVG hides the descendants of a `display:none`
-    // group when it draws, and each of them goes on saying what it says, so a
-    // round trip through a hidden parent cannot flatten the children's state.
-    if (l.hidden === true) attrs.push(`style="display:none"`);
+    // The layer's OWN flag, as a PRESENTATION ATTRIBUTE and not as
+    // `style="display:none"`. The inline style is the highest-specificity form
+    // there is and nothing but `!important` can answer it, which makes a
+    // perfectly ordinary thing — un-hiding a layer in devtools, or restyling
+    // the file from the page that embeds it — need a fight. The attribute sits
+    // at the bottom of the cascade where a reader can override it, matches the
+    // adjacent `opacity`, which was already written this way, and is six bytes
+    // shorter.
+    //
+    // Nothing reads it back: `parse` takes `hidden` from the payload, where the
+    // layer states its own. This is how the file DRAWS.
+    if (l.hidden === true) attrs.push(`display="none"`);
     if (l.locked === true) attrs.push(`data-locked="1"`);
     if (l.opacity !== undefined && l.opacity !== 1) {
       attrs.push(`opacity="${fmtAlpha(l.opacity)}"`);
@@ -630,10 +852,34 @@ function emitLayers(
   }
 }
 
+/**
+ * What the file says it is, for a reader that is not looking at it.
+ *
+ * A `<title>` names the picture; a `<desc>` is where the sentence that would
+ * otherwise only exist in the payload goes. Derived entirely from the document,
+ * so it cannot drift from the drawing and so the round trip stays on bytes.
+ */
+function descOf(doc: EmitDoc): string {
+  let layers = 0;
+  walkLayers(doc.layers, () => {
+    layers++;
+  });
+  const painted = flatten(doc.layers).size;
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`;
+  return (
+    `A FOURFOLD composition on the ${doc.payload.canvas} at depth ${doc.payload.depth}: ` +
+    `${plural(painted, "painted cell")} in ${plural(layers, "layer")}, ` +
+    `every cell one of two congruent triangles of the same lattice.`
+  );
+}
+
 function styleRules(
   doc: EmitDoc,
-  klass: ReadonlyMap<string, string>
+  klass: ReadonlyMap<string, string>,
+  root: string
 ): string[] {
+  // Every selector below is scoped to this document's own id. See `rootIdOf`.
+  const at = `#${root} `;
   const rules: string[] = [];
   if (doc.unpainted !== null) {
     const seam =
@@ -642,7 +888,7 @@ function styleRules(
         : `; stroke: ${colourSafe(doc.tileSeam)}; stroke-width: ${fmtCoord(
             doc.seamWidth
           )}`;
-    rules.push(`.tile { fill: ${colourSafe(doc.unpainted)}${seam} }`);
+    rules.push(`${at}.tile { fill: ${colourSafe(doc.unpainted)}${seam} }`);
   }
   for (const [colour, k] of klass) {
     // The weld — every painted cell stroked in its own fill, which closes the
@@ -653,39 +899,54 @@ function styleRules(
     const weld = doc.weldPaint
       ? `; stroke: ${colourSafe(colour)}; stroke-width: ${fmtCoord(doc.seamWidth * 3)}`
       : "";
-    rules.push(`.${k} { fill: ${colourSafe(colour)}${weld} }`);
+    rules.push(`${at}.${k} { fill: ${colourSafe(colour)}${weld} }`);
   }
-  if (doc.animation !== null) rules.push(...animationRules(doc));
+  if (doc.animation !== null) rules.push(...animationRules(doc, root));
   return rules;
 }
 
 /** How much wider than a hairline a weld stroke is. `strokes.WELD_WIDTH`. */
 const WELD = 3;
 
-function animationRules(doc: EmitDoc): string[] {
+function animationRules(doc: EmitDoc, root: string): string[] {
   const a = doc.animation as EmitAnimation;
   const cycle = Math.max(1, a.steps * a.stepMs + a.holdMs);
   const reveals = new Set<number>();
   walkLayers(doc.layers, (l) => {
     if (l.reveal !== undefined) reveals.add(l.reveal);
   });
+  // Scoped, and the keyframe names carry the document id as a PREFIX because
+  // `@keyframes` has one global namespace per document and `@scope` does not
+  // change that. See `rootIdOf`.
+  const at = `#${root} `;
   const rules: string[] = [
-    `[data-reveal] { opacity: 0; animation-duration: ${cycle}ms; ` +
+    `${at}[data-reveal] { opacity: 0; animation-duration: ${cycle}ms; ` +
       `animation-timing-function: linear; animation-iteration-count: infinite; ` +
       `animation-fill-mode: both }`,
   ];
   const order = [...reveals].sort((x, y) => x - y);
-  for (const k of order) rules.push(`[data-reveal="${k}"] { animation-name: r${k} }`);
   for (const k of order) {
-    const at = k * a.stepMs;
-    const on = (100 * at) / cycle;
-    const lit = (100 * Math.min(at + Math.max(1, a.fadeMs), cycle)) / cycle;
+    rules.push(`${at}[data-reveal="${k}"] { animation-name: ${root}-r${k} }`);
+  }
+  for (const k of order) {
+    const on0 = k * a.stepMs;
+    const on = (100 * on0) / cycle;
+    const lit = (100 * Math.min(on0 + Math.max(1, a.fadeMs), cycle)) / cycle;
     // The first step reveals at 0, where `0%, 0%` would be a duplicate selector.
     const dark = on <= 0 ? "0%" : `0%, ${fmtAlpha(on)}%`;
     rules.push(
-      `@keyframes r${k} { ${dark} { opacity: 0 } ${fmtAlpha(lit)}%, 100% { opacity: 1 } }`
+      `@keyframes ${root}-r${k} { ${dark} { opacity: 0 } ${fmtAlpha(lit)}%, 100% { opacity: 1 } }`
     );
   }
+  // The app's own chrome honours this preference; the thing it EXPORTS — the
+  // one that ends up on somebody else's screen, with no settings panel and no
+  // way to stop it — did not. An infinite loop is exactly what the preference
+  // is about, so the finished plate is what a reader who asked for less motion
+  // gets: every layer up, nothing moving.
+  rules.push(
+    `@media (prefers-reduced-motion: reduce) { ${at}[data-reveal] ` +
+      `{ animation: none; opacity: 1 } }`
+  );
   return rules;
 }
 
@@ -786,24 +1047,31 @@ interface Token {
   attrs: string;
 }
 
-const TOKEN = /<(\/?)(g|use|polygon)\b([^>]*?)(\/?)>/g;
+/**
+ * Every `<g>`, `<use>` and `<polygon>` in a document, open or close.
+ *
+ * `(?=[\s/>])` rather than `\b` after the name. A word boundary sits between
+ * `g` and `:`, so `<g:x id="ghost">` — an element in some other namespace,
+ * which this reader has no business believing anything about — came through as
+ * a group with an id, and one of those left unclosed walks the layer stack.
+ * The lookahead says what was meant: the tag name ENDS here.
+ */
+const TOKEN = /<(\/?)(g|use|polygon)(?=[\s/>])([^>]*?)(\/?)>/g;
 
 /**
- * The document with every comment blanked out.
+ * The document with every comment and every CDATA section blanked out.
  *
- * A comment is not markup, and anything that reads markup has to agree: this
- * file's own header comment names the elements it uses, and a hostile file
- * could hide an unbalanced `<g>` in one and walk the reader's stack off the
- * end. Replaced with spaces rather than removed so that offsets into the
- * document are unchanged and the two texts stay comparable.
+ * Neither is markup, and anything that reads markup has to agree: this file's
+ * own header comment names the elements it uses, and a hostile file could hide
+ * an unbalanced `<g>` in one and walk the reader's stack off the end. CDATA is
+ * the same hole with a different spelling — `<![CDATA[ <g id="ghost"> ]]>` is
+ * character data to every parser and was elements to this one.
+ *
+ * Replaced with spaces rather than removed so that offsets into the document
+ * are unchanged and the two texts stay comparable.
  */
 const withoutComments = (text: string): string =>
-  text.replace(/<!--[\s\S]*?-->/g, (m) => " ".repeat(m.length));
-
-const attrOf = (attrs: string, name: string): string | null => {
-  const m = new RegExp(`(?:^|[^-\\w])${name}\\s*=\\s*"([^"]*)"`, "i").exec(attrs);
-  return m === null ? null : m[1];
-};
+  text.replace(/<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>/g, (m) => " ".repeat(m.length));
 
 /**
  * An SVG document this module wrote, back as the value it was written from.
@@ -849,36 +1117,35 @@ function read(text: string): EmitDoc | null {
   // whose contents must not be able to look like an element.
   const markup = withoutComments(text);
 
-  const head = /^<svg\b([^>]*)>/.exec(text);
+  // FOUND rather than anchored, and found in the MARKUP rather than in the
+  // text. Anchoring at offset zero made this reader refuse every file that had
+  // been through a standard SVG toolchain — an XML declaration, a BOM, a
+  // DOCTYPE or one leading newline was enough, so a FOURFOLD file opened in
+  // Inkscape and saved again would not load. Searching the comment-blanked
+  // text rather than the raw text is what keeps that safe: a `<svg` written
+  // inside the payload — in a layer's name, say — has already been blanked, so
+  // the first one found is the real root and not one somebody smuggled.
+  const head = /<svg(?=[\s/>])([^>]*?)\/?>/.exec(markup);
   if (head === null) return null;
   const width = num(attrOf(head[1], "width"));
   const height = num(attrOf(head[1], "height"));
   if (width === null || height === null) return null;
 
-  const titleAt = /<title>([\s\S]{0,4096}?)<\/title>/.exec(markup);
+  // `<title>` now carries an id, for `aria-labelledby`.
+  const titleAt = /<title(?=[\s>])[^>]*>([\s\S]{0,4096}?)<\/title>/.exec(markup);
   const title = titleAt === null ? "" : unescapeAttr(titleAt[1]);
 
   // ── prototypes ──
-  const protos = new Map<string, [number, number][]>();
-  const defs = /<defs>([\s\S]{0,8192}?)<\/defs>/.exec(markup);
-  if (defs !== null) {
-    const re = /<polygon\s+id="([A-Za-z][\w.-]{0,15})"\s+points="([^"]{0,256})"\s*\/>/g;
-    for (let m = re.exec(defs[1]); m !== null; m = re.exec(defs[1])) {
-      const verts = readPoints(m[2]);
-      if (verts === null) return null;
-      protos.set(m[1], verts);
-    }
-  }
+  const protos = readProtos(markup);
+  if (protos === null) return null;
 
   // ── style ──
-  const styleAt = /<style>([\s\S]{0,1048576}?)<\/style>/.exec(markup);
+  const styleAt = /<style(?=[\s>])[^>]*>([\s\S]{0,1048576}?)<\/style>/.exec(markup);
   const style = styleAt === null ? "" : styleAt[1];
   let unpainted: string | null = null;
   let tileSeam: string | null = null;
   let seamWidth = 0;
-  const tile = /\.tile\s*\{\s*fill:\s*([^;}]+?)\s*(?:;\s*stroke:\s*([^;}]+?)\s*;\s*stroke-width:\s*([^;}\s]+)\s*)?\}/.exec(
-    style
-  );
+  const tile = TILE_RULE.exec(style);
   if (tile !== null) {
     unpainted = tile[1];
     if (tile[2] !== undefined) {
@@ -890,8 +1157,8 @@ function read(text: string): EmitDoc | null {
   }
   const colourOf = new Map<string, string>();
   let weldPaint = false;
-  const kre = /\.(k\d{1,5})\s*\{\s*fill:\s*([^;}]+?)\s*(?:;\s*stroke:\s*([^;}]+?)\s*;\s*stroke-width:\s*([^;}\s]+)\s*)?\}/g;
-  for (let m = kre.exec(style); m !== null; m = kre.exec(style)) {
+  PAINT_RULE.lastIndex = 0;
+  for (let m = PAINT_RULE.exec(style); m !== null; m = PAINT_RULE.exec(style)) {
     colourOf.set(m[1], m[2]);
     if (m[3] !== undefined) {
       weldPaint = true;
@@ -901,8 +1168,9 @@ function read(text: string): EmitDoc | null {
     }
   }
 
-  const rect = /<rect\b[^>]*\bfill="([^"]{0,64})"/.exec(markup);
-  const background = rect === null ? "none" : rect[1];
+  const rect = /<rect(?=[\s/>])([^>]*?)\/?>/.exec(markup);
+  const fill = rect === null ? null : attrOf(rect[1], "fill");
+  const background = fill === null || fill.length > 64 ? "none" : fill;
 
   // ── the drawing ──
   const body = readBody(markup);
@@ -985,11 +1253,94 @@ function read(text: string): EmitDoc | null {
   };
 }
 
+/**
+ * The one spelling of a number this reader accepts.
+ *
+ * `Number` is not a validator, and every place it was used as one had an
+ * answer for something that is not a number at all. `Number("")` is 0, so
+ * `width="" height=""` was a canvas 0 by 0 rather than a refusal.
+ * `Number("0x10")` is 16 and `Number("6.04e2")` is 604, neither of which is a
+ * length SVG would accept in an attribute, so a hostile file could put a cell
+ * somewhere no reader of the same file would draw it. `Infinity`, `NaN` and
+ * ` 12 ` all had answers too.
+ *
+ * This is what this module WRITES — `strokes.fmtCoord` and `fmtAlpha` both emit
+ * exactly this form and nothing else — so requiring it costs nothing that was
+ * ever produced and refuses everything that was not.
+ */
+const NUMBER = /^-?\d{1,17}(?:\.\d{1,17})?$/;
+
 const num = (raw: string | null): number | null => {
   if (raw === null) return null;
-  const n = Number(raw);
+  const t = raw.trim();
+  if (!NUMBER.test(t)) return null;
+  const n = Number(t);
   return Number.isFinite(n) ? n : null;
 };
+
+/**
+ * Where a `.tile` and a `.k…` rule are found in the stylesheet.
+ *
+ * The optional `#id ` in front is the SCOPE `serialise` writes — every selector
+ * it emits sits under this document's own id, so that inlining the file cannot
+ * restyle the page around it. See `rootIdOf`. Tolerated rather than required,
+ * so that a file written before the scope existed still reads.
+ */
+const SCOPE = String.raw`(?:#[A-Za-z][\w-]{0,31}\s+)?`;
+const RULE = String.raw`\s*\{\s*fill:\s*([^;}]+?)\s*(?:;\s*stroke:\s*([^;}]+?)\s*;\s*stroke-width:\s*([^;}\s]+)\s*)?\}`;
+const TILE_RULE = new RegExp(`${SCOPE}\\.tile${RULE}`);
+const PAINT_RULE = new RegExp(`${SCOPE}\\.(k\\d{1,5})${RULE}`, "g");
+
+/** What a `<defs>` prototype may be called. */
+const PROTO_ID = /^[A-Za-z][\w.-]{0,15}$/;
+
+/**
+ * Whether a group hides everything under it.
+ *
+ * Both spellings, because this module writes the attribute and used to write
+ * the inline style, and a file from anywhere else may use either.
+ */
+const DISPLAY_NONE = /(?:^|;)\s*display\s*:\s*none\s*(?:;|$)/i;
+
+const isHidden = (attrs: string): boolean => {
+  if (attrOf(attrs, "display") === "none") return true;
+  const style = attrOf(attrs, "style");
+  return style !== null && DISPLAY_NONE.test(style);
+};
+
+/**
+ * The shapes `<defs>` names, for both readers below.
+ *
+ * A DUPLICATE ID IS A REFUSAL. Two `<polygon id="u">` used to mean the second
+ * one, because the loop wrote it over the first — while a browser resolves
+ * `href="#u"` to the FIRST, so the file this reader loaded and the file a
+ * renderer drew were different pictures and neither said so. The document has
+ * one answer per id or it is not a document we can vouch for.
+ */
+function readProtos(markup: string): Map<string, [number, number][]> | null {
+  const protos = new Map<string, [number, number][]>();
+  const defs = /<defs(?=[\s>])[^>]*>([\s\S]{0,8192}?)<\/defs>/.exec(markup);
+  if (defs === null) return protos;
+  const re = /<polygon(?=[\s/>])([^>]*?)\/?>/g;
+  for (let m = re.exec(defs[1]); m !== null; m = re.exec(defs[1])) {
+    const id = attrOf(m[1], "id");
+    const points = attrOf(m[1], "points");
+    // A shape in `<defs>` with no id is not a prototype; nothing can name it.
+    // Neither is one named something this module would never write, or one
+    // longer than a triangle needs — both are somebody else's furniture and are
+    // stepped over rather than refused, exactly as the pattern this replaced
+    // stepped over them. A `<use>` that then names one still fails to resolve.
+    if (id === null || points === null) continue;
+    if (!PROTO_ID.test(id) || points.length > 256) continue;
+    // The one thing that IS a refusal, because it is an ambiguity rather than
+    // an unknown.
+    if (protos.has(id)) return null;
+    const verts = readPoints(points);
+    if (verts === null) return null;
+    protos.set(id, verts);
+  }
+  return protos;
+}
 
 /** A shape as the markup states it: a placed prototype, or its own points. */
 interface Shape {
@@ -1010,13 +1361,20 @@ function resolve(
 }
 
 function readPoints(raw: string): [number, number][] | null {
-  const nums = raw
+  const toks = raw
     .trim()
     .split(/[\s,]+/)
-    .filter((t) => t.length > 0)
-    .map(Number);
-  if (nums.length < 6 || nums.length % 2 !== 0 || nums.length > 512) return null;
-  if (nums.some((n) => !Number.isFinite(n))) return null;
+    .filter((t) => t.length > 0);
+  if (toks.length < 6 || toks.length % 2 !== 0 || toks.length > 512) return null;
+  // `NUMBER` rather than `Number`, for the reason set out there: a vertex at
+  // `0x10` is a vertex no renderer of the same file would agree with.
+  const nums: number[] = [];
+  for (const t of toks) {
+    if (!NUMBER.test(t)) return null;
+    const n = Number(t);
+    if (!Number.isFinite(n)) return null;
+    nums.push(n);
+  }
   const out: [number, number][] = [];
   for (let i = 0; i < nums.length; i += 2) out.push([nums[i], nums[i + 1]]);
   return out;
@@ -1066,7 +1424,12 @@ function readBody(text: string): Body | null {
       attrs: m[3],
     };
     if (tok.tag !== "g") {
-      if (tok.kind !== "shape") continue;
+      // `<use …/>` and `<use …></use>` are the SAME ELEMENT. This reader used
+      // to take only the self-closed spelling, which is the one it writes, so a
+      // file that had been through a tool preferring the long form lost every
+      // cell — and lost them silently, as a count that no longer lined up.
+      // `</use>` and `</polygon>` say nothing and are skipped.
+      if (tok.kind === "close") continue;
       const shape = shapeToken(tok);
       if (shape === null) return null;
       if (region === "tiling") (body.tiling as Shape[]).push(shape);
@@ -1281,18 +1644,10 @@ export function resolvedShapes(
 ): { verts: [number, number][]; fill: string }[] | null {
   if (typeof text !== "string" || text.length > MAX_ART_BYTES) return null;
   const markup = withoutComments(text);
-  const protos = new Map<string, [number, number][]>();
-  const defs = /<defs>([\s\S]{0,8192}?)<\/defs>/.exec(markup);
-  if (defs !== null) {
-    const re = /<polygon\s+id="([A-Za-z][\w.-]{0,15})"\s+points="([^"]{0,256})"\s*\/>/g;
-    for (let m = re.exec(defs[1]); m !== null; m = re.exec(defs[1])) {
-      const verts = readPoints(m[2]);
-      if (verts === null) return null;
-      protos.set(m[1], verts);
-    }
-  }
+  const protos = readProtos(markup);
+  if (protos === null) return null;
   const fills = new Map<string, string>();
-  const styleAt = /<style>([\s\S]{0,1048576}?)<\/style>/.exec(markup);
+  const styleAt = /<style(?=[\s>])[^>]*>([\s\S]{0,1048576}?)<\/style>/.exec(markup);
   if (styleAt !== null) {
     const re = /\.([\w-]{1,32})\s*\{\s*fill:\s*([^;}]+?)\s*[;}]/g;
     for (let m = re.exec(styleAt[1]); m !== null; m = re.exec(styleAt[1])) {
@@ -1304,6 +1659,13 @@ export function resolvedShapes(
   // tiling states its colour once. Tracked with a stack, so a nested layer
   // inherits what its ancestors said and nothing more.
   const inherited: (string | null)[] = [null];
+  // And so is HIDDENNESS, on the same stack and for a sharper reason. `flatten`
+  // skips a hidden subtree because the picture does not show it; this did not,
+  // so a hidden layer's cells came back here — and, being written last, won the
+  // painter's-algorithm race in `artfile.importByGeometry`. A geometric import
+  // of a file with a hidden layer over a visible one recoloured cells to a
+  // colour the picture had never shown.
+  const dark: boolean[] = [false];
   TOKEN.lastIndex = 0;
   for (let m = TOKEN.exec(markup); m !== null; m = TOKEN.exec(markup)) {
     const close = m[1] === "/";
@@ -1312,7 +1674,10 @@ export function resolvedShapes(
     const attrs = m[3];
     if (tag === "g") {
       if (close) {
-        if (inherited.length > 1) inherited.pop();
+        if (inherited.length > 1) {
+          inherited.pop();
+          dark.pop();
+        }
         continue;
       }
       if (selfClose) continue;
@@ -1321,9 +1686,11 @@ export function resolvedShapes(
         attrOf(attrs, "fill") ??
         (cls === null ? null : (fills.get(cls) ?? null));
       inherited.push(own ?? inherited[inherited.length - 1]);
+      dark.push(dark[dark.length - 1] || isHidden(attrs));
       continue;
     }
-    if (!selfClose) continue;
+    if (close) continue;
+    if (dark[dark.length - 1]) continue;
     const cls = attrOf(attrs, "class");
     const fill =
       attrOf(attrs, "fill") ??

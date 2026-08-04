@@ -214,10 +214,21 @@ export interface ArtComposition {
 export const LAYER_ID = /^[A-Za-z_][A-Za-z0-9_.-]{0,63}$/;
 
 /**
- * Ids `emit.ts` gives to elements of its own, which a layer may therefore not
- * take. Small and closed, and a payload naming one is rejected rather than
- * silently renamed — a file that collides with the document's own furniture is
- * not a file whose layer tree we should trust either.
+ * Ids `emit.ts` gives to FIXED elements of its own, which a layer may therefore
+ * not take. A payload naming one is rejected rather than silently renamed — a
+ * file that collides with the document's own furniture is not a file whose
+ * layer tree we should trust either.
+ *
+ * This list is NOT what keeps ids unique, and it must not be mistaken for it.
+ * It covers the two group ids that are literals in the emitter and the two
+ * prototype names it reaches for first; but `emit.prototypeId` also mints `u2`,
+ * `d2`, `p` and `ux`, `serialise` mints a root id and a title id, and none of
+ * those could ever be enumerated here without this list having to be extended
+ * every time that code learns a new name — which is exactly how a document
+ * came to be written with two `id="u2"` in it. Uniqueness is enforced where the
+ * ids are minted, by reading the ones the document actually holds. See
+ * `emit.prototypeId`. What remains here is a small closed set of literals,
+ * which cannot fall behind anything because nothing generates it.
  */
 export const RESERVED_IDS: ReadonlySet<string> = new Set(["u", "d", "tiling", "paint"]);
 
@@ -933,7 +944,15 @@ const shapeKey = (verts: readonly (readonly [number, number])[]): string =>
 const POLYGON = /<polygon\b([^>]*)>/gi;
 
 /**
- * One attribute out of a tag's attribute text.
+ * One attribute out of a tag's attribute text. THE one — `emit.ts` imports it.
+ *
+ * There used to be two of these, one here and a near-identical one in
+ * `emit.ts`, and they had already drifted: this one accepted `x='1'` and that
+ * one did not, so a file that had been through a toolchain which prefers single
+ * quotes read as geometry to the geometric importer and as nothing at all to
+ * the layer reader. Two readers of the same bytes that disagree about what an
+ * attribute is are a bug waiting for a file to find it, so there is now one
+ * function and both readers call it.
  *
  * The leading `[^-\w]` alternative is doing real work: a plain `\b` would let
  * `fill` match inside `data-fill` and, worse, inside `stroke-fill`-shaped names
@@ -943,7 +962,7 @@ const POLYGON = /<polygon\b([^>]*)>/gi;
 const ATTR = (name: string) =>
   new RegExp(`(?:^|[^-\\w])${name}\\s*=\\s*("([^"]*)"|'([^']*)')`, "i");
 
-const attrOf = (attrs: string, name: string): string | null => {
+export const attrOf = (attrs: string, name: string): string | null => {
   const m = ATTR(name).exec(attrs);
   if (m === null) return null;
   return m[2] ?? m[3] ?? null;

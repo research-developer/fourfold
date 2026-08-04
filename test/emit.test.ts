@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { gzipSync } from "node:zlib";
+import { readFileSync } from "node:fs";
 import {
   PROTOTYPE_LIMIT,
   findLayer,
@@ -13,7 +14,12 @@ import {
   type EmitLayer,
 } from "../src/lib/emit";
 import { artworkSvg, type ArtCell } from "../src/lib/strokes";
-import { extractArt, formatRanges, parseRanges } from "../src/lib/artfile";
+import {
+  extractArt,
+  formatRanges,
+  parseRanges,
+  GEOMETRY_PRECISION,
+} from "../src/lib/artfile";
 import { buildHexagon } from "../src/lib/hexagon";
 import { plateFrame } from "../src/lib/view";
 import { buildRelief, reliefFrame, restShell } from "../src/lib/relief";
@@ -270,7 +276,9 @@ describe("round trip", () => {
 
   it("hides with display:none, so a renderer hides the descendants and the file does not", () => {
     const svg = serialise(docOf(2));
-    expect(svg).toContain(`<g id="hidden-bits" style="display:none">`);
+    // As a PRESENTATION ATTRIBUTE, where a reader can override it — the inline
+    // style it used to be needed `!important` to answer. See `emitLayers`.
+    expect(svg).toContain(`<g id="hidden-bits" display="none">`);
   });
 
   it("carries the title, the seams, the frame and the weld across", () => {
@@ -667,16 +675,20 @@ describe("animation", () => {
   });
 
   it("writes one rule and one keyframes per STEP, not per cell", () => {
-    expect(svg.match(/@keyframes r\d+ \{/g)).toHaveLength(6);
-    expect(svg.match(/\[data-reveal="\d+"\] \{ animation-name: r\d+ \}/g)).toHaveLength(6);
+    // The names carry the document's own id, because `@keyframes` has one
+    // global namespace per document and nothing scopes it. See `rootIdOf`.
+    expect(svg.match(/@keyframes ff[0-9a-f]{6}-r\d+ \{/g)).toHaveLength(6);
+    expect(
+      svg.match(/\[data-reveal="\d+"\] \{ animation-name: ff[0-9a-f]{6}-r\d+ \}/g)
+    ).toHaveLength(6);
     // 36 cells are animated; the rule count does not follow them.
     expect(svg.match(/<use [^>]*class="k/g)?.length).toBeGreaterThan(36);
   });
 
   it("reveals the steps in order, each later in the cycle than the last", () => {
-    const ons = [...svg.matchAll(/@keyframes r(\d+) \{ 0%(?:, ([\d.]+)%)? \{/g)].map(
-      (m) => Number(m[2] ?? 0)
-    );
+    const ons = [
+      ...svg.matchAll(/@keyframes ff[0-9a-f]{6}-r(\d+) \{ 0%(?:, ([\d.]+)%)? \{/g),
+    ].map((m) => Number(m[2] ?? 0));
     expect(ons).toHaveLength(6);
     for (let k = 1; k < ons.length; k++) expect(ons[k]).toBeGreaterThan(ons[k - 1]);
     expect(ons[0]).toBe(0);
@@ -942,5 +954,433 @@ describe("the interface required of the layer model", () => {
       [0, "#111111"],
       [1, "#222222"],
     ]);
+  });
+});
+
+// ── the file is a guest on somebody else's page ──────────────────────────
+
+describe("nothing the file writes escapes the file", () => {
+  const animated = (): EmitDoc => {
+    const { pf } = frameOf(2);
+    const layers: EmitLayer[] = [{ id: "g", paint: paintOf(pf.shown, 20, 0) }];
+    for (let k = 0; k < 3; k++) {
+      layers.push({
+        id: `s${k}`,
+        reveal: k,
+        paint: new Map(pf.shown.slice(k * 4, k * 4 + 4).map((i) => [i, PALETTE[k]])),
+      });
+    }
+    return { ...docOf(2, layers), animation: { stepMs: 250, holdMs: 1800, fadeMs: 90, steps: 3 } };
+  };
+
+  it("scopes every selector under the document's own id", () => {
+    const svg = serialise(animated());
+    const style = /<style>([\s\S]*?)<\/style>/.exec(svg) as RegExpExecArray;
+    const root = /<svg[^>]* id="(ff[0-9a-f]{6})"/.exec(svg)?.[1] as string;
+    expect(root).toMatch(/^ff[0-9a-f]{6}$/);
+
+    // Every rule that has a selector at all states this document first. A
+    // `.k0` or a `[data-reveal]` on its own is a rule about the whole page.
+    const rules = style[1]
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+    expect(rules.length).toBeGreaterThan(3);
+    for (const rule of rules) {
+      if (rule.startsWith("@keyframes") || rule.startsWith("@media")) continue;
+      expect(rule, rule).toMatch(new RegExp(`^#${root} `));
+    }
+    // `@media` wraps a scoped rule rather than a bare one.
+    for (const at of rules.filter((r) => r.startsWith("@media"))) {
+      expect(at, at).toContain(`{ #${root} `);
+    }
+    expect(svg).not.toMatch(/\n\s*\.k\d+ \{/);
+    expect(svg).not.toMatch(/\n\s*\.tile \{/);
+    expect(svg).not.toMatch(/\n\s*\[data-reveal\] \{/);
+  });
+
+  it("prefixes every keyframe name, which no scoping mechanism can do for it", () => {
+    const svg = serialise(animated());
+    const root = /<svg[^>]* id="(ff[0-9a-f]{6})"/.exec(svg)?.[1] as string;
+    const names = [...svg.matchAll(/@keyframes ([\w-]+) /g)].map((m) => m[1]);
+    expect(names).toHaveLength(3);
+    for (const n of names) expect(n).toMatch(new RegExp(`^${root}-r\\d+$`));
+    // The rule that names one agrees with it, so the animation still runs.
+    for (const n of names) expect(svg).toContain(`animation-name: ${n} }`);
+  });
+
+  it("gives two different drawings two different ids, so inlining both is safe", () => {
+    const a = serialise(docOf(2));
+    const b = serialise(flatDoc(2));
+    const idOf = (s: string) => /<svg[^>]* id="(ff[0-9a-f]{6})"/.exec(s)?.[1];
+    expect(idOf(a)).not.toBe(idOf(b));
+    // And the SAME drawing the same one, twice, or the round trip would not be
+    // on bytes.
+    expect(idOf(serialise(docOf(2)))).toBe(idOf(a));
+  });
+
+  it("honours prefers-reduced-motion, which the exported file could not be told", () => {
+    const svg = serialise(animated());
+    const root = /<svg[^>]* id="(ff[0-9a-f]{6})"/.exec(svg)?.[1] as string;
+    expect(svg).toContain(
+      `@media (prefers-reduced-motion: reduce) { #${root} [data-reveal] { animation: none; opacity: 1 } }`
+    );
+    // A still document says nothing about motion at all.
+    expect(serialise(docOf(2))).not.toContain("prefers-reduced-motion");
+  });
+});
+
+// ── a file that has been somewhere else ──────────────────────────────────
+
+describe("a file that has been through another tool still loads", () => {
+  const good = serialise(docOf(2));
+
+  it("reads past an XML declaration, a BOM, a DOCTYPE or a leading newline", () => {
+    for (const [what, text] of [
+      ["xml declaration", `<?xml version="1.0" encoding="UTF-8"?>\n${good}`],
+      ["byte order mark", `﻿${good}`],
+      ["doctype", `<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/x.dtd">\n${good}`],
+      ["leading newline", `\n\n${good}`],
+    ] as const) {
+      const back = parse(text);
+      expect(back, what).not.toBeNull();
+      expect(serialise(back as EmitDoc), what).toBe(good);
+    }
+  });
+
+  it("reads <use></use> and single-quoted attributes, which are the same document", () => {
+    const long = good.replace(
+      /<use href="([^"]+)" x="([^"]+)" y="([^"]+)"( class="[^"]+")?\/>/g,
+      "<use href=\"$1\" x=\"$2\" y=\"$3\"$4></use>"
+    );
+    expect(long).not.toBe(good);
+    expect(serialise(parse(long) as EmitDoc)).toBe(good);
+
+    const quoted = good.replace(/x="([\d.-]+)" y="([\d.-]+)"/g, "x='$1' y='$2'");
+    expect(quoted).not.toBe(good);
+    expect(serialise(parse(quoted) as EmitDoc)).toBe(good);
+  });
+
+  it("still refuses an <svg> smuggled into the payload rather than taking the first one", () => {
+    const { pf } = frameOf(1);
+    const sneak = serialise(
+      docOf(1, [{ id: "s", name: `<svg width="9" height="9">`, paint: paintOf(pf.shown, 2, 0) }])
+    );
+    const back = parse(sneak) as EmitDoc;
+    // The real root, not the one written inside a comment.
+    expect(back.width).toBeGreaterThan(9);
+    expect(serialise(back)).toBe(sneak);
+  });
+});
+
+// ── the reader is stricter about numbers than Number is ──────────────────
+
+describe("parse hardening", () => {
+  const good = serialise(docOf(1));
+
+  it("refuses an empty, hexadecimal or exponential number", () => {
+    expect(parse(good.replace(/width="[\d.]+" height="[\d.]+"/, 'width="" height=""'))).toBeNull();
+    for (const bad of ["0x10", "6.04e2", "+5", "Infinity", "1_0", " "]) {
+      const text = good.replace(/(<use href="#[^"]+" x=")([\d.-]+)(")/, `$1${bad}$3`);
+      expect(text, bad).not.toBe(good);
+      expect(parse(text), bad).toBeNull();
+    }
+    // And in a prototype's own points, where the same trick moves every cell.
+    expect(parse(good.replace(/(<polygon id="u" points=")([^"]+)/, "$10x10,0 8,0 4,8"))).toBeNull();
+  });
+
+  it("refuses a duplicate defs id, which this reader and a browser resolve differently", () => {
+    const twice = good.replace("</defs>", `  <polygon id="u" points="0,0 4,0 2,4"/>\n  </defs>`);
+    expect(twice).not.toBe(good);
+    expect(parse(twice)).toBeNull();
+  });
+
+  it("reads CDATA as the character data it is, not as elements", () => {
+    const cd = good.replace("<rect", '<![CDATA[ <g id="ghost"><use href="#u" x="0" y="0"/> ]]><rect');
+    const back = parse(cd);
+    expect(back).not.toBeNull();
+    expect((back as EmitDoc).layers.map((l) => l.id)).toEqual(
+      (parse(good) as EmitDoc).layers.map((l) => l.id)
+    );
+    expect(serialise(back as EmitDoc)).toBe(good);
+  });
+
+  it("does not mistake an element in another namespace for a group", () => {
+    const ns = good.replace("<rect", '<g:x id="ghost"><rect');
+    const back = parse(ns);
+    expect(back).not.toBeNull();
+    expect(serialise(back as EmitDoc)).toBe(good);
+  });
+
+  it("keeps a numeric character reference meaning what it said", () => {
+    const { pf } = frameOf(1);
+    const doc = docOf(1, [{ id: "e", paint: paintOf(pf.shown, 2, 0) }]);
+    const svg = serialise(doc).replace(
+      /<title([^>]*)>[^<]*<\/title>/,
+      "<title$1>a &#60; b &#x26; c</title>"
+    );
+    const back = parse(svg) as EmitDoc;
+    // The characters, not the eight bytes that spell them.
+    expect(back.title).toBe("a < b & c");
+    // And re-serialising says the same thing rather than escaping the escape.
+    expect(serialise(back)).toContain("<title id=");
+    expect(serialise(back)).toContain("a &lt; b &amp; c");
+    expect(serialise(back)).not.toContain("&amp;#60;");
+    // One pass: an escaped escape stays escaped.
+    const twice = serialise(doc).replace(
+      /<title([^>]*)>[^<]*<\/title>/,
+      "<title$1>a &amp;lt; b</title>"
+    );
+    expect((parse(twice) as EmitDoc).title).toBe("a &lt; b");
+  });
+});
+
+// ── ids the document mints cannot collide with ids it was given ──────────
+
+describe("every id in the document is distinct", () => {
+  it("does not hand a prototype the name a layer already has", () => {
+    const { pf } = frameOf(2);
+    // `u2` is a name `prototypeId` mints and `RESERVED_IDS` does not forbid.
+    for (const name of ["u2", "d2", "p", "ux"]) {
+      const svg = serialise(docOf(2, [{ id: name, paint: paintOf(pf.shown, 5, 0) }]));
+      const ids = [...svg.matchAll(/ id="([^"]+)"/g)].map((m) => m[1]);
+      expect(new Set(ids).size, name).toBe(ids.length);
+      expect(ids, name).toContain(name);
+      // And every `<use>` still names a shape the file defines.
+      const defined = new Set(
+        [...svg.matchAll(/<polygon id="([^"]+)"/g)].map((m) => m[1])
+      );
+      for (const m of svg.matchAll(/<use href="#([^"]+)"/g)) {
+        expect(defined.has(m[1]), `${name}: #${m[1]}`).toBe(true);
+      }
+      expect(serialise(parse(svg) as EmitDoc)).toBe(svg);
+    }
+  });
+
+  it("does not hand the root or the title a name a layer already has", () => {
+    const { pf } = frameOf(2);
+    const plain = serialise(docOf(2, [{ id: "a", paint: paintOf(pf.shown, 5, 0) }]));
+    const root = /<svg[^>]* id="(ff[0-9a-f]{6})"/.exec(plain)?.[1] as string;
+
+    // A layer named exactly what the document was going to call ITSELF, and
+    // one named what it was going to call its own title. Both are legal
+    // payloads; neither may end up written twice.
+    for (const clash of [root, `${root}-t`]) {
+      const svg = serialise(docOf(2, [{ id: clash, paint: paintOf(pf.shown, 5, 0) }]));
+      const ids = [...svg.matchAll(/ id="([^"]+)"/g)].map((m) => m[1]);
+      expect(new Set(ids).size, clash).toBe(ids.length);
+      expect(ids, clash).toContain(clash);
+      // And the label still points at the title element and not at a layer.
+      const labelled = /aria-labelledby="([^"]+)"/.exec(svg)?.[1] as string;
+      expect(svg, clash).toContain(`<title id="${labelled}">`);
+      expect(serialise(parse(svg) as EmitDoc), clash).toBe(svg);
+    }
+  });
+});
+
+// ── the geometric fallback shows what the picture shows ──────────────────
+
+describe("resolvedShapes skips what the picture does not show", () => {
+  it("leaves a hidden subtree out, exactly as flatten does", () => {
+    const doc = docOf(2, [
+      { id: "vis", paint: new Map([[0, "#111111"], [1, "#111111"]]) },
+      // Written LAST, so under painter's algorithm it would win every cell it
+      // names — and it names one the visible layer already painted.
+      {
+        id: "gone",
+        hidden: true,
+        paint: new Map([[0, "#999999"], [2, "#999999"]]),
+        children: [{ id: "gonekid", paint: new Map([[3, "#888888"]]) }],
+      },
+    ]);
+    const shapes = resolvedShapes(serialise(doc)) as { fill: string }[];
+    const fills = shapes.map((s) => s.fill);
+    expect(fills).not.toContain("#999999");
+    expect(fills).not.toContain("#888888");
+    expect(fills.filter((f) => f === "#111111")).toHaveLength(2);
+    // The same answer `flatten` gives, which is the point.
+    expect(new Set(flatten(doc.layers).values())).toEqual(new Set(["#111111"]));
+  });
+
+  it("still reads a hidden group written as an inline style, which older files use", () => {
+    const svg = serialise(docOf(2, [
+      { id: "vis", paint: new Map([[0, "#111111"]]) },
+      { id: "gone", hidden: true, paint: new Map([[1, "#999999"]]) },
+    ]));
+    const older = svg.replace(`display="none"`, `style="display:none"`);
+    expect(older).not.toBe(svg);
+    const fills = (resolvedShapes(older) as { fill: string }[]).map((s) => s.fill);
+    expect(fills).not.toContain("#999999");
+  });
+});
+
+// ── the payload is a comment a person can scroll past ────────────────────
+
+describe("the payload comment wraps", () => {
+  it("has no line long enough to stall an editor, at every depth", () => {
+    for (const depth of [3, 4, 5]) {
+      const svg = serialise(flatDoc(depth));
+      const longest = Math.max(...svg.split("\n").map((l) => l.length));
+      expect(longest, `depth ${depth}`).toBeLessThan(400);
+    }
+    // The one line this file used to have, for scale.
+    const flat = serialise(flatDoc(5)).replace(
+      /(<!-- fourfold:art:1 )([\s\S]*?)( -->)/,
+      (_m, a: string, b: string, c: string) => a + b.replace(/\n\s*/g, "") + c
+    );
+    expect(Math.max(...flat.split("\n").map((l) => l.length))).toBeGreaterThan(60000);
+  });
+
+  it("wraps only where a newline is legal JSON, and only outside a string", () => {
+    const { pf } = frameOf(2);
+    // Names long enough that the wrap must cross one, each holding a comma and
+    // a quote — the two characters the scan has to get right. A raw newline
+    // inside a JSON string is not JSON, so a break landing in one would be a
+    // payload that no longer parses.
+    const doc = docOf(
+      2,
+      Array.from({ length: 6 }, (_, k) => ({
+        id: `long${k}`,
+        name: `x, "y", ${"z".repeat(100)}`,
+        paint: paintOf(pf.shown, 7, k),
+      }))
+    );
+    const svg = serialise(doc);
+    const body = /<!-- fourfold:art:1 ([\s\S]*?) -->/.exec(svg)?.[1] as string;
+    expect(body).toContain("\n");
+    expect(() => JSON.parse(body) as unknown).not.toThrow();
+    expect(extractArt(svg)?.comp?.layers[0].name).toBe(doc.layers[0].name);
+    expect(serialise(parse(svg) as EmitDoc)).toBe(svg);
+  });
+
+  it("keeps the marker readable across the break, which is what makes it safe", () => {
+    const svg = serialise(flatDoc(4));
+    // `MARKER_HEAD` allows the run of whitespace, `extractArt` finds the body
+    // by indexOf, and JSON.parse ignores whitespace between tokens.
+    expect(extractArt(svg)).not.toBeNull();
+    expect(extractArt(svg)?.comp?.layers).toHaveLength(1);
+    // Hand-broken in a different place: still read.
+    const rebroken = svg.replace(
+      /(<!-- fourfold:art:1 )([\s\S]*?)( -->)/,
+      (_m, a: string, b: string, c: string) =>
+        a + "\n      " + b.replace(/\n\s*/g, " ") + "\n  " + c
+    );
+    expect(extractArt(rebroken)?.comp?.layers).toHaveLength(1);
+  });
+
+  it("costs the drawing nothing it cannot afford, which is why it is 320 and not 110", () => {
+    const doc = flatDoc(4);
+    const pretty = serialise(doc);
+    const minified = pretty.replace(/\n\s*/g, "");
+    // The same ceiling the readability test holds the whole file to.
+    expect(gz(pretty) / gz(minified)).toBeLessThan(1.05);
+  });
+});
+
+// ── what a reader who is not looking at it is told ───────────────────────
+
+describe("the exported file names itself", () => {
+  it("carries lang, a title with an id, aria-labelledby and a desc", () => {
+    const svg = serialise(docOf(2));
+    const root = /<svg[^>]* id="(ff[0-9a-f]{6})"/.exec(svg)?.[1] as string;
+    expect(svg).toContain(` lang="en"`);
+    expect(svg).toContain(` role="img"`);
+    expect(svg).toContain(` aria-labelledby="${root}-t"`);
+    expect(svg).toContain(`<title id="${root}-t">`);
+    const desc = /<desc>([^<]*)<\/desc>/.exec(svg)?.[1] as string;
+    expect(desc).toContain("hexagon");
+    expect(desc).toContain("depth 2");
+    // The name the label points at is the title, not the description.
+    const titled = /<title id="[^"]*">([^<]*)<\/title>/.exec(svg)?.[1] as string;
+    expect(titled).toBe("FOURFOLD — hexagon, depth 2");
+  });
+
+  it("says the same thing about the drawing that the drawing says", () => {
+    const doc = docOf(2);
+    const desc = /<desc>([^<]*)<\/desc>/.exec(serialise(doc))?.[1] as string;
+    expect(desc).toContain(`${flatten(doc.layers).size} painted cells`);
+    expect(desc).toContain("4 layers");
+  });
+});
+
+// ── the numbers the comments claim ───────────────────────────────────────
+
+describe("the module's own measurements reproduce", () => {
+  it("counts the relief's distinct shapes at 278 of 384 and 1130 of 1536", () => {
+    const want: Record<number, [number, number]> = { 3: [278, 384], 4: [1130, 1536] };
+    for (const depth of [3, 4]) {
+      const hex = buildHexagon(depth);
+      const surface = buildRelief(hex);
+      for (const reading of ["convex", "concave"] as const) {
+        const baked = reliefFrame(surface, restShell(surface), reading);
+        const shapes = new Set<string>();
+        for (const verts of baked.verts) {
+          const sorted = [...verts].sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+          const o = sorted[0];
+          shapes.add(
+            sorted
+              .map(
+                (v) =>
+                  `${Math.round((v[0] - o[0]) * 100) / 100},${
+                    Math.round((v[1] - o[1]) * 100) / 100
+                  }`
+              )
+              .join(" ")
+          );
+        }
+        expect([shapes.size, baked.verts.length], `depth ${depth} ${reading}`).toEqual(
+          want[depth]
+        );
+      }
+    }
+  });
+
+  it("puts a two-decimal matrix 0.23 units out at depth 5, which is why there is none", () => {
+    const { pf } = frameOf(5);
+    const ys = new Set<number>();
+    for (const c of pf.cells) for (const v of c.verts) ys.add(Math.round(v[1] * 1e6) / 1e6);
+    const sorted = [...ys].sort((a, b) => a - b);
+    const unit = 512 / 2 ** 5;
+    const row = (unit * Math.sqrt(3)) / 2;
+    expect(unit).toBe(16);
+    // `b` — the lattice row index — reaches 64 on the depth-5 hexagon.
+    const rows = Math.round((sorted[sorted.length - 1] - sorted[0]) / row);
+    expect(rows).toBe(64);
+    const written = Math.round(row * 100) / 100;
+    expect(Math.abs(row - written) * rows).toBeCloseTo(0.23, 2);
+    // Ten times the precision the geometric importer matches at.
+    expect(Math.abs(row - written) * rows).toBeGreaterThan(10 * 10 ** -GEOMETRY_PRECISION);
+  });
+});
+
+// ── the stylesheet the app itself ships ──────────────────────────────────
+
+describe("draw.module.css carries no residue", () => {
+  const css = readFileSync(
+    new URL("../src/app/draw/draw.module.css", import.meta.url),
+    "utf8"
+  );
+
+  it("defines no custom property nothing reads", () => {
+    const src = ["src/app/draw/page.tsx", "src/app/draw/draw.module.css"]
+      .map((p) => readFileSync(new URL(`../${p}`, import.meta.url), "utf8"))
+      .join("\n");
+    const declared = [...css.matchAll(/^\s*(--[\w-]+):/gm)].map((m) => m[1]);
+    expect(declared.length).toBeGreaterThan(0);
+    for (const name of new Set(declared)) {
+      expect(src.includes(`var(${name})`), `${name} is declared and never read`).toBe(true);
+    }
+  });
+
+  it("puts every animation it does not defend inside the reduced-motion block", () => {
+    const at = css.indexOf("@media (prefers-reduced-motion: reduce)");
+    expect(at).toBeGreaterThan(0);
+    const block = css.slice(at, css.indexOf("\n}", at));
+    // Named because it was the one that got away.
+    expect(block).toContain(".menu");
+  });
+
+  it("reaches for the token rather than the literal behind it", () => {
+    expect(css).not.toContain("#f59e0b");
   });
 });

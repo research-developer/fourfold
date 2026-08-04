@@ -274,7 +274,7 @@ export interface ExportStamp {
   mode: BrushMode;
   scheme: string;
   at: Date;
-  ext: "svg" | "png";
+  ext: "svg" | "png" | "gif";
 }
 
 const pad2 = (n: number) => String(n).padStart(2, "0");

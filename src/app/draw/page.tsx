@@ -125,6 +125,7 @@ import {
   animationSteps,
   type AnimationStep,
 } from "@/lib/replay";
+import { gifSteps } from "@/lib/gif";
 import {
   act as journalAct,
   addLayer,
@@ -398,6 +399,24 @@ const STEP_MS_DEFAULT = 250;
  */
 const HOLD_MS = 1800;
 const FADE_MS = 90;
+
+/**
+ * The widths a GIF may be written at, and why the plate's own is not among them.
+ *
+ * The hexagon canvas is 1048 pixels across. A GIF is uncompressed pixels behind
+ * an LZW stream, so the file goes as the AREA: the same drawing measured here
+ * is 21 kB at 320 and 96 kB at 1024, and a 256-gesture plate is 98 kB against
+ * 388 kB. So the size is a real choice rather than a detail, and it is offered
+ * rather than decided.
+ *
+ * 512 is the default because it is the size at which a depth-4 cell is still
+ * several pixels across — the seam that shows the tiling survives, which is the
+ * thing that stops the plate reading as a flat block. Below 320 a depth-5 cell
+ * is under a pixel and the drawing becomes its own thumbnail; the export still
+ * works and says so, and nobody should have to find that out by trying.
+ */
+const GIF_WIDTHS: readonly number[] = [320, 512, 768, 1024] as const;
+const GIF_WIDTH_DEFAULT = 512;
 
 /** Past this many gestures the scrub ticks stop being a scale and become a fill. */
 const TICK_LIMIT = 64;
@@ -934,6 +953,16 @@ export default function DrawPage() {
    */
   const [rewind, setRewind] = useState<Rewind | null>(null);
   const [stepMs, setStepMs] = useState(STEP_MS_DEFAULT);
+  const [gifWidth, setGifWidth] = useState(GIF_WIDTH_DEFAULT);
+  /**
+   * Is a GIF being written, and how far in?
+   *
+   * Two pieces of state rather than one nullable number, because "not running"
+   * and "running, nothing done yet" are different things to a button: the
+   * second must already be disabled.
+   */
+  const [gifBusy, setGifBusy] = useState(false);
+  const [gifAt, setGifAt] = useState(0);
 
   const [helpOpen, setHelpOpen] = useState(false);
   const helpClose = useRef<HTMLButtonElement>(null);
@@ -3681,7 +3710,7 @@ export default function DrawPage() {
    * it is and what every file this program has ever written called it.
    */
   const nameFor = useCallback(
-    (ext: "svg" | "png", suffix = "") =>
+    (ext: "svg" | "png" | "gif", suffix = "") =>
       exportName({
         kind: (canvas.view.mode === "sector" ? "triangle" : "hexagon") + suffix,
         depth,
@@ -3769,29 +3798,45 @@ export default function DrawPage() {
    * can be measured on the real drawing rather than argued about. See
    * `replay.ts`, and `test/replay.test.ts`, which measures it.
    */
+  /**
+   * The replay AS DATA — the frames, the polygons and the wash — computed once.
+   *
+   * Lifted out so the animated SVG and the animated GIF are written from ONE
+   * walk of the journal rather than two. Two callers each doing their own walk
+   * would be two chances to disagree about which gesture landed where, and the
+   * disagreement would be invisible until somebody put the two files side by
+   * side. Nothing here is new: it is the first half of `animationText`, moved.
+   */
+  const animationModel = useCallback(() => {
+    if (past.length === 0) return null;
+    const { baked, cells, overlay } = bakedFrame();
+    const shown = canvas.view.mode === "sector" ? canvas.shown : undefined;
+    // One forward walk of the whole JOURNAL, composited onto this depth. The
+    // preview steps one act at a time; a file needs all of them at once. An
+    // act that only moved a layer changed no cell, and `animationSteps`
+    // already drops a step that changed nothing in frame, so a reorder costs
+    // the animation neither a rule nor a beat.
+    const states = everyComposition(comp, past).map((c) =>
+      flattenComposition(c, book)
+    );
+    const frames: AnimationStep[] = animationSteps(
+      states,
+      actStrokes(past),
+      book,
+      // An erase is drawn in the fill an unpainted cell wears, so a step can
+      // TAKE colour away without any element ever having to be removed.
+      showTiling ? TILE : PLATE_BG,
+      shown
+    );
+    if (frames.length === 0) return null;
+    return { baked, cells, overlay, shown, states, frames };
+  }, [comp, past, bakedFrame, canvas, book, showTiling]);
+
   const animationText = useCallback(
     (grouping: "orbit" | "cell") => {
-      if (past.length === 0) return null;
-      const { baked, cells, overlay } = bakedFrame();
-      const shown = canvas.view.mode === "sector" ? canvas.shown : undefined;
-      // One forward walk of the whole JOURNAL, composited onto this depth. The
-      // preview steps one act at a time; a file needs all of them at once. An
-      // act that only moved a layer changed no cell, and `animationSteps`
-      // already drops a step that changed nothing in frame, so a reorder costs
-      // the animation neither a rule nor a beat.
-      const states = everyComposition(comp, past).map((c) =>
-        flattenComposition(c, book)
-      );
-      const frames: AnimationStep[] = animationSteps(
-        states,
-        actStrokes(past),
-        book,
-        // An erase is drawn in the fill an unpainted cell wears, so a step can
-        // TAKE colour away without any element ever having to be removed.
-        showTiling ? TILE : PLATE_BG,
-        shown
-      );
-      if (frames.length === 0) return null;
+      const model = animationModel();
+      if (model === null) return null;
+      const { baked, cells, overlay, shown, states, frames } = model;
       return {
         census: animationCensus(frames),
         text: animatedSvg({
@@ -3836,12 +3881,9 @@ export default function DrawPage() {
       };
     },
     [
-      comp,
-      past,
+      animationModel,
       legacyAddresses,
-      bakedFrame,
       canvas,
-      book,
       showTiling,
       weld,
       depth,
@@ -3871,6 +3913,101 @@ export default function DrawPage() {
       }, one CSS rule per gesture; ${Math.round(bytes.size / 1024)} kB`
     );
   };
+
+  /**
+   * The same replay, as a GIF.
+   *
+   * Written from `animationModel` — the SAME frames the SVG is written from —
+   * so the two files are two encodings of one thing rather than two readings of
+   * the drawing. What differs is what the format can hold: no fade, because a
+   * fade in a GIF is frames and every intermediate opacity is a new colour, and
+   * no antialiasing, because the palette is exact and coverage would spend it
+   * on edge ramps. See `lib/gif.ts`.
+   *
+   * Driven a slice at a time off a `MessageChannel` rather than run straight
+   * through. A depth-5 plate at 1024 px is nearly two seconds of arithmetic and
+   * a frozen page for two seconds is a page that looks broken; a `setTimeout`
+   * would be throttled to once a second the moment the tab went to the
+   * background, and a worker would need `worker-src blob:`, which this app does
+   * not grant. A message port is neither throttled nor a new origin.
+   */
+  const exportGif = useCallback(() => {
+    if (gifBusy) return;
+    const model = animationModel();
+    if (model === null) {
+      setAnnounce("nothing to animate — no committed gesture changed a cell in this frame");
+      return;
+    }
+    const { cells, overlay, shown, states, frames } = model;
+    const run = gifSteps({
+      viewWidth: canvas.geom.width,
+      viewHeight: canvas.geom.height,
+      width: gifWidth,
+      cells,
+      shown,
+      background: PLATE_BG,
+      unpainted: showTiling ? TILE : null,
+      tileSeam: SEAM,
+      paintSeam: PAINT_SEAM,
+      weldPaint: weld,
+      seamWidth: canvas.geom.seamWidth,
+      overlay,
+      ground: states[0],
+      steps: frames,
+      stepMs,
+      holdMs: HOLD_MS,
+    });
+    setGifBusy(true);
+    setGifAt(0);
+    setAnnounce(
+      `writing a GIF — ${frames.length} frame${frames.length === 1 ? "" : "s"} at ${gifWidth} px`
+    );
+
+    const channel = new MessageChannel();
+    // A slice is bounded by TIME rather than by a step count, because one
+    // gesture at depth 2 and one at depth 5 are three orders of magnitude
+    // apart. Twelve milliseconds leaves a sixty-hertz frame its budget.
+    const SLICE_MS = 12;
+    channel.port1.onmessage = () => {
+      const until = performance.now() + SLICE_MS;
+      for (;;) {
+        const next = run.next();
+        if (next.done === true) {
+          channel.port1.close();
+          channel.port2.close();
+          const r = next.value;
+          setGifBusy(false);
+          setGifAt(1);
+          const name = nameFor("gif", "-replay");
+          download(new Blob([r.bytes], { type: "image/gif" }), name);
+          setAnnounce(
+            `exported ${name} — ${r.frames} frame${r.frames === 1 ? "" : "s"}, ` +
+              `${r.width}×${r.height}, ${(r.cycleMs / 1000).toFixed(1)} s a loop, ` +
+              (r.exact
+                ? `${r.palette} colour${r.palette === 1 ? "" : "s"}, exact — no quantisation; `
+                : `${r.distinct} colours reduced to ${r.palette}, the most a GIF can hold; `) +
+              `${Math.round(r.bytes.length / 1024)} kB`
+          );
+          return;
+        }
+        if (performance.now() >= until) {
+          setGifAt(next.value.done / next.value.total);
+          channel.port2.postMessage(0);
+          return;
+        }
+      }
+    };
+    channel.port2.postMessage(0);
+  }, [
+    gifBusy,
+    gifWidth,
+    animationModel,
+    canvas,
+    showTiling,
+    weld,
+    stepMs,
+    nameFor,
+  ]);
 
   const exportPng = () => {
     const url = URL.createObjectURL(
@@ -5441,6 +5578,52 @@ export default function DrawPage() {
                       >
                         save svg animation
                       </button>
+
+                      <label className={styles.rewindField}>
+                        <span className={styles.benchKey}>gif</span>
+                        <select
+                          className={styles.rewindSelect}
+                          value={gifWidth}
+                          disabled={gifBusy}
+                          onChange={(e) => {
+                            const px = Number(e.target.value);
+                            setGifWidth(px);
+                            setAnnounce(
+                              `GIF width ${px} px — ${px}×${Math.round(
+                                (px * canvas.geom.height) / canvas.geom.width
+                              )}, ${steps} frame${steps === 1 ? "" : "s"}`
+                            );
+                          }}
+                          aria-label="width of the exported GIF, in pixels"
+                        >
+                          {GIF_WIDTHS.map((px) => (
+                            <option key={px} value={px}>
+                              {px} px
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <button
+                        type="button"
+                        className={styles.rewindAction}
+                        onClick={exportGif}
+                        disabled={gifBusy}
+                        aria-busy={gifBusy}
+                        aria-label={
+                          gifBusy
+                            ? `writing the GIF — ${Math.round(gifAt * 100)} per cent done`
+                            : `save the replay as an animated GIF — ${gifWidth} pixels wide, one frame per gesture, palette taken from the drawing`
+                        }
+                      >
+                        {gifBusy ? `gif — ${Math.round(gifAt * 100)}%` : "save gif"}
+                        {gifBusy && (
+                          <span
+                            className={styles.gifFuse}
+                            style={{ width: `${Math.round(gifAt * 100)}%` }}
+                            aria-hidden="true"
+                          />
+                        )}
+                      </button>
                     </>
                   )}
 
@@ -5484,7 +5667,12 @@ export default function DrawPage() {
                       are untouched — closing this leaves the drawing exactly as
                       it was. The exported animation is a{" "}
                       <b>separate file</b>: one <code>&lt;g&gt;</code> per orbit
-                      carrying <i>one</i> CSS animation, not one per cell.
+                      carrying <i>one</i> CSS animation, not one per cell. The{" "}
+                      <b>GIF</b> is the same replay at the same step, one frame
+                      per gesture, with the palette taken from the drawing
+                      rather than quantised — so the colours are exact unless
+                      the relief is on, which puts a composition past the 256 a
+                      GIF can hold.
                     </>
                   ) : revert === null ? (
                     <>
