@@ -203,6 +203,45 @@
  * payload comment, where each layer states its own. The attributes are how the
  * file DRAWS; the payload is what it MEANS.
  *
+ * ── What made a gesture, said where a stranger can read it ──────────────
+ *
+ * A stroke in this program is applied through a SYMMETRY GROUP: one gesture
+ * paints a whole orbit at once. That is the fact about a drawing that is hardest
+ * to recover afterwards and the cheapest to state, so a layer that was made by
+ * one carries three numbers, and they go into the MARKUP as well as into the
+ * payload:
+ *
+ *   data-reveal   the animation step this layer comes up at
+ *   data-mode     the brush symmetry the gesture was made under
+ *   data-orbit    how many cells the orbit actually held
+ *
+ * Only `data-reveal` is load bearing for the picture; the stylesheet selects on
+ * it. The other two are for a reader that is not this program. A `<g>` in
+ * Illustrator or Inkscape is a compound path with no indication of what produced
+ * it, and these two words make one addressable — every six-fold stroke, every
+ * orbit that came out short — which is the whole reason this format writes
+ * layers rather than a flattened plate.
+ *
+ * They are therefore written for a STILL export too. A gesture's symmetry is a
+ * fact about the gesture and not about whether anything is being played back,
+ * and a file that stated it only while animating would be a file where turning
+ * the reveal off silently destroyed the provenance while leaving the drawing
+ * pixel for pixel the same.
+ *
+ * `orbit` IS NOT DERIVABLE FROM `mode`, which is why there are two fields and
+ * not one. A seed cell sitting on a mirror line of the group is stabilised, so a
+ * 6-fold brush lays down THREE cells and not six: `mode` is what the user chose
+ * and `orbit` is what the figure gave back. Anything computing one from the
+ * other would report a six-cell compound path with three cells in it, and would
+ * do it on exactly the strokes a symmetry-minded reader is most interested in.
+ * `test/emit.test.ts` round trips a `mode: 6, orbit: 3` layer for that reason,
+ * rather than a matching pair that a derivation would also satisfy.
+ *
+ * What the two cost, measured in that test on 120 gestures at depth 4: 29 bytes
+ * a gesture — 2.7% of the raw file and 0.6% gzipped when it animates, 3.1% and
+ * 0.9% when it does not. A few percent raw, and it is left standing rather than
+ * shortened, because the shorter spellings are the ones nothing else can read.
+ *
  * ── Reading is text and regex only ──────────────────────────────────────
  *
  * A loaded file is UNTRUSTED. `parse` returns `null` for anything it cannot
@@ -269,7 +308,13 @@ export interface EmitLayer {
   reveal?: number;
   /** The brush symmetry the gesture was made under, when one was recorded. */
   mode?: number;
-  /** How many cells the recorded orbit held, when this layer is one. */
+  /**
+   * How many cells the recorded orbit held, when this layer is one.
+   *
+   * THE REALISED SIZE, which is not always `mode`: a stabilised seed gives a
+   * short orbit. Set it from what the gesture actually painted, never from the
+   * brush. See the header.
+   */
   orbit?: number;
 }
 
@@ -901,6 +946,17 @@ function emitLayers(
     if (l.opacity !== undefined && l.opacity !== 1) {
       attrs.push(`opacity="${fmtAlpha(l.opacity)}"`);
     }
+    // The gesture, for a reader that is not this program. See the header.
+    //
+    // ABSENT, never defaulted and never empty: a `data-mode=""` on every group
+    // would be the file claiming a symmetry for the plate itself, and a
+    // `data-mode="1"` default would be indistinguishable from a real one-fold
+    // stroke. And written whether or not `doc.animation` is set, because a
+    // gesture's symmetry is a fact about the gesture rather than about playback.
+    //
+    // Nothing reads any of the three back out of the markup: `parse` takes them
+    // from the payload, like every other flag. These are how the file EXPLAINS
+    // itself to somebody else's tool.
     if (l.reveal !== undefined) attrs.push(`data-reveal="${l.reveal}"`);
     if (l.orbit !== undefined) attrs.push(`data-orbit="${l.orbit}"`);
     if (l.mode !== undefined) attrs.push(`data-mode="${l.mode}"`);

@@ -8,6 +8,7 @@ import {
   GEOMETRY_PRECISION,
   importByGeometry,
   MAX_DEPTH,
+  MAX_LAYERS,
   normalizeHex,
   paintFromPayload,
   payloadFromPaint,
@@ -357,6 +358,157 @@ describe("extractArt is total", () => {
   it("reads a payload written with generous whitespace", () => {
     const doc = `<svg>\n  <!--   ${ART_MARKER}:1\n  {"canvas":"triangle","depth":1,"convention":"apex","cells":[[0,"#d4a017"]]}\n  -->\n</svg>`;
     expect(extractArt(doc)?.cells).toEqual([[0, "#d4a017"]]);
+  });
+});
+
+// ── what a layer says about the gesture that made it ─────────────────────
+
+/**
+ * `reveal`, `mode` and `orbit` are the file's whole statement of PROVENANCE, and
+ * until now nothing here checked them at all — they were exercised only through
+ * `emit.ts`, where a failure shows up as a document that does not round trip and
+ * gives no clue which of the two modules dropped the field. These are the
+ * payload's own promises, tested where they are made.
+ *
+ * `mode` is the brush the gesture was made under and `orbit` is how many cells
+ * it actually landed. THEY ARE NOT THE SAME NUMBER: a seed on a mirror line of
+ * the group is stabilised, so a 6-fold brush can produce an orbit of 3. The
+ * validator treats them as two independent integers for that reason, and the
+ * first test below is written with `mode: 6, orbit: 3` rather than with a
+ * matching pair so that an implementation which quietly derived one from the
+ * other could not pass it.
+ */
+describe("a layer's gesture fields", () => {
+  /** A payload carrying one composition, as the comment `emit.ts` writes it. */
+  const withComp = (comp: unknown): string =>
+    encodeArt({
+      version: ART_VERSION,
+      canvas: "hexagon",
+      depth: 1,
+      convention: "apex",
+      cells: [[0, "#d4a017"]],
+      comp: comp as ArtPayload["comp"],
+    });
+
+  /** One layer, with whatever extra fields a case wants to try. */
+  const oneLayer = (extra: Record<string, unknown>) =>
+    withComp({ layers: [{ id: "g", ...extra }] });
+
+  it("carries the brush and the realised orbit back, separately", () => {
+    const back = extractArt(oneLayer({ reveal: 2, mode: 6, orbit: 3 }));
+    expect(back).not.toBeNull();
+    const l = back?.comp?.layers[0];
+    expect(l?.reveal).toBe(2);
+    expect(l?.mode).toBe(6);
+    // The stabilised orbit, which is not the brush and is not derivable from it.
+    expect(l?.orbit).toBe(3);
+  });
+
+  it("keeps them on a nested layer, which is where a pasted gesture lands", () => {
+    const back = extractArt(
+      withComp({
+        layers: [
+          { id: "outer", children: [{ id: "inner", reveal: 4, mode: 12, orbit: 12 }] },
+        ],
+      })
+    );
+    const inner = back?.comp?.layers[0].children?.[0];
+    expect(inner?.id).toBe("inner");
+    expect([inner?.reveal, inner?.mode, inner?.orbit]).toEqual([4, 12, 12]);
+  });
+
+  it("leaves a file that predates them exactly as readable as it was", () => {
+    // The whole argument for not versioning an optional field, as a test: a
+    // composition written before gestures were recorded says nothing about them,
+    // and must come back saying nothing about them. A default of any kind here —
+    // `mode: 1`, `orbit: 1`, `reveal: 0` — would be this format inventing a
+    // gesture that never happened, and would be indistinguishable from a real
+    // one-fold stroke on the first step.
+    const back = extractArt(oneLayer({ name: "an old layer" }));
+    expect(back).not.toBeNull();
+    const l = back?.comp?.layers[0];
+    expect(l?.name).toBe("an old layer");
+    expect(l?.reveal).toBeUndefined();
+    expect(l?.mode).toBeUndefined();
+    expect(l?.orbit).toBeUndefined();
+    expect("reveal" in (l as object)).toBe(false);
+  });
+
+  it("re-encodes to the same bytes, which is what pins the key order", () => {
+    // `emit.toArtLayer` writes these keys in one order and `artfile`'s validator
+    // rebuilds them in another only if somebody changes one and not the other.
+    // The file round trip is on BYTES, so a disagreement would show up in
+    // `emit.test.ts` as a document that will not re-serialise and give no hint
+    // which module moved. Here it is one line.
+    const text = withComp({
+      shown: "0-23",
+      anim: { stepMs: 250, holdMs: 1800, fadeMs: 90, steps: 6 },
+      layers: [
+        {
+          id: "g",
+          name: "six fold on a mirror",
+          hidden: true,
+          locked: true,
+          opacity: 0.5,
+          reveal: 2,
+          mode: 6,
+          orbit: 3,
+          cells: [[0, "#d4a017"]],
+          children: [{ id: "k", reveal: 3, mode: 3, orbit: 3 }],
+        },
+      ],
+    });
+    expect(encodeArt(extractArt(text) as ArtPayload)).toBe(text);
+  });
+
+  it("refuses a gesture field that is not a whole, non-negative, sane number", () => {
+    // A field the format cannot vouch for is a REFUSAL OF THE WHOLE PAYLOAD, not
+    // a field to drop: a layer claiming a 1.5-fold brush was not written by a
+    // canvas we understand, and the rest of what it says is worth no more than
+    // that.
+    for (const field of ["reveal", "mode", "orbit"]) {
+      for (const bad of [-1, 1.5, "6", null, true, [], {}, MAX_LAYERS + 1]) {
+        expect(
+          extractArt(oneLayer({ [field]: bad })),
+          `${field} = ${JSON.stringify(bad)}`
+        ).toBeNull();
+      }
+    }
+    // `NaN` and `Infinity` cannot be written as JSON at all — `JSON.stringify`
+    // turns both into `null` — so they arrive as the `null` case above rather
+    // than as themselves. Stated rather than left as a gap in the list.
+    expect(JSON.stringify({ mode: NaN })).toBe('{"mode":null}');
+  });
+
+  it("carries the timing block, so an imported file still plays", () => {
+    const back = extractArt(
+      withComp({ anim: { stepMs: 250, holdMs: 1800, fadeMs: 90, steps: 6 }, layers: [] })
+    );
+    expect(back?.comp?.anim).toEqual({ stepMs: 250, holdMs: 1800, fadeMs: 90, steps: 6 });
+  });
+
+  it("refuses a timing block that is not one", () => {
+    const good = { stepMs: 250, holdMs: 1800, fadeMs: 90, steps: 6 };
+    const bad: unknown[] = [
+      // A step of zero milliseconds is a cycle with no length; `holdMs`,
+      // `fadeMs` and `steps` may be zero and `stepMs` may not.
+      { ...good, stepMs: 0 },
+      { ...good, holdMs: -1 },
+      { ...good, fadeMs: 1.5 },
+      { ...good, steps: MAX_LAYERS + 1 },
+      // Longer than an hour, which is the wall the validator draws.
+      { ...good, stepMs: 3_600_001 },
+      // Missing a field is missing a field, not a field to default.
+      { stepMs: 250, holdMs: 1800, fadeMs: 90 },
+      "250ms",
+      [250, 1800, 90, 6],
+      null,
+    ];
+    for (const a of bad) {
+      expect(extractArt(withComp({ anim: a, layers: [] })), JSON.stringify(a)).toBeNull();
+    }
+    // And absent is fine: a still export says nothing about timing.
+    expect(extractArt(withComp({ layers: [] }))?.comp?.anim).toBeUndefined();
   });
 });
 

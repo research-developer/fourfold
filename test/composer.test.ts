@@ -413,6 +413,235 @@ describe("the composition, through the file", () => {
   });
 });
 
+/**
+ * GESTURE PROVENANCE SURVIVES THE EDITOR, and it did not.
+ *
+ * The format has carried `reveal`, `mode` and `orbit` from the start: `emit.ts`
+ * writes them as `data-*` on every layer group, still exports included, and
+ * `artfile.ts` validates them on the way back in. What was missing was the
+ * middle: `layers.Layer` had no slot for the three, so `stackFromEmit` read a
+ * file's paint, name, switches and children and dropped the provenance on the
+ * floor, and `emitLayersOf` had nothing to write back. Open a provenance-
+ * carrying SVG, save it again, and every stroke's symmetry was gone — no error,
+ * no warning, a file that still looked pixel-for-pixel identical.
+ *
+ * The measurement that opened this, before the fix:
+ *
+ *   AssertionError: expected undefined to be 2 // Object.is equality
+ *     expect(out[0].reveal).toBe(2);
+ *
+ * These tests hold the three claims that made it worth fixing rather than
+ * defaulting: the round trip closes, ABSENT stays absent so nothing that was
+ * saved before this existed changes by a byte, and `orbit` is never reconciled
+ * with `mode`.
+ */
+describe("gesture provenance, through the file", () => {
+  /**
+   * A document with no gesture anywhere — the ordinary drawing.
+   *
+   * Written as `EmitLayer` literals rather than built from a `Composition`, so
+   * it states what the file said BEFORE any of this existed and can be compared
+   * against what the round trip produces now.
+   */
+  const plainFile = (): readonly EmitLayer[] => [
+    { id: "ground", name: "Ground", paint: new Map([[0, "#111111"]]) },
+    {
+      id: "over",
+      name: "Over",
+      locked: true,
+      paint: new Map([[1, "#222222"]]),
+      children: [{ id: "kid", name: "Kid", hidden: true, paint: new Map([[2, "#333333"]]) }],
+    },
+  ];
+
+  /** A file whose every layer was made by a gesture, nested three deep. */
+  const gestureFile = (): readonly EmitLayer[] => [
+    {
+      id: "g1",
+      name: "Six-fold stroke",
+      reveal: 2,
+      mode: 6,
+      orbit: 3,
+      paint: new Map([[0, "#111111"]]),
+      children: [
+        {
+          id: "g2",
+          name: "Three-fold stroke",
+          reveal: 5,
+          mode: 3,
+          orbit: 3,
+          paint: new Map([[1, "#222222"]]),
+          children: [
+            { id: "g3", name: "Twelve", reveal: 9, mode: 12, orbit: 12 },
+          ],
+        },
+      ],
+    },
+  ];
+
+  /** A composition around an imported stack, so it can be emitted again. */
+  const compFrom = (list: readonly EmitLayer[], from = 1): Composition => {
+    const built = stackFromEmitAt(list, from);
+    return {
+      layers: built.stack,
+      selected: null,
+      nextId: built.nextId,
+      switches: built.switches,
+    };
+  };
+
+  /** Which of the three keys a layer actually HOLDS. Not which are defined. */
+  const gestureKeys = (o: object): string[] =>
+    ["reveal", "mode", "orbit"].filter((k) => Object.hasOwn(o, k));
+
+  it("carries reveal, mode and orbit out and back", () => {
+    const out = emitLayersOf(compFrom(gestureFile()), BOOK);
+    expect(out[0].reveal).toBe(2);
+    expect(out[0].mode).toBe(6);
+    expect(out[0].orbit).toBe(3);
+  });
+
+  it("carries a layer's OWN gesture at every nesting depth", () => {
+    const out = emitLayersOf(compFrom(gestureFile()), BOOK);
+    const mid = out[0].children?.[0];
+    const deep = mid?.children?.[0];
+    expect(mid?.reveal).toBe(5);
+    expect(mid?.mode).toBe(3);
+    expect(mid?.orbit).toBe(3);
+    // Three deep, and a layer holding no paint of its own still keeps it — a
+    // group grafted in by a paste is exactly that shape.
+    expect(deep?.reveal).toBe(9);
+    expect(deep?.mode).toBe(12);
+    expect(deep?.orbit).toBe(12);
+    expect(deep?.paint).toBeUndefined();
+  });
+
+  it("survives a SECOND trip through the file, unchanged", () => {
+    // The loss this closes was found by saving a loaded file. One trip is not
+    // enough to see it: the damage lands on import and shows on the next export.
+    const once = emitLayersOf(compFrom(gestureFile()), BOOK);
+    const twice = emitLayersOf(compFrom(once, 500), BOOK);
+    const strip = (list: readonly EmitLayer[]): unknown =>
+      list.map((l) => ({
+        reveal: l.reveal,
+        mode: l.mode,
+        orbit: l.orbit,
+        children: l.children === undefined ? undefined : strip(l.children),
+      }));
+    expect(strip(twice)).toEqual(strip(once));
+  });
+
+  it("never derives orbit from mode, and never reconciles the two", () => {
+    // A seed on a mirror line is STABILISED: a 6-fold brush lays down three
+    // cells. This pair is the ordinary case, and a derivation would report a
+    // six-cell compound path holding three — on exactly the strokes a
+    // symmetry-minded reader most wants to find.
+    const out = emitLayersOf(compFrom([{ id: "s", mode: 6, orbit: 3 }]), BOOK);
+    expect(out[0].mode).toBe(6);
+    expect(out[0].orbit).toBe(3);
+    expect(out[0].mode).not.toBe(out[0].orbit);
+  });
+
+  it("keeps a half-stated gesture half-stated, in both directions", () => {
+    // `mode` with no `orbit` must not gain one, and `orbit` with no `mode` must
+    // not gain one either. Filling either in would be the format answering a
+    // question it was never told the answer to.
+    const modeOnly = emitLayersOf(compFrom([{ id: "a", mode: 6 }]), BOOK);
+    expect(modeOnly[0].mode).toBe(6);
+    expect(gestureKeys(modeOnly[0])).toEqual(["mode"]);
+
+    const orbitOnly = emitLayersOf(compFrom([{ id: "b", orbit: 4 }]), BOOK);
+    expect(orbitOnly[0].orbit).toBe(4);
+    expect(gestureKeys(orbitOnly[0])).toEqual(["orbit"]);
+
+    // An animated export of a drawing made before symmetry was recorded says
+    // `reveal` and nothing else. It stays that way.
+    const revealOnly = emitLayersOf(compFrom([{ id: "c", reveal: 0 }]), BOOK);
+    expect(revealOnly[0].reveal).toBe(0);
+    expect(gestureKeys(revealOnly[0])).toEqual(["reveal"]);
+  });
+
+  it("keeps reveal 0 and orbit 0, because absent is not the same as zero", () => {
+    // `0` is the FIRST animation step and a falsy number. Any writer testing
+    // truthiness rather than `!== undefined` drops the first stroke of every
+    // animated file, which is the one failure that looks like a rendering bug.
+    const out = emitLayersOf(compFrom([{ id: "z", reveal: 0, mode: 1, orbit: 0 }]), BOOK);
+    expect(out[0].reveal).toBe(0);
+    expect(out[0].mode).toBe(1);
+    expect(out[0].orbit).toBe(0);
+    expect(gestureKeys(out[0])).toEqual(["reveal", "mode", "orbit"]);
+  });
+
+  it("leaves all three ABSENT on a layer nobody recorded a gesture for", () => {
+    const out = emitLayersOf(compFrom(plainFile()), BOOK);
+    // OWN KEYS, not values: `{ mode: undefined }` would pass a `toBeUndefined`
+    // check and still change `Object.keys`, and any writer that tests for the
+    // key rather than the value would start emitting `data-mode=""`.
+    expect(gestureKeys(out[0])).toEqual([]);
+    expect(gestureKeys(out[1])).toEqual([]);
+    expect(gestureKeys(out[1].children?.[0] ?? {})).toEqual([]);
+    // And on the model side too — an imported layer must not carry three
+    // `undefined`s in from a file that stated nothing.
+    const stack = stackFromEmitAt(plainFile(), 1).stack;
+    expect(gestureKeys(stack[0])).toEqual([]);
+    expect(gestureKeys(stack[1].children[0])).toEqual([]);
+  });
+
+  it("does not resolve a gesture under an ancestor", () => {
+    // The rule `hidden`, `locked` and `opacity` already follow: a layer states
+    // its OWN. A child inside a six-fold parent was not made by a six-fold
+    // gesture, and writing the inherited answer would permanently mark it.
+    const out = emitLayersOf(
+      compFrom([
+        { id: "p", mode: 6, orbit: 6, children: [{ id: "c", name: "plain" }] },
+      ]),
+      BOOK
+    );
+    expect(out[0].mode).toBe(6);
+    expect(gestureKeys(out[0].children?.[0] ?? {})).toEqual([]);
+  });
+
+  it("writes a gesture-free document byte for byte as it always did", () => {
+    // The strongest form of "absent by default": not a key check but the actual
+    // file. The reference list is what the emitter was handed BEFORE `Layer`
+    // grew the three fields, stated by hand; the other is what the round trip
+    // produces now. If provenance ever leaks a default, these diverge.
+    const reference = plainFile();
+    const roundTripped = emitLayersOf(compFrom(reference), BOOK);
+    // The ids are re-minted on import by design, so compare a document whose
+    // layers carry the reference's ids and the round trip's everything else.
+    const relabel = (
+      list: readonly EmitLayer[],
+      like: readonly EmitLayer[]
+    ): readonly EmitLayer[] =>
+      list.map((l, k) => ({
+        ...l,
+        id: like[k].id,
+        children:
+          l.children === undefined
+            ? undefined
+            : relabel(l.children, like[k].children ?? []),
+      }));
+    expect(serialise(svgDoc(relabel(roundTripped, reference)))).toBe(
+      serialise(svgDoc(reference))
+    );
+  });
+
+  it("writes data-reveal, data-mode and data-orbit into the markup", () => {
+    // The whole point of the field: a `<g>` a stranger's editor can address.
+    // Measured on the real serialiser rather than trusted.
+    const svg = serialise(svgDoc(emitLayersOf(compFrom(gestureFile()), BOOK)));
+    expect(svg).toContain('data-reveal="2"');
+    expect(svg).toContain('data-mode="6"');
+    expect(svg).toContain('data-orbit="3"');
+    // ...and none of the three anywhere in a drawing that recorded none.
+    const plain = serialise(svgDoc(emitLayersOf(compFrom(plainFile()), BOOK)));
+    expect(plain).not.toContain("data-reveal");
+    expect(plain).not.toContain("data-mode");
+    expect(plain).not.toContain("data-orbit");
+  });
+});
+
 describe("counting a subtree", () => {
   it("counts a layer's own cells at the book's depth", () => {
     const l: Layer = {
@@ -660,10 +889,53 @@ describe("the event log is the journal", () => {
 // ── helpers that keep the tests readable ─────────────────────────────────
 
 import { stackFromEmit } from "../src/lib/composer";
-import type { EmitLayer } from "../src/lib/emit";
+import { serialise, type EmitDoc, type EmitLayer } from "../src/lib/emit";
+import { plateFrame } from "../src/lib/view";
+import type { ArtCell } from "../src/lib/strokes";
 
 const stackFrom = (list: readonly EmitLayer[]): readonly Layer[] =>
   stackFromEmit(list, BOOK, 1).stack;
 
 const stackFromEmitAt = (list: readonly EmitLayer[], from: number) =>
   stackFromEmit(list, BOOK, from);
+
+/**
+ * A whole `EmitDoc` around a layer list, on the same figure as `BOOK`.
+ *
+ * Here so the provenance tests can measure the BYTES rather than the interface
+ * — "absent by default" is a claim about the file, and the only way to check a
+ * claim about a file is to write one. Everything except `layers` is fixed, so
+ * two documents differ exactly where their layers do.
+ */
+function svgDoc(layers: readonly EmitLayer[]): EmitDoc {
+  const hex = buildHexagon(2, "apex");
+  const pf = plateFrame(hex, { mode: "hexagon", sector: 0 });
+  const cells = new Map<number, ArtCell>();
+  pf.cells.forEach((c, i) => cells.set(i, { verts: c.verts }));
+  return {
+    width: pf.width,
+    height: pf.height,
+    cells,
+    shown: pf.shown,
+    background: "#0a0908",
+    unpainted: "#141110",
+    tileSeam: null,
+    paintSeam: null,
+    seamWidth: 0.7,
+    weldPaint: false,
+    title: "provenance",
+    layers,
+    overlay: [],
+    animation: null,
+    // Held EMPTY and identical across every document this builds: `serialise`
+    // fills `comp` in from `layers`, which is the part under test, and a
+    // flattened `cells` list would only add a second copy of the same paint.
+    payload: {
+      version: 1,
+      canvas: "hexagon",
+      depth: 2,
+      convention: "apex",
+      cells: [],
+    },
+  };
+}

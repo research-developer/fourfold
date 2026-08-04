@@ -720,6 +720,319 @@ describe("animation", () => {
   });
 });
 
+// ── gesture provenance ───────────────────────────────────────────────────
+
+/**
+ * Whether a gesture is still a gesture after the file has been round tripped.
+ *
+ * The block above measures one animated document whose gestures are all at the
+ * TOP LEVEL and all six-fold, which is the easy shape: a flat list of layers
+ * that agree with each other. This one asks the harder question, which is the
+ * one that decides whether the format is portable — can a reader open a file
+ * this program wrote, find each gesture, say which symmetry made it and how
+ * many cells it actually landed, and write the file back out unchanged? So the
+ * fixture nests, hides, fades, and mixes brushes, and every assertion below is
+ * against a STATED expectation rather than against the document it came from.
+ * Comparing a parsed tree to the tree it was parsed from passes just as happily
+ * when both sides are empty.
+ */
+describe("a gesture survives export, import and re-export", () => {
+  /**
+   * Six gestures under six different brushes: two nested, one hidden, one faded,
+   * and one whose ORBIT IS SHORTER THAN ITS BRUSH.
+   *
+   * `g2` is the case the two fields exist for and the one a single field could
+   * not state. A seed cell sitting on a mirror line of the group is stabilised,
+   * so a 6-fold brush lays down three cells and not six: `mode` is what the user
+   * chose and `orbit` is what the figure gave back, and a reader that derived
+   * either from the other would report a six-cell compound path with three cells
+   * in it. They are written independently for that reason, and the round trip is
+   * asserted on both separately below.
+   */
+  const gestural = (): EmitDoc => {
+    const { pf } = frameOf(3);
+    const shown = pf.shown;
+    /** `n` cells starting a twelfth of the way along, so the gestures differ. */
+    const stroke = (k: number, n: number): Map<number, string> =>
+      new Map(
+        shown
+          .slice(k * 12, k * 12 + n)
+          .map((i, j) => [i, PALETTE[(k + j) % PALETTE.length]] as [number, string])
+      );
+    const layers: EmitLayer[] = [
+      // No gesture at all: the plate the strokes were laid on.
+      { id: "ground", name: "ground", paint: paintOf(shown, 20, 0) },
+      { id: "g0", name: "one fold", reveal: 0, mode: 1, orbit: 1, paint: stroke(0, 1) },
+      { id: "g1", name: "three fold", reveal: 1, mode: 3, orbit: 3, paint: stroke(1, 3) },
+      {
+        id: "g2",
+        name: "six fold on a mirror",
+        reveal: 2,
+        mode: 6,
+        // STABILISED. Not a typo and not derivable from `mode`.
+        orbit: 3,
+        paint: stroke(2, 3),
+        children: [
+          { id: "g3", name: "twelve fold", reveal: 3, mode: 12, orbit: 12, paint: stroke(3, 12) },
+          {
+            id: "g4",
+            name: "two fold, hidden",
+            hidden: true,
+            reveal: 4,
+            mode: 2,
+            orbit: 2,
+            paint: stroke(4, 2),
+            children: [
+              {
+                id: "g5",
+                name: "six fold, faded",
+                opacity: 0.5,
+                reveal: 5,
+                mode: 6,
+                orbit: 6,
+                paint: stroke(5, 6),
+              },
+            ],
+          },
+        ],
+      },
+    ];
+    return {
+      ...docOf(3, layers),
+      animation: { stepMs: 250, holdMs: 1800, fadeMs: 90, steps: 6 },
+    };
+  };
+
+  /**
+   * Every layer's provenance, in tree order, one line each, with the PATH so
+   * that a gesture that came back at the wrong depth reads as a different line
+   * rather than as the same one.
+   */
+  const provenance = (layers: readonly EmitLayer[], path = ""): string[] => {
+    const out: string[] = [];
+    for (const l of layers) {
+      const say = (k: string, v: number | undefined) => (v === undefined ? "" : ` ${k}=${v}`);
+      out.push(
+        `${path}${l.id}${say("reveal", l.reveal)}${say("mode", l.mode)}${say("orbit", l.orbit)}`
+      );
+      if (l.children !== undefined) out.push(...provenance(l.children, `${path}${l.id}/`));
+    }
+    return out;
+  };
+
+  /** What the fixture says, written out rather than read back off itself. */
+  const STATED = [
+    "ground",
+    "g0 reveal=0 mode=1 orbit=1",
+    "g1 reveal=1 mode=3 orbit=3",
+    "g2 reveal=2 mode=6 orbit=3",
+    "g2/g3 reveal=3 mode=12 orbit=12",
+    "g2/g4 reveal=4 mode=2 orbit=2",
+    "g2/g4/g5 reveal=5 mode=6 orbit=6",
+  ];
+
+  const doc = gestural();
+  const once = serialise(doc);
+
+  it("is the document the assertions below claim it is", () => {
+    // The fixture guarding itself. Everything after this compares a parsed tree
+    // to `STATED`, which is worth nothing if the tree it was built from never
+    // said that in the first place.
+    expect(provenance(doc.layers)).toEqual(STATED);
+  });
+
+  it("writes the brush and the realised orbit into the markup, independently", () => {
+    // Both, on the group, once each — the compound-path statement an SVG tool
+    // that has never heard of this format can still read.
+    expect(once).toContain(
+      `<g id="g2" data-name="six fold on a mirror" data-reveal="2" data-orbit="3" data-mode="6">`
+    );
+    expect(once).toContain(`data-reveal="3" data-orbit="12" data-mode="12"`);
+    // The hidden gesture keeps its own provenance AND its own flag; hiding a
+    // stroke must not erase what made it.
+    expect(once).toContain(
+      `<g id="g4" data-name="two fold, hidden" display="none" data-reveal="4" data-orbit="2" data-mode="2">`
+    );
+    expect(once).toContain(`opacity="0.5" data-reveal="5" data-orbit="6" data-mode="6"`);
+    // Six gestures, six groups carrying a brush, and not one attribute on a
+    // cell: the orbit is the group, which is the whole addressability claim.
+    expect(once.match(/data-mode="/g)).toHaveLength(6);
+    expect(once.match(/data-orbit="/g)).toHaveLength(6);
+    expect(once).not.toMatch(/<use [^>]*data-(?:mode|orbit|reveal)/);
+  });
+
+  it("brings every gesture back, at the depth and in the order it was written", () => {
+    const back = parse(once);
+    expect(back).not.toBeNull();
+    const got = back as EmitDoc;
+    expect(provenance(got.layers)).toEqual(STATED);
+    // Nesting, stated separately: `provenance` prints the path, but a tree that
+    // came back flat with slashes in its ids would print the same lines.
+    const tree = (l: readonly EmitLayer[]): string =>
+      l.map((x) => `${x.id}(${tree(x.children ?? [])})`).join(",");
+    expect(tree(got.layers)).toBe("ground(),g0(),g1(),g2(g3(),g4(g5()))");
+    expect(got.animation).toEqual({ stepMs: 250, holdMs: 1800, fadeMs: 90, steps: 6 });
+    // The stabilised one, called out on its own, because "6 and 3" surviving is
+    // the claim and "6 and 6" would survive an implementation that derived one
+    // from the other.
+    const g2 = findLayer(got.layers, "g2") as EmitLayer;
+    expect([g2.mode, g2.orbit]).toEqual([6, 3]);
+  });
+
+  it("re-exports to the same bytes, and the re-export is still animated", () => {
+    const back = parse(once) as EmitDoc;
+    const twice = serialise(back);
+    expect(twice).toBe(once);
+    // Byte identity already implies this, and it is asserted anyway: the
+    // question the round trip was run to answer is whether an IMPORTED file
+    // still plays, and "the bytes match" is an answer about the wrong thing if
+    // the bytes never carried an animation to begin with.
+    expect(twice.match(/@keyframes ff[0-9a-f]{6}-r\d+ \{/g)).toHaveLength(6);
+    expect(twice).toMatch(/#ff[0-9a-f]{6} \[data-reveal\] \{ opacity: 0;/);
+    expect(twice).toContain("animation-iteration-count: infinite");
+    // On the GROUPS, and counted there: `data-reveal="k"` also appears once per
+    // step inside the stylesheet, as the selector that gives the step its
+    // keyframes, so an unqualified count of the string is twelve and says
+    // nothing about how many gestures the file holds.
+    expect(twice.match(/<g [^>]*data-reveal="\d+"/g)).toHaveLength(6);
+    // And a third pass, because a fixed point reached on the second call is a
+    // weaker promise than a fixed point: `parse` reads the payload and the
+    // markup separately and only their agreement makes the file stable.
+    expect(serialise(parse(twice) as EmitDoc)).toBe(twice);
+  });
+
+  it("states the symmetry in a STILL export too, where nothing is playing", () => {
+    // A gesture's symmetry is a fact about the gesture. A file exported with the
+    // reveal turned off is the same six compound paths made by the same six
+    // brushes, and a tool opening it has the same reason to want to address
+    // them — so the attributes are written on the `<g>` whether or not there is
+    // a stylesheet that animates it.
+    const still = serialise({ ...doc, animation: null });
+    expect(still).not.toContain("@keyframes");
+    expect(still).not.toContain("animation-iteration-count");
+    expect(still).toContain(
+      `<g id="g2" data-name="six fold on a mirror" data-reveal="2" data-orbit="3" data-mode="6">`
+    );
+    expect(still.match(/data-mode="/g)).toHaveLength(6);
+    expect(still.match(/data-orbit="/g)).toHaveLength(6);
+    const back = parse(still) as EmitDoc;
+    expect(back.animation).toBeNull();
+    expect(provenance(back.layers)).toEqual(STATED);
+    expect(serialise(back)).toBe(still);
+  });
+
+  it("keeps the provenance when one gesture is copied out on its own", () => {
+    // The operation the whole feature is for: select a compound path, copy it,
+    // paste it somewhere else. A scoped export is a standalone composition, so
+    // the copy has to state what made it just as the file it came from did —
+    // otherwise "copy" is where the symmetry gets lost, and it would get lost
+    // silently, because the copied drawing looks identical.
+    const clip = serialise(doc, { layer: "g2" });
+    const back = parse(clip) as EmitDoc;
+    expect(back).not.toBeNull();
+    expect(provenance(back.layers)).toEqual([
+      "g2 reveal=2 mode=6 orbit=3",
+      "g2/g3 reveal=3 mode=12 orbit=12",
+      "g2/g4 reveal=4 mode=2 orbit=2",
+      "g2/g4/g5 reveal=5 mode=6 orbit=6",
+    ]);
+    expect(serialise(back)).toBe(clip);
+
+    // And through the rename that pasting into a document which already holds
+    // those ids forces. `rekey` moves nothing and must therefore change nothing
+    // but the ids — a paste that dropped the brush would be a paste that turned
+    // four addressable gestures into four anonymous groups.
+    const fresh = rekey(back.layers, new Set(["g2", "g3", "g4", "g5"]));
+    expect(provenance(fresh)).toEqual([
+      "g2-2 reveal=2 mode=6 orbit=3",
+      "g2-2/g3-2 reveal=3 mode=12 orbit=12",
+      "g2-2/g4-2 reveal=4 mode=2 orbit=2",
+      "g2-2/g4-2/g5-2 reveal=5 mode=6 orbit=6",
+    ]);
+  });
+
+  it("writes no attribute at all for a layer that carries no gesture", () => {
+    // Absent, not defaulted and not empty. A `data-mode=""` on every group would
+    // be a file claiming a symmetry for the plate itself, and a `data-mode="1"`
+    // default would be indistinguishable from a real one-fold stroke.
+    const plain = serialise(docOf(2));
+    expect(plain).not.toMatch(/data-(?:mode|orbit|reveal)/);
+    // And inside a document that DOES carry gestures, the layer that has none
+    // still gets nothing.
+    expect(once).toContain(`<g id="ground" data-name="ground">`);
+  });
+
+  /**
+   * What `data-mode` and `data-orbit` cost, measured on a document shaped like a
+   * real drawing rather than on the fixture above.
+   *
+   * 120 gestures on a depth-4 hexagon, each a six-cell orbit — one in seven of
+   * them stabilised to three, so the two fields genuinely differ and neither
+   * compresses as a copy of the other. Both sides are the same document: the
+   * "without" side is this emitter's own output with only those two attributes
+   * deleted, so nothing else in the file moves.
+   *
+   *                    RAW                          GZIPPED
+   *   animated   134 018 / 130 538  +2.67%      14 366 / 14 281  +0.60%
+   *   still      115 279 / 111 799  +3.11%      12 320 / 12 213  +0.88%
+   *
+   * THREE PERCENT OF THE RAW BYTES IS A FEW PERCENT, and it is left standing
+   * rather than argued down. The raw cost is exactly 29 bytes per gesture —
+   * ` data-orbit="6" data-mode="6"` and nothing else — so it is 3480 bytes in
+   * both columns and the percentage only moves because the still file is
+   * smaller. It reads as a percentage of the whole file because the file is
+   * O(cells) and this is O(gestures); on a sparser drawing, or one whose
+   * gestures ARE its cells, the same 29 bytes would be a larger fraction, and
+   * that is the case where the provenance is most of what there is to say.
+   *
+   * Gzipped it is under one percent, which is the number that matters for a file
+   * that travels. What the two attributes add is highly repetitive text —
+   * `data-orbit="6" data-mode="6"` verbatim on 102 of the 120 groups — so
+   * deflate charges nearly nothing for them, and the 107 bytes it does charge
+   * are mostly the eighteen stabilised groups saying something different from
+   * their neighbours. Which is the information.
+   *
+   * Two ceilings rather than one, because the raw and the gzipped answers differ
+   * by a factor of three and a single bound would have to be the loose one.
+   */
+  it("costs about three percent raw and under one percent gzipped to say all this", () => {
+    const { pf } = frameOf(4);
+    const shown = pf.shown;
+    const layers: EmitLayer[] = [{ id: "ground", paint: paintOf(shown, 20, 0) }];
+    for (let k = 0; k < 120; k++) {
+      layers.push({
+        id: `g${k}`,
+        reveal: k,
+        mode: 6,
+        orbit: k % 7 === 0 ? 3 : 6,
+        paint: new Map(
+          shown.slice(k * 6, k * 6 + 6).map((i) => [i, PALETTE[k % PALETTE.length]] as [number, string])
+        ),
+      });
+    }
+    const base = docOf(4, layers);
+    for (const animation of [
+      { stepMs: 120, holdMs: 1200, fadeMs: 60, steps: 120 },
+      null,
+    ] as const) {
+      const what = animation === null ? "still" : "animated";
+      const svg = serialise({ ...base, animation });
+      // The same file with only these two attributes taken out.
+      const bare = svg.replace(/ data-(?:mode|orbit)="\d+"/g, "");
+      expect(bare).not.toMatch(/data-(?:mode|orbit)/);
+      // `data-reveal` is left alone: it predates this and pays for itself in the
+      // stylesheet, so charging it here would be charging the animation twice.
+      // Counted on the groups — the stylesheet spells it too. See above.
+      expect(bare.match(/<g [^>]*data-reveal="/g)).toHaveLength(120);
+      // 29 bytes a gesture, and the same 29 whether or not anything is playing.
+      expect(bytes(svg) - bytes(bare), `${what} raw`).toBe(120 * 29);
+      expect(bytes(svg) / bytes(bare), `${what} raw`).toBeLessThan(1.04);
+      expect(gz(svg) / gz(bare), `${what} gzipped`).toBeGreaterThan(1);
+      expect(gz(svg) / gz(bare), `${what} gzipped`).toBeLessThan(1.01);
+    }
+  });
+});
+
 // ── untrusted input ──────────────────────────────────────────────────────
 
 describe("a loaded file is untrusted", () => {

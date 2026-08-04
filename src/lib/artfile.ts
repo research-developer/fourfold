@@ -169,11 +169,29 @@ export interface ArtLayer {
   cells?: [number, string][];
   /** Sub-layers, in paint order — later children sit over earlier ones. */
   children?: ArtLayer[];
-  /** Animation: the step this layer is revealed at. See `emit.ts`. */
+  /**
+   * Animation: the step this layer is revealed at. See `emit.ts`.
+   *
+   * This and the two below are optional and NOT versioned, on exactly the
+   * argument `relief`, `plate`, `view` and `comp` already make: a composition
+   * written before gestures were recorded says nothing about them, and a reader
+   * that predates them treats their absence as "this layer was not made by a
+   * gesture we know about" — which is what such a file meant. A DEFAULT would be
+   * worse than a bump: `mode: 1` invented here is indistinguishable from a real
+   * one-fold stroke, so the format would be answering a question it was never
+   * told the answer to. `test/artfile.test.ts` holds them absent.
+   */
   reveal?: number;
   /** The brush symmetry the gesture was made under, when one was recorded. */
   mode?: number;
-  /** How many cells the recorded orbit held, when this layer is one. */
+  /**
+   * How many cells the recorded orbit held, when this layer is one.
+   *
+   * VALIDATED INDEPENDENTLY OF `mode`, and they are frequently unequal: a seed
+   * on a mirror line of the group is stabilised, so a 6-fold brush produces an
+   * orbit of 3. Nothing here may cross-check one against the other — a payload
+   * stating `mode: 6, orbit: 3` is the ordinary case and not a contradiction.
+   */
   orbit?: number;
 }
 
