@@ -126,7 +126,15 @@ import {
   PRESET_NAMES,
   type PresetName,
 } from "@/lib/presets";
-import { SHORTCUTS } from "@/lib/shortcuts";
+import {
+  ALT_REST,
+  SHORTCUTS,
+  altDown,
+  altLost,
+  altUp,
+  shapeAlt,
+  type AltState,
+} from "@/lib/shortcuts";
 import {
   hexagonSurface,
   BRUSH_SCOPES,
@@ -1003,7 +1011,41 @@ export default function DrawPage() {
   const [schemeName, setSchemeName] = useState<SchemeName>("hexad");
   const [base, setBase] = useState<Swatch>(() => swatchFromHex("#d4a017"));
 
-  const [tool, setTool] = useState<Tool>("paint");
+  /**
+   * The tool the user CHOSE, which is not always the tool in force.
+   *
+   * Holding Option/Alt with nothing pressed is a momentary eraser (see the Alt
+   * block further down), and the whole of that feature is the two lines below:
+   * `pickedTool` is the selection and `tool` is what the program does with it.
+   *
+   * ── Why an override and not a save/restore ──────────────────────────────
+   *
+   * The obvious build is `prev = tool; setTool("erase")` on the way down and
+   * `setTool(prev)` on the way up. It was rejected, and not on taste:
+   *
+   *  · IT CAN GET STUCK. Every path that fails to reach the restore — a missed
+   *    keyup, an unmount mid-hold, a throw between the two — leaves a
+   *    DESTRUCTIVE tool selected with nothing on screen saying it is temporary,
+   *    and the user's own selection destroyed. Here the momentary state is one
+   *    boolean whose false is the resting value; losing track of it can only
+   *    fail toward the tool the user actually picked.
+   *
+   *  · IT CLOBBERS A MID-HOLD CHANGE. The brief asks that release restore the
+   *    previous tool "including if the user changed tools some other way
+   *    mid-hold". A save/restore would write the stale saved value back over
+   *    the new choice. This restores it exactly by never overwriting it: click
+   *    ADJUST while the eraser is held and `pickedTool` is adjust from that
+   *    instant, so the release reveals adjust rather than reinstating paint.
+   *    There is no restore step to get wrong, because there is no save.
+   *
+   * Everything downstream — the paint pipeline, the ghost, the cursor, the HUD
+   * flag, the pressed state of the tool buttons, the canvas label — reads
+   * `tool` and needs no further change. That is the point of putting the
+   * override at the name rather than at forty call sites.
+   */
+  const [pickedTool, setPickedTool] = useState<Tool>("paint");
+  const [eraseHeld, setEraseHeld] = useState(false);
+  const tool: Tool = eraseHeld ? "erase" : pickedTool;
   const [adjustName, setAdjustName] = useState<AdjustName>("hue+");
   const [band, setBand] = useState<BandFamily | null>(null);
   const [progName, setProgName] = useState<ProgressionName>("off");
@@ -1155,6 +1197,49 @@ export default function DrawPage() {
   /** Space is down. A ref as well, because the key handler reads it. */
   const [spaceHeld, setSpaceHeld] = useState(false);
   const panned = useRef(false);
+
+  /**
+   * Every pointer currently pressed, anywhere on the window.
+   *
+   * THE DISCRIMINATOR for Option/Alt, and the only thing it is for. `shortcuts.
+   * altDown` asks one question — was a pointer already down when the key went
+   * down — and this answers it.
+   *
+   * ── Why a window listener and not a flag lifted out of `DrawBoard` ──────
+   *
+   * The board knows perfectly well when a press is live; it keeps `drawing`,
+   * `anchor`, `proposing` and `panFrom` for exactly that. Lifting one of them
+   * would have made the discriminator "a press on the CANVAS", which is the
+   * narrower and arguably more faithful reading — the shape modifier only means
+   * anything while a canvas gesture is running.
+   *
+   * This is the wider one — ANY press, including one on a rail button — and the
+   * choice is deliberate, because the two readings differ only in cases where
+   * the wider one REFUSES TO ARM a destructive tool: hold a zoom button down,
+   * press Alt, and you get the shape modifier's inert branch instead of a live
+   * eraser. Erring toward "the eraser did not arm" is free; erring the other way
+   * costs the user cells. It also needs no new prop, cannot be desynchronised
+   * from the board's four refs, and sees presses that begin outside the canvas
+   * entirely.
+   *
+   * A `Set` of pointer ids rather than a count, so a lost `pointerup` for one
+   * finger cannot leave a permanent phantom press behind on a touchscreen. The
+   * board already leans on window-level `pointerup`/`pointercancel` for exactly
+   * this reason — "a gesture can finish anywhere" — so this adds no assumption
+   * that the drawing surface was not already making.
+   */
+  const pointers = useRef<Set<number>>(new Set());
+  /**
+   * What the live Option/Alt hold means. See `shortcuts.AltState`.
+   *
+   * A REF as well as `eraseHeld` state, and the two are not two sources of
+   * truth: `applyAlt` is the only writer of either and writes both, the ref is
+   * what the window listeners read (they must see the value THIS event, not the
+   * one the last render closed over), and the state is what the picture reads.
+   * `compRef` beside `session.composition` is the same arrangement for the same
+   * reason.
+   */
+  const altRef = useRef<AltState>(ALT_REST);
   /**
    * The animation frame the drill-in zoom is travelling on, or `null`.
    *
@@ -3301,13 +3386,26 @@ export default function DrawPage() {
     );
   };
 
+  /**
+   * Choose a tool. Writes the SELECTION, never the momentary override.
+   *
+   * Compared against `pickedTool` rather than against `tool`, and the difference
+   * is reachable: with the momentary eraser held, `tool` is already "erase", so
+   * comparing against it would make clicking the ERASE button a no-op — the one
+   * click whose whole meaning is "make this one stick". Against the selection it
+   * does what it says, and the release then reveals erase instead of undoing it.
+   */
   const pickTool = useCallback(
     (next: Tool) => {
-      if (next === tool) return;
-      setTool(next);
-      setAnnounce(`${next} tool — ${TOOL_LABEL[next]}`);
+      if (next === pickedTool) return;
+      setPickedTool(next);
+      setAnnounce(
+        eraseHeld && next !== "erase"
+          ? `${next} tool — ${TOOL_LABEL[next]}; erase is held, so it takes over when Option is released`
+          : `${next} tool — ${TOOL_LABEL[next]}`
+      );
     },
-    [tool]
+    [pickedTool, eraseHeld]
   );
 
   /**
@@ -3722,6 +3820,101 @@ export default function DrawPage() {
     [canvas, stopEasing]
   );
 
+  // ── Option / Alt: the momentary eraser ──────────────────────────────────
+  //
+  // THE CONFLICT. Option was already taken. `shapeStampFor` reads an `alt` flag
+  // and expands a line or a ring symmetrically about its anchor, `DrawBoard`
+  // reads it off the pointer event on every move so that letting go mid-drag
+  // un-expands the figure under the finger, and the window key handler has a
+  // bare `if (e.altKey) return` so that a stray Option can never fire a letter.
+  // All three of those stay.
+  //
+  // THE RULE, in the owner's words: "The erase should only work if you press
+  // opt/alt with no mouse down or drag. So if all you do is click and hold for
+  // even a fraction of a second and then hold option, it sets the centroid and
+  // scales symmetrically. Hold opt/alt the split second before clicking and it
+  // erases."
+  //
+  // So the meaning is fixed by ORDER, decided once, at the keydown, from
+  // `pointers`. `shortcuts.altDown` is that decision and it is pure, which is
+  // the only reason any of this is testable at all — vitest runs `environment:
+  // "node"` here, so nothing that needs a DOM can be asserted.
+  //
+  // WHAT IS NOT DONE HERE, and why. The hold is not cancelled when a press
+  // starts or ends; it lasts until the key comes up, "including across a
+  // subsequent press and drag", so a single Option hold can erase several
+  // gestures. And it is not converted into a tool CHANGE — see `pickedTool`.
+
+  /**
+   * The one writer of the Alt state, ref and render alike.
+   *
+   * Announces only on the edge that matters — whether the eraser is in force —
+   * so a hold that latches "modifier" says nothing at all. That is right: the
+   * shape modifier has a visible effect on the figure under the finger and has
+   * never announced itself, whereas arming a destructive brush from a key with
+   * no on-screen control is exactly the thing a live region is for.
+   */
+  const applyAlt = useCallback(
+    (next: AltState) => {
+      const was = altRef.current;
+      altRef.current = next;
+      if (was.erasing === next.erasing) return;
+      setEraseHeld(next.erasing);
+      setAnnounce(
+        next.erasing
+          ? `erase held — ${shapeTool} shape, ${mode}-fold brush; release Option for the ${pickedTool} tool`
+          : `erase released — ${pickedTool} tool`
+      );
+    },
+    [shapeTool, mode, pickedTool]
+  );
+
+  /**
+   * The pointer census, and the last line of defence against a stuck eraser.
+   *
+   * CAPTURE PHASE, on the window, so this counts a press whatever else the page
+   * does with it — a control that stops propagation, a menu that swallows the
+   * click, the canvas releasing pointer capture on the way down.
+   *
+   * The second half is the guard. `PointerEvent.altKey` is the OS's own answer
+   * to "is Option held", taken at the instant of the press, so a press that
+   * arrives with it FALSE while this page believes the eraser is armed is proof
+   * the page is wrong — a keyup that went to another window, most likely. The
+   * hold is dropped, and the press is swallowed rather than let through.
+   *
+   * Swallowing it is the deliberate part. React attaches its own listeners at
+   * the root container, which is inside the window, so `stopPropagation` here
+   * means the board never sees this press at all: no stroke, no proposal, no
+   * tap toward a double-tap. It costs one ignored click in a state that should
+   * not be reachable, and it buys an absolute statement — NO ERASE GESTURE CAN
+   * BEGIN UNLESS THE POINTER EVENT ITSELF REPORTS OPTION HELD. Without it the
+   * disarm would still be correct but a render late, because `paintAt` reads
+   * `tool` from the closure it was built with, and this press would erase.
+   */
+  useEffect(() => {
+    const down = (e: PointerEvent) => {
+      pointers.current.add(e.pointerId);
+      if (e.altKey || altRef.current.hold === null) return;
+      const armed = altRef.current.erasing;
+      applyAlt(altLost());
+      if (armed) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    const up = (e: PointerEvent) => {
+      pointers.current.delete(e.pointerId);
+    };
+    window.addEventListener("pointerdown", down, true);
+    window.addEventListener("pointerup", up, true);
+    window.addEventListener("pointercancel", up, true);
+    return () => {
+      window.removeEventListener("pointerdown", down, true);
+      window.removeEventListener("pointerup", up, true);
+      window.removeEventListener("pointercancel", up, true);
+    };
+  }, [applyAlt]);
+
   /**
    * Every shortcut, in one listener on the window.
    *
@@ -3740,6 +3933,16 @@ export default function DrawPage() {
    */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // BEFORE EVERY GUARD BELOW, including the ones that return.
+      //
+      // If this page believes Option is held and a keystroke arrives saying it
+      // is not, it is not — and dropping that belief must not depend on where
+      // the focus happens to be or on which of the six early returns this key
+      // takes. This is the cheap half of the stuck-modifier defence and it
+      // fires on the very next key the user presses; `blur` is the half that
+      // fires without them pressing anything.
+      if (!e.altKey && altRef.current.hold !== null) applyAlt(altLost());
+
       const el = document.activeElement;
       // A RANGE is not a text field. It has to swallow the arrows and Home/End,
       // which it does natively, but Escape has to keep closing the preview the
@@ -3813,8 +4016,28 @@ export default function DrawPage() {
         }
         return;
       }
-      // Option is the shape modifier, read off the pointer event. It is never a
-      // shortcut prefix, so a stray Alt must not fire a letter.
+      // OPTION / ALT DOWN — the one place the meaning of this hold is decided.
+      //
+      // Reached only after the text-field guard above, which is why holding
+      // Option while the hex input has focus arms nothing: a destructive brush
+      // that arms while you are typing a colour would be indefensible, and the
+      // release still disarms because `onUp` handles Alt outside every guard.
+      //
+      // `brushOff` covers the three states in which the plate is not editable.
+      // A hold latched there stays inert for its whole life rather than going
+      // live the moment the panel closes under a finger that never let go.
+      if (e.key === "Alt") {
+        applyAlt(
+          altDown(altRef.current, {
+            pointerDown: pointers.current.size > 0,
+            brushOff: previewing || helpOpen || saveOpen,
+          })
+        );
+        return;
+      }
+      // Option is the shape modifier, read off the pointer event, and — since
+      // this change — the momentary eraser as well. Neither is a shortcut
+      // prefix, so a stray Alt must not fire a letter.
       if (e.altKey) return;
 
       // `?` is Shift and the slash key on a US layout, and browsers disagree
@@ -3898,7 +4121,13 @@ export default function DrawPage() {
         return;
       }
       if (k === "t") {
-        pickTool(TOOLS[(TOOLS.indexOf(tool) + 1) % TOOLS.length]);
+        // The SELECTION cycles, not the tool in force. Unreachable while the
+        // momentary eraser is held — `if (e.altKey) return` above sees to that
+        // — so the two are provably equal wherever this line runs; written
+        // against `pickedTool` anyway, because a reader should not have to
+        // prove that to know the cycle cannot be knocked out of step by a
+        // modifier.
+        pickTool(TOOLS[(TOOLS.indexOf(pickedTool) + 1) % TOOLS.length]);
         return;
       }
       if (k === "f") {
@@ -3940,12 +4169,11 @@ export default function DrawPage() {
       // cannot work. The breadcrumb is the other half: it is the way OUT that a
       // Tab key can find, and it names every level rather than only the last.
       //
-      // NOT LISTED IN THE HELP PANEL, and that is a gap rather than a decision:
-      // `lib/shortcuts.ts` is the panel's source and it is outside the file lane
-      // this change was made under. The two keys are named in the breadcrumb's
-      // own title text and in the sentence the focus announces, so they are
-      // discoverable from the control they belong to; they should be added to
-      // `SHORTCUTS` by whoever next opens that file.
+      // NOW LISTED IN THE HELP PANEL, under a group of their own — the gap the
+      // previous note here asked to have closed. `lib/shortcuts.ts` says why
+      // "focus" is not a sub-heading of "view". They are also still named in
+      // the breadcrumb's title text and in the sentence the focus announces,
+      // which is how they were discoverable before the panel caught up.
       if (k === "i") {
         drillIn();
         return;
@@ -4013,6 +4241,22 @@ export default function DrawPage() {
      * tap was the paint. Nothing was given up.
      */
     const onUp = (e: KeyboardEvent) => {
+      // ALT FIRST, above every guard in this function, and unconditionally.
+      //
+      // The arm is refused in a text field; the DISARM never is. A release that
+      // could be swallowed by wherever the focus drifted to is a release that
+      // sometimes leaves a destructive brush on, and "sometimes" is the whole
+      // failure mode. There is no state to inspect and no branch: `altUp` is
+      // the resting state from anywhere.
+      if (e.key === "Alt") {
+        applyAlt(altUp());
+        return;
+      }
+      // The same evidence the keydown path uses, on the way up as well. A
+      // chord ending on a non-Alt key while we still believe Option is held
+      // says otherwise.
+      if (!e.altKey && altRef.current.hold !== null) applyAlt(altLost());
+
       if (e.key !== " ") return;
       const el = document.activeElement;
       if (
@@ -4030,16 +4274,46 @@ export default function DrawPage() {
       panned.current = false;
     };
 
-    // A window that loses focus mid-hold would keep Space down forever.
-    const onBlur = () => setSpaceHeld(false);
+    /**
+     * A window that loses focus mid-hold would keep Space down forever — and,
+     * since this change, a destructive brush on forever.
+     *
+     * THIS IS THE PRIMARY GUARD, not a fallback. Alt-Tab is the ordinary way to
+     * leave a browser window and it is done WITH THE KEY DOWN: the OS moves the
+     * focus, the keyup is delivered to whatever the user landed on, and this
+     * page is never told. Come back and the hand is holding nothing while the
+     * page believes otherwise. `blur` fires on the way out, before any of that
+     * can matter, so the eraser is already gone when the window is returned to.
+     */
+    const onBlur = () => {
+      setSpaceHeld(false);
+      applyAlt(altLost());
+    };
+
+    /**
+     * And the same on a tab switch.
+     *
+     * `blur` covers ⌘Tab and Alt-Tab on every browser measured, and covers
+     * ⌘Shift-[ / Ctrl-Tab too — so this is belt and braces rather than a case
+     * that was seen to leak. It is here because the failure it guards against
+     * is a DESTRUCTIVE tool left armed with nothing holding it, which is worth
+     * two listeners, and because `visibilitychange` catches the one shape of
+     * focus loss `blur` is not specified to: a page hidden without the window
+     * itself losing focus.
+     */
+    const onHide = () => {
+      if (document.visibilityState === "hidden") applyAlt(altLost());
+    };
 
     window.addEventListener("keydown", onKey);
     window.addEventListener("keyup", onUp);
     window.addEventListener("blur", onBlur);
+    document.addEventListener("visibilitychange", onHide);
     return () => {
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("keyup", onUp);
       window.removeEventListener("blur", onBlur);
+      document.removeEventListener("visibilitychange", onHide);
     };
   }, [
     doUndo,
@@ -4069,7 +4343,9 @@ export default function DrawPage() {
     reading,
     reliefOn,
     band,
-    tool,
+    pickedTool,
+    applyAlt,
+    previewing,
     viewMode,
     sector,
     pickView,
@@ -6279,8 +6555,20 @@ export default function DrawPage() {
                 most of the time. Folding it into the header row would make the
                 header jump by a row the moment the tool changed; here it opens
                 below the rule it belongs under, and costs canvas height only
-                while the adjust brush is actually in the hand. */}
-            {tool === "adjust" && (
+                while the adjust brush is actually in the hand.
+
+                ON `pickedTool`, NOT `tool`, and this is the one place in the
+                page where that distinction had to be made by hand. Everything
+                else reads the tool IN FORCE, which is what the momentary
+                eraser is for. This is layout: gated on `tool` it would unmount
+                the moment Option went down and remount when it came up, so
+                holding a key to erase would shunt the canvas up and down by a
+                row under the pointer — the exact jump the paragraph above says
+                this strip was moved out of the header to avoid. It is also the
+                honest reading: the strip says WHICH adjustment is selected,
+                the selection has not changed, and a momentary brush is not a
+                reason to hide a control the user will have back in a second. */}
+            {pickedTool === "adjust" && (
               <div className={styles.adjustBar}>
                 <span className={styles.benchKey} id="adjust-key">
                   adjustment
@@ -6743,7 +7031,25 @@ export default function DrawPage() {
                         // business and it already confines a shape to the
                         // anchor's own region of the symmetry surface.
                         if (!inFocus(anchor)) return;
-                        setShapeDrag({ anchor, at, alt });
+                        // THE CROSSING GUARD, and the only place the two
+                        // meanings of Option could have met.
+                        //
+                        // The board reads `e.altKey` off every pointer event
+                        // and hands it up here as "expand about the anchor".
+                        // While the momentary eraser is held that flag is true
+                        // on every event of the gesture — so an unmasked line
+                        // drag would come out BOTH erasing and symmetric: two
+                        // modifiers from one press of one key, one of which
+                        // nobody asked for. `shapeAlt` drops it while the
+                        // eraser is in force. Read from the ref rather than
+                        // from `eraseHeld`, because this is an event handler
+                        // and the ref is this instant rather than the last
+                        // render's.
+                        setShapeDrag({
+                          anchor,
+                          at,
+                          alt: shapeAlt(altRef.current, alt),
+                        });
                       }
                 }
                 onShapeEnd={previewing ? NOTHING : commitShape}
@@ -6803,9 +7109,23 @@ export default function DrawPage() {
                     {rewind.kind} · {rewind.index}/{steps}
                   </span>
                 ) : (
+                  /* The momentary eraser reuses this flag rather than raising a
+                     second indicator, because it IS the tool flag: `tool` is
+                     already "erase" while Option is held, so the chip, its
+                     hue, the `cell` cursor on the canvas, the pressed state of
+                     the ERASE button and the canvas label all say so with no
+                     further work. What it adds is the word HELD and a brighter
+                     rule, so a brush that will go away on its own is not
+                     mistaken for one that has been chosen — the difference
+                     matters, because one of them means "put the key down". */
                   tool !== "paint" && (
-                    <span className={styles.modeFlag} data-tool={tool} aria-hidden="true">
-                      {tool}
+                    <span
+                      className={styles.modeFlag}
+                      data-tool={tool}
+                      data-held={eraseHeld ? "on" : undefined}
+                      aria-hidden="true"
+                    >
+                      {eraseHeld ? "erase · held" : tool}
                     </span>
                   )
                 )}

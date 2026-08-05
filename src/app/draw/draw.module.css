@@ -2858,6 +2858,26 @@
   color: #f0a3a3;
 }
 
+/**
+ * The MOMENTARY eraser — Option held with nothing pressed.
+ *
+ * Same chip, same hue, louder: the tool is the same tool and colouring it
+ * differently would say it was a fourth one. What has to read differently is
+ * that it is TEMPORARY, and that is carried by the word (`erase · held`) plus a
+ * filled ground, so the state is legible at a glance over any artwork and from
+ * the corner of the eye.
+ *
+ * No animation. A pulsing chip over a drawing is a thing that competes with the
+ * drawing, and this is up only while a key is physically down — there is no
+ * "did I leave that on" question for a blink to answer.
+ */
+.modeFlag[data-held="on"] {
+  background: rgba(96, 22, 22, 0.86);
+  border-color: currentColor;
+  box-shadow: 0 0 0 1px rgba(240, 163, 163, 0.35);
+  color: #ffd9d9;
+}
+
 .modeFlag[data-tool="adjust"] {
   color: #7dd3fc;
 }
