@@ -73,6 +73,15 @@ import {
 import { buildFigure, type Convention } from "@/lib/figure";
 import { buildHexagon, type Hexagon } from "@/lib/hexagon";
 import {
+  EMPTY_PROPOSAL,
+  proposalHolds,
+  proposeSeed,
+  seedStamp,
+  stampGroups,
+  unionCells,
+  type Proposal,
+} from "@/lib/propose";
+import {
   clipToRegion,
   imageStamp,
   latticeView,
@@ -421,6 +430,16 @@ const TICK_LIMIT = 64;
 
 /** The board's handlers, switched off while a preview is standing. */
 const NOTHING = () => {};
+
+/**
+ * "No proposal is standing", as one shared array.
+ *
+ * Module scope rather than a fresh `[]` per render, so the board's `candidate`
+ * prop keeps its identity across every render in which nothing is proposed and
+ * the ghost layer does not re-render for a pointer that is merely moving. Same
+ * reasoning as `propose.EMPTY_PROPOSAL`, one level up the pipe.
+ */
+const NO_SPECS: readonly PreviewSpec[] = [];
 
 function TransportGlyph({ playing }: { playing: boolean }) {
   return (
@@ -813,7 +832,7 @@ const GLYPH_LEGEND: readonly { icon: React.ReactNode; what: string }[] = [
   { icon: <ShapeGlyph shape="line" />, what: "line — drag along a lattice row" },
   { icon: <ShapeGlyph shape="ring" />, what: "ring — a level set of the hex norm" },
   { icon: <DragGlyph mode="paint" />, what: "drag paints continuously" },
-  { icon: <DragGlyph mode="propose" />, what: "drag proposes; tap to commit" },
+  { icon: <DragGlyph mode="propose" />, what: "drag gathers; tap to commit" },
   { icon: <ActionGlyph name="undo" />, what: "undo a whole gesture" },
   { icon: <ActionGlyph name="redo" />, what: "redo it" },
   { icon: <ActionGlyph name="replay" />, what: "replay the drawing being made" },
@@ -881,7 +900,23 @@ export default function DrawPage() {
   const [progOrigin, setProgOrigin] = useState(0);
   /** `null` = follow the pointer type; anything else is the user's own choice. */
   const [dragChoice, setDragChoice] = useState<DragMode | null>(null);
-  const [candidate, setCandidate] = useState<number | null>(null);
+  /**
+   * The standing proposal: the seeds a `propose` drag has gathered, in order.
+   *
+   * It was a single `number | null` — one candidate, replaced by every cell the
+   * finger crossed — and that is the limitation this list removes. A propose
+   * drag now ACCUMULATES applications exactly as a paint drag does, and the only
+   * difference between the two modes is when the plate changes.
+   *
+   * The shape argument is written out in `propose.ts`: ordered, because
+   * `StrokeMark.groups` is defined in stroke order and a progression lays its
+   * gradient along that order; distinct, because a duplicate seed is invisible in
+   * the ghost and still spends a colouring event at commit. Nothing here holds
+   * the CELLS the proposal covers — those are derived from the seeds by the same
+   * `brushStamp` the commit will use, so the ghost and the stroke cannot come to
+   * disagree.
+   */
+  const [proposal, setProposal] = useState<Proposal>(EMPTY_PROPOSAL);
 
   /**
    * The drawing: a TREE of address plates, and the journal of what was done to
@@ -1279,16 +1314,25 @@ export default function DrawPage() {
   );
 
   /**
+   * The most recent seed of the standing proposal, or `null` when none stands.
+   *
+   * The LAST one, because it is the one the finger was on when it lifted, so it
+   * is what the span readout and the relief template should be about. The rest
+   * of the proposal is behind it and is not where the hand is.
+   */
+  const lastSeed = proposal.length === 0 ? null : proposal[proposal.length - 1];
+
+  /**
    * The cell the readouts and the relief take their cue from.
    *
    * Clamped to the canvas, because a cell index outlives the canvas that
    * numbered it by exactly one render when the depth changes.
    */
   const seedCell =
-    (hover ?? candidate ?? cursor) === null ||
-    (hover ?? candidate ?? cursor)! >= canvas.geom.cells.length
+    (hover ?? lastSeed ?? cursor) === null ||
+    (hover ?? lastSeed ?? cursor)! >= canvas.geom.cells.length
       ? null
-      : (hover ?? candidate ?? cursor)!;
+      : (hover ?? lastSeed ?? cursor)!;
 
   /**
    * Remember which sector a cell was in.
@@ -1466,15 +1510,24 @@ export default function DrawPage() {
    * not move are split out as `inert` rather than dropped: "the brush reaches
    * here and will do nothing" is the rule that stops it behaving as a fill, and
    * it is worth seeing.
+   *
+   * `colourBase` defaults to the base the NEXT stroke would start from, which is
+   * what a hover ghost and a one-seed proposal both want. A multi-seed proposal
+   * passes its own, one step of the progression per seed, because that is what
+   * the commit will actually lay — see `proposalSpecs`.
    */
   const specFromStamp = useCallback(
-    (stamp: ReturnType<typeof brushStamp>, seed: number): PreviewSpec => {
+    (
+      stamp: ReturnType<typeof brushStamp>,
+      seed: number,
+      colourBase: Swatch = effectiveBase
+    ): PreviewSpec => {
       const all = stamp.cells;
       if (tool === "erase") {
         return { cells: all, colours: [], inert: [], seed, erasing: true };
       }
       const colours = stampColours(
-        { tool, scheme, base: effectiveBase, adjust },
+        { tool, scheme, base: colourBase, adjust },
         paint,
         stamp
       );
@@ -1507,17 +1560,16 @@ export default function DrawPage() {
 
   /** The free brush at a seed: one stamp, clipped to the isolated arm. */
   const specFor = useCallback(
-    (seed: number | null): PreviewSpec | null => {
+    (seed: number | null, colourBase?: Swatch): PreviewSpec | null => {
       if (seed === null || seed >= canvas.geom.cells.length) return null;
       // Clipped, so the ghost promises exactly what the stroke will lay. A
       // preview that reached outside the isolated arm would be teaching the
-      // wrong brush.
+      // wrong brush. `seedStamp` is the same call `paintAt` makes, so the ghost
+      // and the stroke are one function apart rather than two copies.
       return specFromStamp(
-        clipStamp(
-          brushStamp(canvas.surface, canvas.bands, seed, shape),
-          keepCell
-        ),
-        seed
+        seedStamp(canvas.surface, canvas.bands, seed, shape, keepCell),
+        seed,
+        colourBase
       );
     },
     [canvas, shape, keepCell, specFromStamp]
@@ -1581,23 +1633,90 @@ export default function DrawPage() {
     };
   }, [shapeDrag, shapeStampFor, specFromStamp]);
 
-  const candidateSpec = useMemo(
-    () =>
-      shapeTool === "free" && dragMode === "propose" ? specFor(candidate) : null,
-    [shapeTool, dragMode, specFor, candidate]
-  );
+  /**
+   * The standing proposal, drawn: ONE GHOST PER SEED, in the order proposed.
+   *
+   * Not one merged ghost, and the reason is the reason the seeds are kept
+   * separately at all. A stamp's `span` is per application — the realised orbit
+   * size for a plain brush, the number of image bands for a band brush, and both
+   * of those vary from seed to seed — so a merged ghost would have to pick one
+   * span and would then show hues the commit is not going to lay. Per seed, each
+   * ghost is exactly `specFor` of that seed, which is exactly what `paintAt`
+   * will do to it.
+   *
+   * ── The base advances per seed, because the commit's does ───────────────
+   *
+   * A proposal of five seeds commits as five applications of the brush, and
+   * `paintAt` spends one colouring event per application, so the progression
+   * steps once per seed and the run comes out as a gradient. The preview has to
+   * step with it or it would show five copies of one hue and then lay five
+   * different ones — the exact failure `brush.stampColours` exists to prevent
+   * from the other side. `liveEvents` is 0 throughout, because a proposal has
+   * not touched the plate; the k-th seed is therefore the k-th step.
+   *
+   * Only the PAINT tool spends events (see `brush.EventLog`), so erase and
+   * adjust hold the base still across the whole proposal, which is what they do
+   * on a paint drag too.
+   *
+   * ── Only the free brush proposes ────────────────────────────────────────
+   *
+   * `line` and `ring` are excluded, and not merely left out. They are ANCHORED
+   * gestures: the press names a cell, the drag names a second, and nothing is
+   * painted until the release — so they already show a live preview under a
+   * pressed finger and already commit as one stroke, which is the whole of what
+   * propose mode was invented to give the free brush. There is also nothing to
+   * accumulate: a proposal is a run of applications at seeds, and a line is one
+   * figure with an anchor and an extent, not a set of seeds. Adding a candidate
+   * stage to them would mean a second tap for no preview that the drag did not
+   * already give.
+   */
+  const proposalSpecs = useMemo(() => {
+    if (shapeTool !== "free" || dragMode !== "propose") return NO_SPECS;
+    if (proposal.length === 0) return NO_SPECS;
+    const out: PreviewSpec[] = [];
+    proposal.forEach((seed, k) => {
+      const at = specFor(
+        seed,
+        prog.at(base, progressionIndex(events, progOrigin, tool === "paint" ? k : 0))
+      );
+      if (at !== null) out.push(at);
+    });
+    return out;
+  }, [
+    shapeTool,
+    dragMode,
+    proposal,
+    specFor,
+    prog,
+    base,
+    events,
+    progOrigin,
+    tool,
+  ]);
 
-  // A hover ghost and a standing proposal at once is two answers to one
-  // question. The proposal wins: it is the one that can be committed. An
-  // anchored drag outranks both — it is the thing under the finger.
+  /**
+   * The hover ghost now stands ALONGSIDE the proposal rather than yielding to it.
+   *
+   * It used to yield, and while the candidate was a single cell that was right:
+   * two ghosts would have been two answers to "what will be committed". A
+   * proposal is a SET now, and the two ghosts answer different questions — the
+   * marching dashes are what stands, the solid ghost is what the next application
+   * would add — so suppressing the second one costs the keyboard its preview
+   * entirely, since arrowing around with a proposal up would show nothing at the
+   * cursor at all. They are already told apart by two channels at once (fill
+   * strength and a marching dash; see `DrawBoard.Ghost`), which is what makes
+   * showing both legible rather than confusing.
+   *
+   * An anchored drag still outranks both — it is the thing under the finger.
+   */
   const preview = useMemo(
     () =>
       dragSpec !== null
         ? dragSpec.spec
-        : candidateSpec === null && shapeTool === "free"
+        : shapeTool === "free"
         ? specFor(hover)
         : null,
-    [dragSpec, candidateSpec, shapeTool, specFor, hover]
+    [dragSpec, shapeTool, specFor, hover]
   );
 
   // ── the canvas is a different set of cells now ──────────────────────────
@@ -1631,7 +1750,7 @@ export default function DrawPage() {
     setProgOrigin(0);
     setHover(null);
     setCursor(null);
-    setCandidate(null);
+    setProposal(EMPTY_PROPOSAL);
     setAnnounce(why);
   }, []);
 
@@ -1745,7 +1864,7 @@ export default function DrawPage() {
     setCentre(null);
     setHover(null);
     setCursor(null);
-    setCandidate(null);
+    setProposal(EMPTY_PROPOSAL);
     setShapeDrag(null);
   }, []);
 
@@ -1806,7 +1925,7 @@ export default function DrawPage() {
     const m = SCOPE_MODES[next].includes(mode) ? mode : 6;
     setScope(next);
     setMode(m);
-    setCandidate(null);
+    setProposal(EMPTY_PROPOSAL);
     setAnnounce(
       `brush scope ${next} — ${SCOPE_LABEL[next]}${
         m === mode ? "" : `; brush dropped to ${m}-fold`
@@ -1861,7 +1980,7 @@ export default function DrawPage() {
       setDepth(d);
       setHover(null);
       setCursor(null);
-      setCandidate(null);
+      setProposal(EMPTY_PROPOSAL);
       setShapeDrag(null);
       setAnnounce(
         `depth ${d}, ${cellCount("hexagon", d)} cells — every layer carried across, ${
@@ -1875,7 +1994,7 @@ export default function DrawPage() {
   const pickIsolation = (next: Isolation) => {
     if (next === isolation) return;
     setIsolation(next);
-    setCandidate(null);
+    setProposal(EMPTY_PROPOSAL);
     setAnnounce(
       next === null
         ? "isolation off — the whole sector"
@@ -1915,10 +2034,11 @@ export default function DrawPage() {
       // takes this rather than a bare id, so painting somewhere the brush may
       // not is not expressible; see `layers.Target`.
       const into = target.value;
-      const stamp = clipStamp(
-        brushStamp(canvas.surface, canvas.bands, i, shape),
-        keepCell
-      );
+      // The same call the ghost makes — see `specFor` — so what is previewed and
+      // what is laid are one function apart. A proposal's commit reaches this
+      // line once per seed, each with its own stamp and therefore its own
+      // `span`; see `commitProposal`.
+      const stamp = seedStamp(canvas.surface, canvas.bands, i, shape, keepCell);
       if (stamp.cells.length === 0) return;
       // Recomputed per application rather than taken from `effectiveBase`, so a
       // drag lays a gradient along its own path instead of one flat colour.
@@ -1953,9 +2073,11 @@ export default function DrawPage() {
       // The symmetry this application used, recorded before the indices are
       // forgotten. `groups` is null for a plain orbit — where there is no
       // grouping, not a grouping of one — so the orbit itself is the group,
-      // which is exactly the shape the animated export wants.
-      for (const g of stamp.groups ?? [stamp.cells]) {
-        if (g.length === 0) continue;
+      // which is exactly the shape the animated export wants. APPENDED, never
+      // merged: a gesture that applied the brush N times has N groups in the
+      // order it applied them, which is what `StrokeMark.groups` is and what
+      // `provenance.gestureLayers` reads to nest a mixed-orbit gesture.
+      for (const g of stampGroups(stamp)) {
         pendingGroups.current.push(g.map((c) => book.addr[c]));
       }
       // The gesture belongs to the layer it STARTED on, and `endStroke`
@@ -2124,7 +2246,7 @@ export default function DrawPage() {
       }
       disarm();
       setShapeDrag(null);
-      setCandidate(null);
+      setProposal(EMPTY_PROPOSAL);
       setHover(null);
       const index = kind === "replay" ? 0 : steps;
       setRewind({
@@ -2540,37 +2662,88 @@ export default function DrawPage() {
 
   // ── propose and commit ──────────────────────────────────────────────────
 
+  /**
+   * One more application onto the standing proposal. NOTHING TOUCHES THE PLATE.
+   *
+   * The board calls this on the press and again on every cell a propose-mode
+   * drag enters, which is the same event stream `paintAt` gets in paint mode —
+   * that symmetry is the feature. `proposeSeed` drops a repeat of a seed already
+   * held and hands back the same array, so a finger resting on a cell boundary
+   * does not even cause a render; see `propose.ts` for why a duplicate would be
+   * worse than useless.
+   *
+   * The hover ghost is cleared because during a drag the pointer IS the gesture,
+   * and a stale hover from before the press would be a second ghost claiming to
+   * be somewhere the finger is not.
+   */
   const propose = useCallback(
     (i: number) => {
       if (previewing) return;
       noteSector(i);
-      setCandidate(i);
+      setProposal((p) => proposeSeed(p, i));
       setCursor(i);
       setHover(null);
     },
     [previewing, noteSector]
   );
 
-  const commitCandidate = useCallback(() => {
-    if (candidate === null || previewing) return;
-    paintAt(candidate);
+  /**
+   * The whole proposal, laid down as ONE RUNG OF THE JOURNAL.
+   *
+   * This is the decision the whole feature turns on, so it is worth saying
+   * plainly what makes it hold. `paintAt` journals NOTHING: it applies the brush
+   * into `compRef` and accumulates the gesture in refs — the merged edits, the
+   * colouring events spent, and one `StrokeMark` group per application.
+   * `endStroke` is the only function on this page that pushes a paint rung, and
+   * it is called exactly ONCE here, after the loop. So a five-seed proposal is
+   * one rung and one undo takes back all five, rather than five rungs and a
+   * lottery about how many presses of ⌘Z put the plate back.
+   *
+   * The loop is also what keeps the record honest in the other two ways. Each
+   * seed gets its own `brushStamp`, so each keeps its own `span` and its own
+   * scheme positions — merging the seeds into one stamp would collapse those and
+   * repaint the proposal in hues the ghost never showed. And each pushes its own
+   * entry into `pendingGroups`, in the order applied, which is exactly what
+   * `StrokeMark.groups` is defined to be and what `provenance.gestureLayers`
+   * reads to decide whether the gesture is one layer or a parent with a child per
+   * orbit. No merged super-group is invented anywhere.
+   *
+   * Seeds whose applications change nothing simply contribute nothing: `paintAt`
+   * returns before spending an event or pushing a group when the stamp is empty
+   * or the edits are all no-ops, and `endStroke` declines to journal a gesture
+   * with no edits at all. So a proposal entirely over cells the brush cannot
+   * touch commits nothing and says so, rather than pushing an empty rung.
+   */
+  const commitProposal = useCallback(() => {
+    if (proposal.length === 0 || previewing) return;
+    for (const seed of proposal) paintAt(seed);
     endStroke("commit");
-    setCandidate(null);
-  }, [candidate, previewing, paintAt, endStroke]);
+    setProposal(EMPTY_PROPOSAL);
+  }, [proposal, previewing, paintAt, endStroke]);
 
-  const dropCandidate = useCallback(() => {
-    if (candidate === null) return;
-    setCandidate(null);
-    setAnnounce("candidate dropped");
-  }, [candidate]);
+  /**
+   * Drop it. No plate change, no rung, nothing to undo — which is the sentence
+   * the live region says, because "dropped" alone leaves open whether the work
+   * went somewhere recoverable.
+   */
+  const dropProposal = useCallback(() => {
+    if (proposal.length === 0) return;
+    const n = proposal.length;
+    setProposal(EMPTY_PROPOSAL);
+    setAnnounce(
+      `proposal dropped — ${n} application${
+        n === 1 ? "" : "s"
+      } discarded; the plate is unchanged and there is nothing to undo`
+    );
+  }, [proposal]);
 
   const pickDragMode = (next: DragMode) => {
     if (next === dragMode) return;
     setDragChoice(next);
-    setCandidate(null);
+    setProposal(EMPTY_PROPOSAL);
     setAnnounce(
       next === "propose"
-        ? "drag proposes a candidate; tap it to commit"
+        ? "drag gathers a proposal; tap it or press Enter to commit it as one gesture"
         : "drag paints continuously"
     );
   };
@@ -2653,11 +2826,16 @@ export default function DrawPage() {
       // gesture is reachable from the keyboard: Enter anchors, the cluster
       // stretches, Enter lays it.
       setShapeDrag((d) => (d === null ? null : { ...d, at: next }));
-      if (shapeTool === "free" && dragMode === "propose") setCandidate(next);
-      else setHover(next);
+      // The HOVER ghost follows the cursor in both drag modes now. It used to
+      // move the candidate in propose mode, which was right while a proposal was
+      // one cell — arrowing moved the one thing that could be committed. A
+      // proposal is a set that only grows by an explicit Enter, so arrowing must
+      // not add to it; what the cursor wants is the ghost of the application
+      // Enter WOULD add, and that is exactly the hover ghost.
+      setHover(next);
       if (said !== null) setAnnounce(said);
     },
-    [dragMode, noteSector, shapeTool]
+    [noteSector]
   );
 
   const onArrow = useCallback(
@@ -2777,8 +2955,10 @@ export default function DrawPage() {
       if (start < 0) return;
       noteSector(start);
       setCursor(start);
-      if (dragMode === "propose") setCandidate(start);
-      else setHover(start);
+      // The first Enter only lands the cursor and its ghost — in both modes now,
+      // because in propose mode Enter is the ADD gesture and adding a seed the
+      // user has not yet seen a ghost of would be proposing blind.
+      setHover(start);
       return;
     }
     if (shapeTool !== "free") {
@@ -2793,7 +2973,13 @@ export default function DrawPage() {
       return;
     }
     if (dragMode === "propose") {
-      if (candidate === cursor) commitCandidate();
+      // Enter on a cell the proposal ALREADY holds commits the whole set; Enter
+      // anywhere else adds that cell to it. That is the one-candidate rule
+      // generalised rather than replaced — pressing Enter twice on one cell
+      // still proposes then commits — and it gives the keyboard the same two
+      // gestures the pointer has, where a tap inside the standing ghost commits
+      // and a tap outside it proposes.
+      if (proposalHolds(proposal, cursor)) commitProposal();
       else propose(cursor);
       return;
     }
@@ -2805,8 +2991,8 @@ export default function DrawPage() {
     cursor,
     canvas,
     dragMode,
-    candidate,
-    commitCandidate,
+    proposal,
+    commitProposal,
     propose,
     paintAt,
     endStroke,
@@ -2819,7 +3005,7 @@ export default function DrawPage() {
     (next: ShapeTool) => {
       setShapeTool(next);
       setShapeDrag(null);
-      setCandidate(null);
+      setProposal(EMPTY_PROPOSAL);
       setAnnounce(
         next === "free"
           ? "free brush — every cell the pointer crosses is an application"
@@ -3016,7 +3202,7 @@ export default function DrawPage() {
           disarm("cancelled — nothing was changed");
           return;
         }
-        // Before the candidate and the anchored drag, and it cannot collide
+        // Before the proposal and the anchored drag, and it cannot collide
         // with either: both are dropped when a preview opens and neither can be
         // started while one stands.
         if (rewind !== null) {
@@ -3032,7 +3218,7 @@ export default function DrawPage() {
           setAnnounce(`${shapeTool} cancelled`);
           return;
         }
-        dropCandidate();
+        dropProposal();
         return;
       }
 
@@ -3250,7 +3436,7 @@ export default function DrawPage() {
   }, [
     doUndo,
     doRedo,
-    dropCandidate,
+    dropProposal,
     helpOpen,
     closeHelp,
     openHelp,
@@ -4306,26 +4492,57 @@ export default function DrawPage() {
   /** Cells in the FRAME, and cells on the plate. They differ in sector view. */
   const total = canvas.shown.length;
   const modelTotal = hex.cells.length;
-  const live = candidateSpec ?? preview;
-  const reach = live === null ? null : live.cells.length + live.inert.length;
+  /**
+   * What a standing proposal comes to, in cells.
+   *
+   * The UNION over the applications, not the sum of them: two seeds of one orbit
+   * share every cell, and a proposal that reported 12 where the plate would
+   * change 6 would be counting the gesture rather than the drawing. `commits` is
+   * the cells that would actually take colour — which for the adjustment brush
+   * already excludes the inert ones, exactly as the one-cell candidate's count
+   * did — and `reach` adds back what the brush merely touches.
+   */
+  const proposalCommits = useMemo(
+    () => unionCells(proposalSpecs.map((s) => s.cells)).length,
+    [proposalSpecs]
+  );
+  const proposalReach = useMemo(
+    () => unionCells(proposalSpecs.flatMap((s) => [s.cells, s.inert])).length,
+    [proposalSpecs]
+  );
+  const standing = proposalSpecs.length > 0;
+  const reach = standing
+    ? proposalReach
+    : preview === null
+    ? null
+    : preview.cells.length + preview.inert.length;
   /**
    * What the live region says.
    *
-   * A standing candidate speaks for itself, DERIVED rather than pushed into
+   * A standing proposal speaks for itself, DERIVED rather than pushed into
    * `announce` from an effect — the proposal changes when the brush changes as
    * much as when the finger moves, and a derived string cannot fall out of step
    * with the ghost the way a stored one can. `announce` carries everything else:
    * strokes, undo, exports, tool changes, and the commit that clears the
-   * candidate.
+   * proposal.
+   *
+   * It names the count of APPLICATIONS as well as of cells, because those are
+   * now two different numbers and the first one is the one that decides how many
+   * steps of the progression the commit will spend. It also says "one gesture",
+   * which is the promise the commit has to keep: one rung, one undo.
    */
   const said =
     dragSpec !== null
       ? `${dragSpec.said} — release to lay it, Escape to cancel`
-      : candidateSpec === null
+      : !standing
       ? announce
-      : `candidate proposed at cell ${candidateSpec.seed} — ${
-          candidateSpec.cells.length + candidateSpec.inert.length
-        } cells under the ${tool} brush; tap it or press Enter to commit, Escape to drop`;
+      : `${proposalSpecs.length} application${
+          proposalSpecs.length === 1 ? "" : "s"
+        } proposed, last at cell ${
+          proposalSpecs[proposalSpecs.length - 1].seed
+        } — ${proposalReach} cell${
+          proposalReach === 1 ? "" : "s"
+        } under the ${tool} brush; tap the ghost or press Enter to commit them as one gesture, Escape to drop`;
 
   const schemeGradient = `linear-gradient(90deg, ${tape
     .map((s, k) => `${s.hex} ${(100 * k) / Math.max(tape.length - 1, 1)}%`)
@@ -5092,12 +5309,12 @@ export default function DrawPage() {
                         title={
                           d === "paint"
                             ? "drag paints continuously"
-                            : "drag proposes a candidate — tap it to commit"
+                            : "drag gathers a proposal — tap it to commit the lot"
                         }
                         aria-label={
                           d === "paint"
                             ? "drag lays colour continuously"
-                            : "drag proposes a candidate; tap it to commit"
+                            : "drag gathers a proposal; tap it to commit every application as one gesture"
                         }
                         onClick={() => pickDragMode(d)}
                       >
@@ -5772,7 +5989,7 @@ export default function DrawPage() {
                 // preview drops all three. The STATE is kept — the cursor comes
                 // back where it was left when the preview closes.
                 preview={previewing ? null : preview}
-                candidate={previewing ? null : candidateSpec}
+                candidate={previewing ? NO_SPECS : proposalSpecs}
                 cursor={previewing ? null : cursor}
                 guides={guides}
                 showGuides={showGuides}
@@ -5795,7 +6012,7 @@ export default function DrawPage() {
                 }. Q W E A D Z X C step the cursor on the lattice, W and X move a ring outward and inward, arrow keys walk it by screen direction, Enter ${
                   shapeTool === "free"
                     ? dragMode === "propose"
-                      ? "proposes then commits"
+                      ? "adds an application to the proposal, and commits the whole proposal when pressed on one it already holds"
                       : "paints"
                     : "anchors then lays the figure"
                 }. Press question mark for every shortcut.`}
@@ -5803,7 +6020,7 @@ export default function DrawPage() {
                 onPaint={previewing ? NOTHING : paintAt}
                 onStrokeEnd={previewing ? NOTHING : endStroke}
                 onPropose={previewing ? NOTHING : propose}
-                onCommit={previewing ? NOTHING : commitCandidate}
+                onCommit={previewing ? NOTHING : commitProposal}
                 onArrow={previewing ? NOTHING : onArrow}
                 onShapeDrag={
                   previewing
@@ -5877,41 +6094,49 @@ export default function DrawPage() {
                   under the very finger that had just proposed. Floated over the
                   corner it costs no layout height at all, so nothing moves when
                   a proposal appears, and it is beside the ghost it acts on. */}
-              {candidateSpec !== null && (
+              {standing && (
                 <div className={styles.candidateBar}>
-                  <span className={styles.benchKey}>candidate</span>
+                  {/* The key names the count of APPLICATIONS, because that is
+                      what the drag gathered and what the mark will record — the
+                      button below already names the cells. One number each,
+                      rather than one control saying both. */}
+                  <span className={styles.benchKey}>
+                    proposal · {proposalSpecs.length}
+                  </span>
                   <div className={styles.commitRow}>
                     {/* Disabled at zero rather than hidden. An adjustment
-                        candidate over bare tiling really would do nothing, and
+                        proposal over bare tiling really would do nothing, and
                         a greyed COMMIT beside the dashed inert outlines says
                         that better than a button that shrugs. */}
                     <button
                       type="button"
                       className={styles.commitBtn}
-                      onClick={commitCandidate}
-                      disabled={candidateSpec.cells.length === 0}
+                      onClick={commitProposal}
+                      disabled={proposalCommits === 0}
                       aria-label={
-                        candidateSpec.cells.length === 0
+                        proposalCommits === 0
                           ? "nothing to commit — the brush would change no cell here"
-                          : `commit the standing candidate — ${candidateSpec.cells.length} cells`
+                          : `commit the standing proposal — ${proposalSpecs.length} application${
+                              proposalSpecs.length === 1 ? "" : "s"
+                            } over ${proposalCommits} cells, as one undoable gesture`
                       }
                     >
-                      commit {candidateSpec.cells.length}
+                      commit {proposalCommits}
                     </button>
                     <button
                       type="button"
-                      onClick={dropCandidate}
-                      aria-label="drop the standing candidate"
+                      onClick={dropProposal}
+                      aria-label="drop the standing proposal — nothing is painted"
                     >
                       drop
                     </button>
                   </div>
                 </div>
               )}
-              {paint.size === 0 && candidateSpec === null && !dropping && !previewing && (
+              {paint.size === 0 && !standing && !dropping && !previewing && (
                 <p className={styles.emptyHint}>
                   {dragMode === "propose"
-                    ? "drag to propose — tap the ghost to commit"
+                    ? "drag to gather a proposal — tap it to commit"
                     : "click or drag to paint — every stroke is an orbit"}
                 </p>
               )}
@@ -5958,7 +6183,11 @@ export default function DrawPage() {
                   )}{" "}
                   ·{" "}
                   {reach === null ? (
-                    <b>{dragMode === "propose" ? "drag to propose" : "hover to preview"}</b>
+                    <b>
+                      {dragMode === "propose"
+                        ? "drag to gather"
+                        : "hover to preview"}
+                    </b>
                   ) : (
                     <b>reach {reach}</b>
                   )}
@@ -6067,8 +6296,10 @@ export default function DrawPage() {
                   <Kbd>Esc</Kbd>
                 </span>
                 <span>
-                  drag moves a candidate; tap it or press Enter to commit it, Esc
-                  to drop it
+                  drag gathers a proposal, one application per cell it crosses
+                  and nothing on the plate; tap the ghost, or press Enter on a
+                  cell it already holds, to commit the whole thing as one
+                  undoable gesture; Esc drops it
                 </span>
               </li>
             ) : (

@@ -52,18 +52,29 @@ import { WELD_WIDTH, type PaintMap } from "@/lib/strokes";
  * symmetry brush is about to do — is therefore unreachable on a phone, where it
  * is needed most, because the first contact with the plate is already a stroke.
  *
- * `propose` mode makes the press itself the hover: a drag moves a CANDIDATE and
- * commits nothing, lifting the finger leaves it standing, and a tap on it lays
- * the paint. Two consequences fall out for free. The candidate survives a change
- * of brush, scheme or colour, so the settings can be auditioned against a
- * real proposal before anything is committed; and a mis-aimed first touch costs
- * nothing, which on a 390px screen is the difference between a drawing tool and
- * a guessing game.
+ * `propose` mode makes the press itself the hover: a drag GATHERS applications
+ * and commits nothing, lifting the finger leaves them standing, and a tap on
+ * them lays the paint. Two consequences fall out for free. The proposal survives
+ * a change of brush, scheme or colour, so the settings can be auditioned against
+ * a real proposal before anything is committed; and a mis-aimed first touch
+ * costs nothing, which on a 390px screen is the difference between a drawing
+ * tool and a guessing game.
  *
- * The commit gesture is a TAP ON THE CANDIDATE, not a tap anywhere, so the
- * "move it" and "keep it" gestures never contend: pressing inside the standing
- * proposal arms a commit and pressing outside it re-proposes. Dragging away
- * from an armed press disarms it, because that is a drag and not a tap.
+ * The commit gesture is a TAP ON THE PROPOSAL, not a tap anywhere, so the "add
+ * to it" and "keep it" gestures never contend: pressing inside the standing
+ * proposal arms a commit and pressing outside it adds. Dragging away from an
+ * armed press disarms it, because that is a drag and not a tap.
+ *
+ * ── A drag gathers, it does not replace ─────────────────────────────────
+ *
+ * It used to replace: every cell the finger crossed became THE candidate and the
+ * one before it was forgotten, so the mode that exists for touch could lay
+ * exactly one application per gesture while the mode that exists for a mouse
+ * could lay a hundred. `onPropose` is now called on the press and on every cell
+ * the drag enters — the same event stream `onPaint` gets in paint mode, which is
+ * the whole point — and the page accumulates them. See `lib/propose.ts` for the
+ * accumulation rule, and `page.tsx`'s `commitProposal` for why the whole run
+ * commits as ONE rung of the journal.
  */
 
 export interface BoardCell {
@@ -172,8 +183,16 @@ interface Props {
   relief: ReliefView | null;
   paint: PaintMap;
   preview: PreviewSpec | null;
-  /** The standing proposal in `propose` mode. Committed by a tap on itself. */
-  candidate: PreviewSpec | null;
+  /**
+   * The standing proposal in `propose` mode, ONE ENTRY PER APPLICATION the drag
+   * gathered, in the order it gathered them. Empty when nothing stands.
+   *
+   * A list and not a single spec, because a propose drag accumulates: see
+   * `lib/propose.ts` for why the seeds are kept apart rather than merged, and
+   * `Ghost` below for what one entry looks like. A tap anywhere inside ANY of
+   * them commits the whole thing.
+   */
+  candidate: readonly PreviewSpec[];
   cursor: number | null;
   guides: Guides;
   showGuides: boolean;
@@ -803,9 +822,11 @@ export default function DrawBoard({
       moved.current = false;
       last.current = i;
       // Inside the standing proposal this press is a commit, and must NOT also
-      // move the candidate: the plate would jump under the finger and then be
-      // painted somewhere the user did not aim.
-      const onCandidate = candidate !== null && previewCovers(candidate, i);
+      // add to it: the plate would gain an application under the finger and then
+      // be painted somewhere the user did not aim. ANY of the gathered
+      // applications counts — the whole ghost is one tap target, because the
+      // whole ghost is one gesture.
+      const onCandidate = candidate.some((c) => previewCovers(c, i));
       armed.current = onCandidate;
       if (!onCandidate) onPropose(i);
       return;
@@ -957,16 +978,35 @@ export default function DrawBoard({
           dashClass={candidateClass}
         />
       )}
-      {candidate && (
+      {/* ONE GHOST PER APPLICATION, keyed by its seed — which is unique inside a
+          proposal, because `propose.proposeSeed` refuses a repeat. Drawn as a
+          run of `standing` ghosts rather than as one merged outline, for the
+          reason `lib/propose.ts` gives: an application's colours are indexed
+          over ITS OWN span, so merging them would show hues the commit is not
+          going to lay.
+
+          WHAT THIS COSTS, stated rather than optimised away. `Ghost` is
+          memoised, but the page rebuilds the whole spec list each time the drag
+          gathers one more application, so every standing ghost re-renders on
+          every new seed — O(seeds × orbit) polygons per pointer move. That is
+          inside a budget this component already spends: a PAINT drag re-renders
+          `PaintLayer` over the entire plate on every application, which at depth
+          4 is 1536 polygons, and a proposal a finger could plausibly gather is
+          well under that. If it is ever measured to matter, the fix is an
+          identity cache in the page keyed by seed, so an unchanged spec keeps
+          its object and this `memo` bails out. It has not been measured, so it
+          has not been written. */}
+      {candidate.map((spec) => (
         <Ghost
+          key={spec.seed}
           geom={geom}
           pts={pts}
           centroids={centroids}
-          spec={candidate}
+          spec={spec}
           standing
           dashClass={candidateClass}
         />
-      )}
+      ))}
 
       {cursorPoints !== undefined && (
         <polygon
