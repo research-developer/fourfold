@@ -249,7 +249,17 @@ import {
 } from "@/lib/strokes";
 import BrushDial from "./BrushDial";
 import ColourWell from "./ColourWell";
-import LayersPanel from "./LayersPanel";
+/**
+ * `Timeline` comes out of `LayersPanel` and is NOT in the layers panel.
+ *
+ * It was, for one pass; the owner then asked for it "in the top of the bottom
+ * toolbar", so it is mounted below, in the band under the plate. The code stayed
+ * in that file because this pass had a five-file lane and a new component file
+ * was not in it — the module name is stale, deliberately and visibly, rather
+ * than the placement being wrong. `LayersPanel`'s header says the same thing
+ * from the other end.
+ */
+import LayersPanel, { Timeline } from "./LayersPanel";
 import SectorDial, { SectorGlyph } from "./SectorDial";
 import styles from "./draw.module.css";
 
@@ -3316,6 +3326,67 @@ export default function DrawPage() {
   }, []);
 
   /**
+   * IS THE TIMELINE STRIP ON SCREEN — and this is the whole of what it means.
+   *
+   * ── Why it is a separate state and not derived from the preview ────────
+   *
+   * There are three things in this file that could plausibly be called "is the
+   * timeline open", and they are three:
+   *
+   *   `rewind !== null` — a preview is standing. The plate is showing a state
+   *     that is not the live drawing.
+   *   `playFresh && playSteps > 0` — there is a beat count, taken for the
+   *     picture on screen. The rail has stops.
+   *   `timelineOpen` — the strip is not folded away. FURNITURE.
+   *
+   * Only the third is this. Wiring it to either of the others was tried on
+   * paper and refused for the same reason both times: it would make the strip
+   * unfold itself. A person who presses the seam has said, in as many words,
+   * "not now" — and REPLAY, HISTORY, P and M all open a preview, so a strip that
+   * opened with the preview would reappear on the next press of any of four
+   * controls that are about something else. That is the definition of a control
+   * fighting its user, and the brief for this pass named it.
+   *
+   * The traffic in the other direction is refused too, and that half matters
+   * more: FOLDING THE STRIP AWAY MUST NOT CLOSE A PREVIEW OR CLEAR A MARK.
+   * `closeRewind`, `setPlaySpan` and the beat count are not reachable from here
+   * — the seam's only effect is this boolean — so the drawing is in exactly the
+   * same state with the strip shut as with it open, and `timeline.seamSaid` puts
+   * that state on the seam so it is not a secret. `test/timeline.test.ts` holds
+   * the sentence to it.
+   *
+   * ── Persistence, and how far it goes ───────────────────────────────────
+   *
+   * `useState` in a component that never unmounts, so it survives every render
+   * this page does — a stroke, a preview opening, a depth change, a reframe. It
+   * does NOT survive a reload, and that is deliberate rather than unfinished:
+   * every other way of persisting it (localStorage read at render) hands the
+   * server and the first client render different answers, and this program has
+   * been careful about exactly that — see `coarseOnServer` and `motionOnServer`,
+   * which lie on the server precisely because the alternative is a hydration
+   * mismatch. A strip that starts open on every load is the honest default; it
+   * is where the owner asked for it to be.
+   */
+  const [timelineOpen, setTimelineOpen] = useState(true);
+  /**
+   * NOTHING IS ANNOUNCED HERE, and that is a decision rather than an omission.
+   *
+   * Almost every control on this page pushes a sentence into the live region,
+   * and this one was written that way first — "timeline hidden; the playhead and
+   * any in and out points are kept". It was removed because it is said twice:
+   * the seam is a real `<button>` with `aria-expanded`, so a screen reader
+   * announces the state change on the press by itself, and the button's own name
+   * is `timeline.seamSaid`, which CHANGES on the press and names the playhead and
+   * the cut. Focus is on that button at the moment it is pressed, so the
+   * reassurance is delivered exactly where the hand is. A live-region sentence
+   * on top of that is the same fact a third time.
+   */
+  const toggleTimeline = useCallback(
+    () => setTimelineOpen(!timelineOpen),
+    [timelineOpen]
+  );
+
+  /**
    * What reverting to the previewed state would cost, computed against the LIVE
    * journal so the number in the button is the number the button will do.
    *
@@ -6191,22 +6262,6 @@ export default function DrawPage() {
             session={session}
             book={book}
             frozen={previewing}
-            /* The playhead rides IN this panel, on the owner's own reading of
-               the Flash arrangement: a time ruler over the track stack, with the
-               vertical list underneath it exactly as it was. `LayersPanel`'s
-               header argues the placement and says what a filmstrip would add
-               later; nothing here draws one. */
-            timeline={{
-              steps: playFresh ? playSteps : null,
-              at: playAt,
-              span: playSpan,
-              acts: steps,
-              onOpen: standPlayhead,
-              onSeek: seekPlayhead,
-              onMarkIn: () => setMark("in"),
-              onMarkOut: () => setMark("out"),
-              onClearMarks: clearMarks,
-            }}
             onSelect={pickLayer}
             onToggleVisible={flipVisible}
             onToggleLocked={flipLocked}
@@ -7781,81 +7836,125 @@ export default function DrawPage() {
               )}
             </div>
 
-            {/* THE BASELINE: what is true of the drawing, and what is true of
-                its symmetry, side by side under the artwork.
+            {/* THE BAND UNDER THE PLATE — the timeline at the top of it, then
+                the two readings.
 
-                The status used to be the top row of the plate rule and the
-                legend the strip under the canvas, and the reviewer's note was
-                simply that they are the same kind of sentence and were being
-                read in two different places. They are one band now — one row on
-                a desktop, two on a phone.
+                WHAT THE OWNER CALLED THE BOTTOM TOOLBAR. Measured rather than
+                assumed: the only band under the canvas is `.baseline`, and it
+                holds no control at all — it is what is true of the DRAWING on
+                the left and what is true of its SYMMETRY on the right, two
+                readings and a hairline. So "toolbar" names where it is rather
+                than what is in it, and the timeline is now the first thing in
+                that band that can be pressed. Everything below it on the page —
+                the key lines, the footnote — is prose about the program rather
+                than furniture of it, so there was no other candidate.
 
-                One ROW is not one LINE, and the difference is measured: at
-                1512 the plate is 766px wide and these two readings come to
-                about 1330px of small caps between them. The legend alone
-                already wrapped to two lines there. So the band is two COLUMNS
-                that each wrap inside their own, divided by a hairline —
-                genuinely beside each other, which is what was asked, without
-                ellipsising a fact to prove it. */}
-            <div className={styles.baseline}>
-              <div className={styles.readout}>
-                <span>
-                  {viewMode === "sector" ? `sector ${sector}` : "hexagon"} · d
-                  {depth} · <b>{total} cells</b>
-                  {viewMode === "sector" && <> of {modelTotal}</>}
-                </span>
-                <span>
-                  brush <b>{mode}-fold</b>
-                  {band !== null && (
-                    <>
-                      {" "}
-                      · band <b>{band}</b>
-                    </>
-                  )}{" "}
-                  ·{" "}
-                  {reach === null ? (
-                    <b>
-                      {dragMode === "propose"
-                        ? "drag to gather"
-                        : "hover to preview"}
-                    </b>
-                  ) : (
-                    <b>reach {reach}</b>
-                  )}
-                </span>
-                <span>
-                  {schemeName} · <b>{paint.size} painted</b>
-                </span>
-              </div>
+                THE TOP OF IT is the seam, not the strip, because the seam is the
+                edge the strip comes out of and the seam is what must not move
+                when it is pressed. `Timeline`'s header argues that and
+                `.timelineSeam` measures it.
 
-              <div className={styles.legend}>
-              {legend.length === 0 ? (
-                <span className={styles.legendItem}>
-                  trivial subgroup · no axis, no rotation
-                </span>
-              ) : (
-                legend.map((l) => (
-                  <span key={l.key} className={styles.legendItem}>
-                    {l.dot ? (
-                      <span
-                        className={styles.legendDot}
-                        style={{ borderColor: l.colour }}
-                        aria-hidden="true"
-                      />
-                    ) : (
-                      <span
-                        className={styles.legendSwatch}
-                        style={{
-                          borderTopColor: l.colour,
-                          borderTopStyle: l.dashed ? "dashed" : "solid",
-                        }}
-                        aria-hidden="true"
-                      />
-                    )}
-                    {l.label}
+                THE READINGS ARE UNTOUCHED but they are not where they were.
+                `.baseline` is the same two columns at the same widths with the
+                same wrapping, and the hairline that used to be its own
+                `border-top` is now drawn by the seam row above it — but that row
+                is 24px where the border was 1px, so MEASURED at 1512 with the
+                strip folded away the readings sit 23px lower than before. That
+                is the price of the seam and it is paid whether the strip is open
+                or shut; `.baseBar` records it. */}
+            <div className={styles.baseBar}>
+              <Timeline
+                view={{
+                  steps: playFresh ? playSteps : null,
+                  at: playAt,
+                  span: playSpan,
+                  acts: steps,
+                  onOpen: standPlayhead,
+                  onSeek: seekPlayhead,
+                  onMarkIn: () => setMark("in"),
+                  onMarkOut: () => setMark("out"),
+                  onClearMarks: clearMarks,
+                }}
+                open={timelineOpen}
+                onToggle={toggleTimeline}
+              />
+
+              {/* THE BASELINE: what is true of the drawing, and what is true of
+                  its symmetry, side by side under the artwork.
+
+                  The status used to be the top row of the plate rule and the
+                  legend the strip under the canvas, and the reviewer's note was
+                  simply that they are the same kind of sentence and were being
+                  read in two different places. They are one band now — one row
+                  on a desktop, two on a phone.
+
+                  One ROW is not one LINE, and the difference is measured: at
+                  1512 the plate is 766px wide and these two readings come to
+                  about 1330px of small caps between them. The legend alone
+                  already wrapped to two lines there. So the band is two COLUMNS
+                  that each wrap inside their own, divided by a hairline —
+                  genuinely beside each other, which is what was asked, without
+                  ellipsising a fact to prove it. */}
+              <div className={styles.baseline}>
+                <div className={styles.readout}>
+                  <span>
+                    {viewMode === "sector" ? `sector ${sector}` : "hexagon"} · d
+                    {depth} · <b>{total} cells</b>
+                    {viewMode === "sector" && <> of {modelTotal}</>}
                   </span>
-                ))
-              )}
+                  <span>
+                    brush <b>{mode}-fold</b>
+                    {band !== null && (
+                      <>
+                        {" "}
+                        · band <b>{band}</b>
+                      </>
+                    )}{" "}
+                    ·{" "}
+                    {reach === null ? (
+                      <b>
+                        {dragMode === "propose"
+                          ? "drag to gather"
+                          : "hover to preview"}
+                      </b>
+                    ) : (
+                      <b>reach {reach}</b>
+                    )}
+                  </span>
+                  <span>
+                    {schemeName} · <b>{paint.size} painted</b>
+                  </span>
+                </div>
+
+                <div className={styles.legend}>
+                {legend.length === 0 ? (
+                  <span className={styles.legendItem}>
+                    trivial subgroup · no axis, no rotation
+                  </span>
+                ) : (
+                  legend.map((l) => (
+                    <span key={l.key} className={styles.legendItem}>
+                      {l.dot ? (
+                        <span
+                          className={styles.legendDot}
+                          style={{ borderColor: l.colour }}
+                          aria-hidden="true"
+                        />
+                      ) : (
+                        <span
+                          className={styles.legendSwatch}
+                          style={{
+                            borderTopColor: l.colour,
+                            borderTopStyle: l.dashed ? "dashed" : "solid",
+                          }}
+                          aria-hidden="true"
+                        />
+                      )}
+                      {l.label}
+                    </span>
+                  ))
+                )}
+                </div>
               </div>
             </div>
           </div>

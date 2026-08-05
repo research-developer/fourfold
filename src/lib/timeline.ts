@@ -9,9 +9,13 @@
  * drags, and the two marks they set from it.
  *
  * Nothing here reconstructs a plate and nothing here writes one. It is a map
- * between two integer spaces plus the arithmetic on the marks, so all of it is
- * reachable from `test/timeline.test.ts` under `environment: "node"` — which is
- * the whole reason it is a module and not four helpers inside `page.tsx`.
+ * between two integer spaces, the arithmetic on the marks, and the two SENTENCES
+ * that report them — `spanSaid` for the strip and `seamSaid` for the seam that
+ * collapses it — so all of it is reachable from `test/timeline.test.ts` under
+ * `environment: "node"`, which is the whole reason it is a module and not four
+ * helpers inside `page.tsx`. The sentences are here for exactly that reason:
+ * `vitest` runs with no DOM, so a string this program says out loud is testable
+ * only if the string is computed somewhere a test can call.
  *
  * ── The two index spaces, and why the program has both ──────────────────
  *
@@ -240,6 +244,67 @@ export function spanSaid(span: InOut | null, steps: number): string {
   const dropped =
     after === 0 ? "" : `, ${after} step${after === 1 ? "" : "s"} not shown`;
   return `in ${at.in}, out ${at.out} — ${beats}${folded}${dropped}`;
+}
+
+/**
+ * What the seam that opens and shuts the strip is called, in words.
+ *
+ * ── Why a shut strip has to say more than an open one ───────────────────
+ *
+ * The timeline is a SLIDEOUT now — it sits at the top of the band under the
+ * plate and a centred seam collapses it — and collapsing it creates a state this
+ * program did not have before: A CUT CAN BE IN FORCE WITH NOTHING ON SCREEN
+ * SAYING SO. The marks are a property of the DRAWING and not of the strip, they
+ * survive the strip being shut (see `Timeline`'s header), and they change what
+ * REPLAY plays and what both animated exports write. A person who set an in
+ * point, collapsed the strip and came back an hour later would otherwise export
+ * a trimmed animation with no visible reason for it.
+ *
+ * So the OPEN name is bare — "hide the timeline", because the strip is right
+ * there and every fact is legible on it — and the SHUT name carries the two
+ * facts the collapse took away: where the playhead stands, and whether there is
+ * a cut. The asymmetry is the point and not an oversight.
+ *
+ * ── What it defers to, rather than deciding again ───────────────────────
+ *
+ * `spanIsWhole` decides whether there IS a cut, for the same reason it decides
+ * it for `spanSaid`: a span equal to the whole replay is what "no marks"
+ * resolves to, and a seam that read `in 0, out n-1` as a cut would describe
+ * every fresh drawing as trimmed. `clampSpan` decides what the numbers ARE, so
+ * the seam reports the span that is in force rather than the one that was asked
+ * for — the same deference, and the same reason, as `markIn`.
+ *
+ * NO COUNT IS THE ORDINARY RESTING STATE and not an error — `steps === null`
+ * while no preview has stood the playhead up, and `steps === 0` on a frame in
+ * which no gesture changed a cell. There is no playhead position to name in
+ * either, but the marks may still be set, so they are still announced, from the
+ * RAW span: this is the one place that reports marks with no count to clamp them
+ * against, and it says only what it knows.
+ */
+export function seamSaid(
+  open: boolean,
+  steps: number | null,
+  at: number | null,
+  span: InOut | null
+): string {
+  if (open) return "hide the timeline";
+  const said: string[] = [];
+  if (steps !== null && steps > 0) {
+    said.push(
+      at === null
+        ? "the playhead is before step 0"
+        : `the playhead is on step ${at} of ${steps - 1}`
+    );
+    const cut = clampSpan(span, steps);
+    if (cut !== null && !spanIsWhole(span, steps)) {
+      said.push(`cut to in ${cut.in}, out ${cut.out}`);
+    }
+  } else if (span !== null) {
+    said.push(`in ${span.in} and out ${span.out} are set`);
+  }
+  return said.length === 0
+    ? "show the timeline"
+    : `show the timeline — ${said.join(", ")}`;
 }
 
 /**

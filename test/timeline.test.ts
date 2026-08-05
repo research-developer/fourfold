@@ -2,7 +2,9 @@
  * THE PLAYHEAD's arithmetic: the map between the journal's index space and the
  * animation's, and the two marks that are set from it.
  *
- * Four claims, and they are the four the strip in the layers panel turns on:
+ * Five claims, and they are the five the strip under the plate turns on — the
+ * fifth arrived with the slideout, which gave the program a state it did not
+ * have before: the strip shut, with a cut still in force:
  *
  *   THE BEAT LIST AGREES WITH THE MODEL. `timeline.beatsOf` restates
  *   `replay.animationSteps`' drop rule — an act that changed no shown cell has
@@ -25,6 +27,18 @@
  *   A DRAWING WITH NOTHING TO PLAY IS `null` THROUGHOUT, not an empty span.
  *   `replay.InOut` cannot express the empty span at all, deliberately, and the
  *   panel has to be able to sit on a drawing that has not been drawn.
+ *
+ *   A CUT CANNOT HIDE BEHIND A COLLAPSED STRIP. The marks belong to the drawing
+ *   rather than to the panel, so shutting the panel leaves them in force with
+ *   nothing on screen saying so — unless the seam says it, which is what
+ *   `seamSaid` is for and what the last block below asserts.
+ *
+ * WHAT IS NOT HERE, and cannot be: anything about the picture. `vitest` runs
+ * under `environment: "node"` with no DOM, so the slideout's markup, its
+ * transition, the direction the chevron points and every collision measured on
+ * screen are outside this file by construction. They are argued where they are
+ * drawn — `page.tsx` and `draw.module.css` — and the report that accompanied
+ * them carries the measurements.
  */
 
 import { describe, expect, it } from "vitest";
@@ -51,6 +65,7 @@ import {
   markIn,
   markOut,
   railPercent,
+  seamSaid,
   spanCovers,
   spanIsWhole,
   spanSaid,
@@ -313,6 +328,86 @@ describe("what the strip says", () => {
     const span = markOut({ in: 3, out: 5 }, 1, 6);
     expect(spanSaid(span, 6)).toContain("in 3, out 3");
     expect(spanSaid(span, 6)).toContain("1 step");
+  });
+});
+
+/**
+ * THE SEAM, which is the only part of this strip that can be pressed while the
+ * strip itself is not on screen.
+ *
+ * The one claim worth a test here is not "the sentence reads well" — it is that
+ * A CUT IN FORCE CANNOT BECOME INVISIBLE. The marks belong to the drawing and
+ * not to the panel, so they survive the panel being collapsed, and they decide
+ * what REPLAY plays and what both animated exports write. The seam's name is the
+ * only thing left saying so once the strip is shut, which makes these assertions
+ * the difference between a slideout and a trapdoor.
+ *
+ * The ARROW is not tested and cannot be: which way the chevron points is a path
+ * in an SVG inside a React component, `vitest` runs under `environment: "node"`
+ * with no DOM, and a test that asserted `open ? "up" : "down"` against a
+ * function whose whole body is `open ? "up" : "down"` would prove nothing about
+ * the picture on screen. The convention is stated where the chevron is drawn.
+ */
+describe("what the seam says", () => {
+  it("says only what the press will do while the strip is open", () => {
+    // Open, with a cut in force and the playhead somewhere in the middle: none
+    // of that belongs on the seam, because all of it is legible one line below.
+    expect(seamSaid(true, 8, 3, { in: 2, out: 4 })).toBe("hide the timeline");
+    expect(seamSaid(true, null, null, null)).toBe("hide the timeline");
+  });
+
+  it("carries the playhead's position once the strip is shut", () => {
+    expect(seamSaid(false, 8, 3, null)).toBe(
+      "show the timeline — the playhead is on step 3 of 7"
+    );
+    // The GROUND is a rail position and not a step, so it is named rather than
+    // numbered — the same distinction `stepAtAct` returns `null` for.
+    expect(seamSaid(false, 8, null, null)).toBe(
+      "show the timeline — the playhead is before step 0"
+    );
+  });
+
+  it("announces a CUT that the collapse has taken off the screen", () => {
+    expect(seamSaid(false, 8, 3, { in: 2, out: 4 })).toBe(
+      "show the timeline — the playhead is on step 3 of 7, cut to in 2, out 4"
+    );
+  });
+
+  it("does not call an uncut drawing cut", () => {
+    // `spanIsWhole`'s own reason for existing: a span equal to the whole replay
+    // is what "no marks" resolves to, so a seam that reported it would describe
+    // every fresh drawing as trimmed.
+    expect(seamSaid(false, 6, 0, { in: 0, out: 5 })).toBe(
+      "show the timeline — the playhead is on step 0 of 5"
+    );
+    expect(seamSaid(false, 6, 0, null)).toBe(
+      "show the timeline — the playhead is on step 0 of 5"
+    );
+  });
+
+  it("reports the span that is IN FORCE, not the one that was asked for", () => {
+    // Out dragged before in: `clampSpan` collapses it to the single step at in,
+    // and the seam says so — the same deference `spanSaid` and `markIn` make.
+    const span = markOut({ in: 3, out: 5 }, 1, 6);
+    expect(seamSaid(false, 6, 3, span)).toContain("cut to in 3, out 3");
+    // A mark past the end of a shorter frame is clamped to the end, not printed.
+    expect(seamSaid(false, 4, 0, { in: 0, out: 40 })).toBe(
+      "show the timeline — the playhead is on step 0 of 3"
+    );
+  });
+
+  it("still names the marks when there is no count to clamp them against", () => {
+    // No preview has stood the playhead up, so there are no beats — and the
+    // marks are STILL set, because they are the drawing's and not the strip's.
+    expect(seamSaid(false, null, null, { in: 2, out: 4 })).toBe(
+      "show the timeline — in 2 and out 4 are set"
+    );
+    // A frame in which no gesture changed a cell: same case, same sentence.
+    expect(seamSaid(false, 0, null, { in: 2, out: 4 })).toBe(
+      "show the timeline — in 2 and out 4 are set"
+    );
+    expect(seamSaid(false, null, null, null)).toBe("show the timeline");
+    expect(seamSaid(false, 0, null, null)).toBe("show the timeline");
   });
 });
 

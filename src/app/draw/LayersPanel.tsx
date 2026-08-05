@@ -11,7 +11,13 @@ import {
 import { layerCells, panelRows, type PanelRow } from "@/lib/composer";
 import type { AddressBook } from "@/lib/plate";
 import type { InOut } from "@/lib/replay";
-import { railPercent, spanCovers, spanIsWhole, spanSaid } from "@/lib/timeline";
+import {
+  railPercent,
+  seamSaid,
+  spanCovers,
+  spanIsWhole,
+  spanSaid,
+} from "@/lib/timeline";
 import styles from "./draw.module.css";
 
 /**
@@ -63,29 +69,24 @@ import styles from "./draw.module.css";
  * testing for null here, so the panel and the model cannot disagree about when
  * a control is live.
  *
- * ── THE PLAYHEAD sits ABOVE the list, and the list is unchanged ─────────
+ * ── THE PLAYHEAD IS NO LONGER IN THIS PANEL ─────────────────────────────
  *
- * The owner asked for "the standard Flash/video editing style timeline+layers
- * style … just a playhead … Layers will just be a vertical list as it is now,
- * but with the playhead included". So the strip is a TIME RULER over the track
- * stack, which is where a ruler goes in every editor that has one, and not a
- * fourth column bolted onto rows that are 26px tall in a rail that is under
- * 300px wide. Not one row of the list below it moved.
+ * It was, for one pass: a time ruler at the top of this section, over the track
+ * stack, on the owner's own reading of the Flash arrangement. The owner then
+ * asked for it "in the top of the bottom toolbar", so it rides in the band under
+ * the plate now, as a slideout with a centred seam. `page.tsx` mounts it there
+ * and `Timeline`'s own header below carries the argument and the measurements.
  *
- * WHAT IT IS MEASURED IN. Reveal STEPS — `replay.AnimationStep[]` indices, the
- * same space `emit.EmitLayer.reveal` and `replay.InOut` are in, and NOT the
- * journal's act index. `lib/timeline.ts` holds the map and its header argues why
- * the two spaces exist; the short version is that a gesture which changed
- * nothing visible in this frame is not a beat, so act k and step k drift apart,
- * and differently per frame.
+ * Not one row of this list moved when it left, exactly as not one row moved when
+ * it arrived: the strip was always furniture ABOVE the list rather than a fourth
+ * column inside rows that are 26px tall, which is what made both moves cheap.
  *
- * THE FILMSTRIP IS DEFERRED — deliberately, and this shape is what makes it a
- * later addition rather than a rebuild. The rail is one horizontal axis with a
- * `--tl-in`/`--tl-out`/`--tl-at` coordinate system already on it; a filmstrip is
- * the same axis repeated once per row, so it arrives as a track element inside
- * `Row` reading the same three custom properties, with the ruler above it
- * already correct. Nothing here draws a frame cell, and nothing should until it
- * is asked for.
+ * WHY THE CODE IS STILL IN THIS FILE — the honest answer, and not a design. This
+ * pass was given a five-file lane and a new component file was not in it, so
+ * `Timeline` stayed where it was written and became a named export, which is why
+ * `page.tsx` imports it from a module called `LayersPanel`. It shares this
+ * file's 24-unit glyph family and nothing else with the panel. The right home is
+ * a `Timeline.tsx` of its own and getting it there is a move, not a rewrite.
  */
 
 /**
@@ -158,15 +159,48 @@ const STEP_BACK = "M14 5l-7 7 7 7";
 const STEP_ON = "M10 5l7 7-7 7";
 
 /**
- * What the panel needs to draw a playhead, and the five things it can ask for.
+ * The seam's two arrows, and the ONE rule that says which is drawn.
+ *
+ * THE CHEVRON POINTS THE WAY THE PANEL WILL TRAVEL, not the way it currently
+ * lies. The seam is the top edge of the slideout and the panel hangs BELOW it,
+ * so:
+ *
+ *   SHUT  → the press drops the panel out from under the seam → chevron DOWN.
+ *   OPEN  → the press retracts it back up into the seam       → chevron UP.
+ *
+ * The alternative convention — the arrow describing where the panel is — was
+ * rejected for a specific reason rather than on taste: on a control whose whole
+ * job is to move something, an arrow reads as an instruction, and a shut panel
+ * marked with an UP arrow ("the panel is up there, out of sight") is a button
+ * that appears to promise the opposite of what it does. `aria-expanded` carries
+ * the STATE, which is what a state belongs on; the picture carries the ACTION.
+ *
+ * Deliberately shallow — a 5-of-24 rise across 14 of the grid's units, so the
+ * mark is under 3px tall at the 14px this family renders at. A full-height
+ * chevron in an 18px tab reads as a button with an icon in it; this reads as a
+ * crease in a rule, which is the whole of what a seam is meant to look like.
+ */
+const CHEVRON_DOWN = "M5 10l7 5 7-5";
+const CHEVRON_UP = "M5 14l7-5 7 5";
+
+/**
+ * What the strip needs to draw a playhead, and the five things it can ask for.
  *
  * `steps === null` IS THE ORDINARY RESTING STATE and not an error: counting the
  * beats means flattening the whole journal, which is measured at ~205 ms for a
  * depth-5 plate with 256 acts, and paying that on every stroke to keep a rail
  * warm would be a hitch on every press of the brush. So the count is taken ONCE
- * when a preview opens, and the strip sits closed — marks still legible, still
- * clearable — until it is. `page.tsx` carries the argument in full at
+ * when a preview opens, and the strip sits UNCOUNTED — marks still legible,
+ * still clearable — until it is. `page.tsx` carries the argument in full at
  * `openRewind`.
+ *
+ * UNCOUNTED IS NOT COLLAPSED, and the slideout made the difference worth
+ * spelling out. `steps === null` is a fact about the DRAWING — nobody has asked
+ * for a beat count — and it is what the PLAYHEAD button in the strip acts on.
+ * `open` is a fact about the FURNITURE — whether the strip is on screen — and
+ * only the seam touches it. Neither drives the other: a preview opening does not
+ * force a collapsed strip open, because a person who folded it away asked for
+ * that and a control that unfolds itself is a control that is fighting them.
  */
 export interface TimelineView {
   /** How many reveal steps this frame has, or `null` while they are uncounted. */
@@ -195,8 +229,6 @@ export interface LayersPanelProps {
   book: AddressBook;
   /** A preview is standing: every write is off, and the reason is said above. */
   frozen: boolean;
-  /** The playhead over the animation's reveal steps. See `TimelineView`. */
-  timeline: TimelineView;
   onSelect: (id: LayerId | null) => void;
   onToggleVisible: (id: LayerId) => void;
   onToggleLocked: (id: LayerId) => void;
@@ -219,7 +251,6 @@ export default function LayersPanel({
   session,
   book,
   frozen,
-  timeline,
   onSelect,
   onToggleVisible,
   onToggleLocked,
@@ -260,8 +291,6 @@ export default function LayersPanel({
           {rows.length} sheet{rows.length === 1 ? "" : "s"}
         </span>
       </div>
-
-      <Timeline view={timeline} />
 
       <ol className={styles.layerList} aria-label="layers, topmost first">
         {rows.map((row) => (
@@ -448,15 +477,47 @@ export default function LayersPanel({
 }
 
 /**
- * THE PLAYHEAD, and the two marks that are set from it.
+ * The id the seam's `aria-controls` names. One strip on the page, so a constant
+ * rather than a `useId`: the value has to be written into two attributes on two
+ * elements and a generated one would be one more thing to thread.
+ */
+const PANEL_ID = "timeline-panel";
+
+/**
+ * THE PLAYHEAD, and the two marks that are set from it — a slideout at the top
+ * of the band under the plate.
+ *
+ * ── Where it sits, and what the move cost ───────────────────────────────
+ *
+ * The owner asked for it "in the top of the bottom toolbar". The band under the
+ * artwork is `.baseline` — measured, that band is a pair of READINGS (what is
+ * true of the drawing, what is true of its symmetry) and carries no control at
+ * all, so "toolbar" is the owner's word for where it is rather than for what is
+ * in it. It is nonetheless the only band there is under the canvas, so this is
+ * the top of it, and this strip is now the first thing in that band that can be
+ * pressed. See `.baseBar` in the stylesheet.
+ *
+ * WHAT THE RAIL GAINED, measured in a browser on the built page rather than
+ * estimated: the plate is 766px wide at 1512 and 344px at 390, and the track
+ * inside this strip comes out at 692px and 250px. In the right-hand rail, where
+ * the panel was 240–290px wide, the same arithmetic gives 166–216px. That is the
+ * one thing the move plainly improves: at the 256-gesture history limit a beat
+ * is 2.7px of track at 1512 where it was under a pixel, so the playhead can now
+ * be dropped on a chosen beat with a mouse on a desktop.
+ *
+ * WHAT IT COST. The rail gave this strip a column that was always on screen and
+ * always the same width; the band under the plate is shared with two readings
+ * that wrap, and on a phone it is below the fold on a tall drawing. That is what
+ * the seam is for, and it is why the seam and not the strip is what stays put.
  *
  * ── Why the marks are SET FROM the playhead and not dragged ─────────────
  *
  * `replay.InOut` is two indices into the beat list, and the obvious control for
- * two indices on a track is two draggable handles. MEASURED, that is not a
- * control here: the rail column this panel sits in is 240–290px wide, so at the
- * 256-gesture history limit one beat is under a pixel of track and a handle
- * cannot be put on a chosen one at all. It is not much better at 40 beats.
+ * two indices on a track is two draggable handles. MEASURED, that is still not a
+ * control here even at the new width: 692px of rail over 257 stops is 2.7px a
+ * beat at 1512, and 250px over 257 stops is 0.97px at 390 — under a finger by
+ * more than an order of magnitude. Two handles would be two things nobody can
+ * put on a chosen beat rather than one.
  *
  * So the playhead is the only thing that moves, and it is an `<input
  * type="range">` — which means Left/Right step it by exactly one beat, Home and
@@ -471,7 +532,7 @@ export default function LayersPanel({
  * focus, the second to plate depth. Neither is worth taking for this, so the
  * marks are buttons, reached by Tab from the rail they act on.
  *
- * ── Why the strip is CLOSED until a preview opens ───────────────────────
+ * ── Why the strip is UNCOUNTED until a preview opens ────────────────────
  *
  * Counting the beats means flattening every state of the journal, measured at
  * ~205 ms for a depth-5 plate with 256 acts, and the result cannot be cached
@@ -482,11 +543,49 @@ export default function LayersPanel({
  * preview stands, so the journal cannot move under it. `page.tsx` carries the
  * argument at `openRewind`.
  *
- * The marks survive the strip being closed, because they are a property of the
- * drawing rather than of the preview, and they are still legible and still
- * clearable while it is.
+ * The marks survive both the count being absent AND the strip being collapsed,
+ * because they are a property of the DRAWING rather than of the preview or of
+ * the furniture. That is exactly why the seam has to announce them — see
+ * `timeline.seamSaid`, which is the one part of this control that is testable
+ * with no DOM and is tested.
+ *
+ * ── THE SEAM, and why it is above the panel rather than below it ────────
+ *
+ * TWO REASONS, both about the hand. The seam is the edge the panel comes out
+ * of, so a chevron on it points at where the panel will go, which is the whole
+ * of the convention (see `CHEVRON_DOWN`). And it does not move when it is
+ * pressed: everything that changes height is BELOW it, so the second press of a
+ * double toggle lands where the first one did. A seam under the panel would
+ * travel the panel's own height on every press, which on a control this thin is
+ * the difference between hitting it and hitting the readout under it.
+ *
+ * LOW PROFILE AGAINST A REAL TARGET — the one design constraint the owner
+ * named, and it is resolved by separating the PAINT from the BOX. The painted
+ * tab is 56 × 18px at every width, which is a crease in the band's own hairline
+ * rather than a button bar; the `<button>` around it is transparent and its
+ * padding is what makes the target, so it is 84 × 24px on a mouse and 96 × 44px
+ * on a coarse pointer. Nothing overflows the button's own box, which is why this
+ * needs none of the `pointer-events` defences `.canvasZoom` carries: it is in
+ * normal flow under the canvas and cannot reach it. `.timelineSeam` measures it.
+ *
+ * ── THE FILMSTRIP IS STILL DEFERRED ─────────────────────────────────────
+ *
+ * And the move made it cheaper rather than more expensive: a filmstrip is this
+ * axis repeated once per row, reading the same `--tl-in`/`--tl-out`/`--tl-at`
+ * properties, and a band under the plate has three times the width to repeat it
+ * across. Nothing here draws a frame cell, and nothing should until it is asked
+ * for.
  */
-function Timeline({ view }: { view: TimelineView }) {
+export function Timeline({
+  view,
+  open,
+  onToggle,
+}: {
+  view: TimelineView;
+  /** Is the strip on screen? Furniture, and nothing else reads it. */
+  open: boolean;
+  onToggle: () => void;
+}) {
   const { steps, at, span, acts } = view;
   const live = steps !== null && steps > 0;
   // `at` is a beat; the rail also has the GROUND at its left end, which is the
@@ -515,166 +614,215 @@ function Timeline({ view }: { view: TimelineView }) {
   const bandTo = railPercent(span?.out ?? (steps ?? 1) - 1, steps ?? 0);
 
   return (
-    <div
-      className={styles.timeline}
-      data-live={live ? "on" : undefined}
-      style={
-        {
-          "--tl-at": `${railPercent(pos, steps ?? 0)}%`,
-          "--tl-in": `${bandFrom}%`,
-          "--tl-out": `${bandTo}%`,
-        } as React.CSSProperties
-      }
-    >
-      <div className={styles.timelineHead}>
-        <span className={styles.timelineKey}>timeline</span>
-        <span className={styles.timelineNow}>
-          {live ? (
-            at === null ? (
-              "before step 0"
-            ) : (
-              <>
-                step <b>{at}</b> / {steps - 1}
-              </>
-            )
-          ) : steps === 0 ? (
-            "no step in this frame"
-          ) : (
-            `${acts} gesture${acts === 1 ? "" : "s"}`
-          )}
-        </span>
+    <>
+      {/* THE SEAM. A hairline across the band with a chevron tab crimped into
+          the middle of it — the band's own top rule, drawn by this row's two
+          pseudo-elements, so the slideout adds a control without adding a line.
+          The tab is 56 × 18 of paint inside an 84 × 24 button (96 × 44 on a
+          coarse pointer); `.timelineSeam` carries the numbers and the reason.
+
+          The ROW is not the button. A full-width strip that toggles on any
+          press would be the button bar this was asked not to be, and it would
+          swallow a press meant for the readout below it — so the hairlines are
+          inert pseudo-elements and only the centred tab acts. */}
+      <div className={styles.timelineSeam}>
+        <button
+          type="button"
+          className={styles.seamBtn}
+          aria-expanded={open}
+          aria-controls={PANEL_ID}
+          onClick={onToggle}
+          title={open ? "hide the timeline" : "show the timeline"}
+          // The full sentence, and it is NOT the title: while the strip is shut
+          // this name is the only thing that says a cut is in force, and a cut
+          // silently changes what REPLAY plays and what both animated exports
+          // write. `timeline.seamSaid` builds it and `test/timeline.test.ts`
+          // holds it to that.
+          aria-label={seamSaid(open, steps, at, span)}
+        >
+          <span className={styles.seamTab} aria-hidden="true">
+            {/* The chevron points where the panel WILL GO, not where it is.
+                See `CHEVRON_DOWN` for why that is the convention and what
+                `aria-expanded` is left to say instead. */}
+            <Glyph d={open ? CHEVRON_UP : CHEVRON_DOWN} />
+          </span>
+        </button>
       </div>
 
-      <div className={styles.timelineRow}>
-        {live ? (
-          <>
-            <button
-              type="button"
-              className={styles.timelineBtn}
-              onClick={() => view.onSeek(pos - 1)}
-              disabled={pos <= -1}
-              title="one step back"
-              aria-label="move the playhead one step back"
-            >
-              <Glyph d={STEP_BACK} />
-            </button>
-
-            {/* The rail. A real range input, so the whole keyboard works on it
-                without a handler; the marks and the band between them are drawn
-                UNDER it from `--tl-in`/`--tl-out` and take no pointer events, so
-                the only thing on this track that can be grabbed is the thumb. */}
-            <span className={styles.timelineRail}>
-              <span className={styles.timelineBand} aria-hidden="true" />
-              {cut && (
-                <>
-                  <span className={styles.timelineMarkIn} aria-hidden="true" />
-                  <span className={styles.timelineMarkOut} aria-hidden="true" />
-                </>
+      {/* The slide. Height and visibility only — the strip inside it is exactly
+          the strip that was in the rail, unchanged. `visibility` is what takes
+          the rail, the marks and the PLAYHEAD button out of the Tab order while
+          it is shut; `max-height` alone would leave four focusable controls in a
+          zero-height box, which is a keyboard trap that scrolls a clipped
+          container. `.timelineSlide` carries the timing and the reduced-motion
+          exemption. */}
+      <div
+        id={PANEL_ID}
+        className={styles.timelineSlide}
+        data-open={open ? "on" : "off"}
+      >
+        <div
+          className={styles.timeline}
+          data-live={live ? "on" : undefined}
+          style={
+            {
+              "--tl-at": `${railPercent(pos, steps ?? 0)}%`,
+              "--tl-in": `${bandFrom}%`,
+              "--tl-out": `${bandTo}%`,
+            } as React.CSSProperties
+          }
+        >
+          <div className={styles.timelineHead}>
+            <span className={styles.timelineKey}>timeline</span>
+            <span className={styles.timelineNow}>
+              {live ? (
+                at === null ? (
+                  "before step 0"
+                ) : (
+                  <>
+                    step <b>{at}</b> / {steps - 1}
+                  </>
+                )
+              ) : steps === 0 ? (
+                "no step in this frame"
+              ) : (
+                `${acts} gesture${acts === 1 ? "" : "s"}`
               )}
-              <input
-                type="range"
-                className={styles.timelineScrub}
-                min={-1}
-                max={steps - 1}
-                step={1}
-                value={pos}
-                onChange={(e) => view.onSeek(Number(e.target.value))}
-                aria-label="playhead — the animation step the plate is showing"
-                aria-valuetext={
-                  at === null
-                    ? `before step 0 — the plate the replay opens on, ${steps} step${
-                        steps === 1 ? "" : "s"
-                      } to come`
-                    : `step ${at} of ${steps - 1}${
-                        // GATED ON `cut`, not on `spanCovers` alone. With no
-                        // marks set `span` is null and `spanCovers` is false for
-                        // every step — correctly, since a null span covers
-                        // nothing — so an ungated test announced every beat of
-                        // an uncut drawing as "outside the in and out points".
-                        // There are no in and out points to be outside of until
-                        // there is a cut.
-                        !cut || spanCovers(span, at)
-                          ? ""
-                          : " — outside the in and out points"
-                      }`
-                }
-              />
             </span>
+          </div>
 
+          <div className={styles.timelineRow}>
+            {live ? (
+              <>
+                <button
+                  type="button"
+                  className={styles.timelineBtn}
+                  onClick={() => view.onSeek(pos - 1)}
+                  disabled={pos <= -1}
+                  title="one step back"
+                  aria-label="move the playhead one step back"
+                >
+                  <Glyph d={STEP_BACK} />
+                </button>
+
+                {/* The rail. A real range input, so the whole keyboard works on it
+                    without a handler; the marks and the band between them are drawn
+                    UNDER it from `--tl-in`/`--tl-out` and take no pointer events, so
+                    the only thing on this track that can be grabbed is the thumb. */}
+                <span className={styles.timelineRail}>
+                  <span className={styles.timelineBand} aria-hidden="true" />
+                  {cut && (
+                    <>
+                      <span className={styles.timelineMarkIn} aria-hidden="true" />
+                      <span className={styles.timelineMarkOut} aria-hidden="true" />
+                    </>
+                  )}
+                  <input
+                    type="range"
+                    className={styles.timelineScrub}
+                    min={-1}
+                    max={steps - 1}
+                    step={1}
+                    value={pos}
+                    onChange={(e) => view.onSeek(Number(e.target.value))}
+                    aria-label="playhead — the animation step the plate is showing"
+                    aria-valuetext={
+                      at === null
+                        ? `before step 0 — the plate the replay opens on, ${steps} step${
+                            steps === 1 ? "" : "s"
+                          } to come`
+                        : `step ${at} of ${steps - 1}${
+                            // GATED ON `cut`, not on `spanCovers` alone. With no
+                            // marks set `span` is null and `spanCovers` is false for
+                            // every step — correctly, since a null span covers
+                            // nothing — so an ungated test announced every beat of
+                            // an uncut drawing as "outside the in and out points".
+                            // There are no in and out points to be outside of until
+                            // there is a cut.
+                            !cut || spanCovers(span, at)
+                              ? ""
+                              : " — outside the in and out points"
+                          }`
+                    }
+                  />
+                </span>
+
+                <button
+                  type="button"
+                  className={styles.timelineBtn}
+                  onClick={() => view.onSeek(pos + 1)}
+                  disabled={pos >= steps - 1}
+                  title="one step on"
+                  aria-label="move the playhead one step on"
+                >
+                  <Glyph d={STEP_ON} />
+                </button>
+              </>
+            ) : (
+              <button
+                type="button"
+                className={styles.timelineOpen}
+                onClick={view.onOpen}
+                disabled={acts === 0}
+                title={
+                  acts === 0
+                    ? "nothing to play — no gesture has been committed yet"
+                    : "stand the playhead up — counts this frame's steps and opens the preview"
+                }
+                aria-label={
+                  acts === 0
+                    ? "no playhead — no gesture has been committed yet"
+                    : `open the timeline — count this frame's animation steps over ${acts} committed gesture${
+                        acts === 1 ? "" : "s"
+                      } and stand the playhead up as a preview`
+                }
+              >
+                playhead
+              </button>
+            )}
+          </div>
+
+          {/* THE MARKS. Beside the rail rather than on it, for the reason in the
+              header: at this width a mark cannot be dragged onto a chosen beat, so
+              it is set where the playhead already stands. */}
+          <div className={styles.timelineMarks} role="group" aria-label="in and out points">
             <button
               type="button"
               className={styles.timelineBtn}
-              onClick={() => view.onSeek(pos + 1)}
-              disabled={pos >= steps - 1}
-              title="one step on"
-              aria-label="move the playhead one step on"
+              onClick={view.onMarkIn}
+              disabled={!live || at === null}
+              title="in point here — everything before it is already on the plate"
+              aria-label="set the in point at the playhead; every earlier step is folded into the first frame"
             >
-              <Glyph d={STEP_ON} />
+              <Glyph d={MARK_IN} />
             </button>
-          </>
-        ) : (
-          <button
-            type="button"
-            className={styles.timelineOpen}
-            onClick={view.onOpen}
-            disabled={acts === 0}
-            title={
-              acts === 0
-                ? "nothing to play — no gesture has been committed yet"
-                : "stand the playhead up — counts this frame's steps and opens the preview"
-            }
-            aria-label={
-              acts === 0
-                ? "no playhead — no gesture has been committed yet"
-                : `open the timeline — count this frame's animation steps over ${acts} committed gesture${
-                    acts === 1 ? "" : "s"
-                  } and stand the playhead up as a preview`
-            }
-          >
-            playhead
-          </button>
-        )}
+            <button
+              type="button"
+              className={styles.timelineBtn}
+              onClick={view.onMarkOut}
+              disabled={!live || at === null}
+              title="out point here — nothing after it is shown"
+              aria-label="set the out point at the playhead; no later step is shown at all"
+            >
+              <Glyph d={MARK_OUT} />
+            </button>
+            <button
+              type="button"
+              className={styles.timelineBtn}
+              onClick={view.onClearMarks}
+              disabled={span === null}
+              title="clear the cut — play the whole drawing again"
+              aria-label="clear the in and out points; the replay plays the whole drawing again"
+            >
+              <Glyph d={CUT_OFF} />
+            </button>
+            <span className={styles.timelineSaid} data-cut={cut ? "on" : undefined}>
+              {said ?? (span === null ? "whole" : `in ${span.in}, out ${span.out}`)}
+            </span>
+          </div>
+        </div>
       </div>
-
-      {/* THE MARKS. Beside the rail rather than on it, for the reason in the
-          header: at this width a mark cannot be dragged onto a chosen beat, so
-          it is set where the playhead already stands. */}
-      <div className={styles.timelineMarks} role="group" aria-label="in and out points">
-        <button
-          type="button"
-          className={styles.timelineBtn}
-          onClick={view.onMarkIn}
-          disabled={!live || at === null}
-          title="in point here — everything before it is already on the plate"
-          aria-label="set the in point at the playhead; every earlier step is folded into the first frame"
-        >
-          <Glyph d={MARK_IN} />
-        </button>
-        <button
-          type="button"
-          className={styles.timelineBtn}
-          onClick={view.onMarkOut}
-          disabled={!live || at === null}
-          title="out point here — nothing after it is shown"
-          aria-label="set the out point at the playhead; no later step is shown at all"
-        >
-          <Glyph d={MARK_OUT} />
-        </button>
-        <button
-          type="button"
-          className={styles.timelineBtn}
-          onClick={view.onClearMarks}
-          disabled={span === null}
-          title="clear the cut — play the whole drawing again"
-          aria-label="clear the in and out points; the replay plays the whole drawing again"
-        >
-          <Glyph d={CUT_OFF} />
-        </button>
-        <span className={styles.timelineSaid} data-cut={cut ? "on" : undefined}>
-          {said ?? (span === null ? "whole" : `in ${span.in}, out ${span.out}`)}
-        </span>
-      </div>
-    </div>
+    </>
   );
 }
 

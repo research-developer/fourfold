@@ -258,280 +258,6 @@
   color: var(--bone-faint);
 }
 
-/* ---------- the timeline: a playhead over the layers ---------- */
-
-/**
- * THE TIME RULER, above the track stack.
- *
- * The owner asked for "the standard Flash/video editing style timeline+layers
- * style … just a playhead", with the layers kept as the vertical list they
- * already are. So this is a ruler over the list and not a column beside it:
- * three rows of furniture, 62px, above a list that did not move by a pixel.
- *
- * VIOLET, because it is the preview's colour. `.rewindBar` argues the hue in
- * full — violet is already ROTATION on this canvas, the console's word for a
- * symmetry acting over time, and it has never once meant "this is live". A
- * playhead that moved the plate in the drawing's own accent would be the one
- * control on the page whose colour claimed it was editing.
- *
- * ── The rail's coordinate system, which the filmstrip will inherit ──────
- *
- * `--tl-at`, `--tl-in` and `--tl-out` are percentages along ONE axis, all three
- * from `timeline.railPercent`, so the thumb and the marks it sets cannot land in
- * different places. The axis has one more stop than the drawing has beats: its
- * left end is the animation's GROUND — the plate the replay opens on — and its
- * right end is the last step. `timeline.GROUND` argues that.
- *
- * A FILMSTRIP IS DEFERRED and would need no new geometry: it is this axis
- * repeated once per row, reading the same three properties, under a ruler that
- * is already correct. Nothing here draws a frame cell.
- */
-.timeline {
-  --tl-accent: #a78bfa;
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  margin-bottom: 8px;
-  padding: 6px 8px 7px;
-  border: 1px solid var(--rule);
-  border-radius: 2px;
-  background: var(--plate-2);
-}
-
-.timeline[data-live="on"] {
-  border-color: color-mix(in srgb, var(--tl-accent) 42%, var(--rule));
-}
-
-.timelineHead {
-  display: flex;
-  align-items: baseline;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.timelineKey {
-  font-size: 8.5px;
-  letter-spacing: 0.22em;
-  text-transform: uppercase;
-  color: var(--bone-faint);
-}
-
-.timelineNow {
-  font-size: 9.5px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: var(--bone-faint);
-  font-variant-numeric: tabular-nums;
-}
-
-.timelineNow b {
-  color: var(--tl-accent);
-  font-weight: 500;
-}
-
-.timelineRow {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  min-height: 22px;
-}
-
-.timelineRail {
-  position: relative;
-  display: flex;
-  align-items: center;
-  flex: 1 1 auto;
-  min-width: 0;
-  height: 22px;
-}
-
-/**
- * The part that PLAYS, drawn under the thumb.
- *
- * A band and not two ticks, because the question a person actually has of a cut
- * is "how much of it is left", and a filled region answers that at a glance
- * where two hairlines make them subtract. Inert: this and the two marks are
- * `pointer-events: none`, so the only grabbable thing on the track is the range
- * input's own thumb — a decoration that could eat a drag would make the rail
- * unusable at exactly the widths this panel has.
- */
-.timelineBand {
-  position: absolute;
-  left: var(--tl-in, 0%);
-  right: calc(100% - var(--tl-out, 100%));
-  top: 50%;
-  height: 9px;
-  transform: translateY(-50%);
-  border-radius: 1px;
-  background: color-mix(in srgb, var(--tl-accent) 22%, transparent);
-  pointer-events: none;
-}
-
-.timelineMarkIn,
-.timelineMarkOut {
-  position: absolute;
-  top: 50%;
-  width: 2px;
-  height: 15px;
-  transform: translateY(-50%);
-  background: var(--tl-accent);
-  pointer-events: none;
-}
-
-.timelineMarkIn {
-  left: var(--tl-in, 0%);
-}
-
-.timelineMarkOut {
-  left: var(--tl-out, 100%);
-  margin-left: -2px;
-}
-
-/**
- * The playhead itself: the same range input the rewind scrub is, in the same
- * 3px bone bar, so the two controls on this page that move through the drawing's
- * past are recognisably one instrument.
- *
- * TRANSPARENT TRACK, unlike `.scrub`'s filled one. The band under it is already
- * saying which part plays, and a second fill would be two statements about one
- * axis in two colours.
- */
-.timelineScrub {
-  position: relative;
-  width: 100%;
-  height: 22px;
-  margin: 0;
-  appearance: none;
-  background: transparent;
-  cursor: ew-resize;
-  touch-action: none;
-}
-
-.timelineScrub::-webkit-slider-runnable-track {
-  height: 3px;
-  border-radius: 2px;
-  background: var(--rule-bright);
-}
-
-.timelineScrub::-moz-range-track {
-  height: 3px;
-  border-radius: 2px;
-  background: var(--rule-bright);
-}
-
-.timelineScrub::-webkit-slider-thumb {
-  appearance: none;
-  width: 3px;
-  height: 17px;
-  margin-top: -7px;
-  border: 0;
-  border-radius: 2px;
-  background: var(--bone);
-  box-shadow: 0 0 0 1px rgba(10, 9, 8, 0.85), 0 0 10px rgba(0, 0, 0, 0.6);
-}
-
-.timelineScrub::-moz-range-thumb {
-  width: 3px;
-  height: 17px;
-  border: 0;
-  border-radius: 2px;
-  background: var(--bone);
-  box-shadow: 0 0 0 1px rgba(10, 9, 8, 0.85), 0 0 10px rgba(0, 0, 0, 0.6);
-}
-
-.timelineScrub:focus-visible {
-  outline: 2px solid var(--lime);
-  outline-offset: 2px;
-  border-radius: 2px;
-}
-
-/* The same 26px the panel's own row buttons are, so the strip and the list
-   under it are one piece of furniture rather than two sizes of control. */
-.timelineBtn {
-  flex: none;
-  width: 24px;
-  height: 22px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  padding: 0;
-  border: 1px solid var(--rule-bright);
-  border-radius: 2px;
-  background: transparent;
-  color: var(--bone-dim);
-}
-
-.timelineBtn:hover:not(:disabled) {
-  color: var(--bone);
-  border-color: var(--bone-faint);
-}
-
-/* Dimmed AND refused, on the panel's own rule: a control that cannot act
-   carries the real attribute, so it leaves the Tab order too. */
-.timelineBtn:disabled {
-  opacity: 0.35;
-}
-
-.timelineOpen {
-  flex: 1 1 auto;
-  height: 22px;
-  border: 1px solid var(--rule-bright);
-  border-radius: 2px;
-  background: transparent;
-  color: var(--bone-dim);
-  font-size: 8.5px;
-  letter-spacing: 0.22em;
-  text-transform: uppercase;
-}
-
-.timelineOpen:hover:not(:disabled) {
-  color: var(--bone);
-  border-color: var(--tl-accent);
-}
-
-.timelineOpen:disabled {
-  opacity: 0.4;
-}
-
-.timelineMarks {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-/* The sentence the marks produced. It is the LAST thing in the strip and it is
-   allowed to shrink, because the buttons beside it must not: a readout that
-   pushes a control off the rail is a readout that broke the control. */
-.timelineSaid {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  text-align: right;
-  font-size: 8.5px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  color: var(--bone-faint);
-  font-variant-numeric: tabular-nums;
-}
-
-.timelineSaid[data-cut="on"] {
-  color: var(--tl-accent);
-}
-
-/* A thumb wants a target. The rail keeps its height — a 22px track is already
-   the full width of the panel — and everything beside it grows. */
-@media (max-width: 700px) {
-  .timelineBtn,
-  .timelineOpen {
-    height: 34px;
-  }
-  .timelineBtn {
-    width: 34px;
-  }
-}
-
 /* ---------- the layers panel ---------- */
 
 /**
@@ -3459,6 +3185,486 @@
   pointer-events: none;
 }
 
+/* ---------- the timeline: a slideout at the top of the bottom band ------- */
+
+/**
+ * THE BOTTOM BAND: the timeline's seam, the timeline, and the two readings.
+ *
+ * THIS RULE IS THE MOVE. The strip used to be a time ruler at the top of the
+ * layers panel, in the right-hand rail; the owner asked for it "in the top of
+ * the bottom toolbar", so the band under the plate gained a wrapper and the
+ * strip went into it above `.baseline`.
+ *
+ * WHAT WAS FOUND ON THE WAY, and it is worth stating plainly because the brief
+ * for the move assumed otherwise: `.baseline` IS NOT A TOOLBAR. It is two
+ * READINGS — what is true of the drawing, what is true of its symmetry — and it
+ * has never carried a control. It is nonetheless the only band under the canvas,
+ * so it is what was meant, and this strip is the first pressable thing in it.
+ *
+ * WHERE THE 10px WENT. `.baseline` used to own the `margin-top` that separated
+ * it from the canvas and the `border-top` that ruled it off. Both moved here —
+ * the margin to this wrapper, the rule to `.timelineSeam`'s hairlines — so the
+ * band still opens with 10px of air and a hairline, in that order, drawn in the
+ * same colour at the same weight.
+ *
+ * WHAT IT IS NOT is pixel-identical, and the first draft of this note claimed it
+ * was. MEASURED at 1512 with the strip folded away: the readings sit 23px lower
+ * than they did before this change, because the seam ROW is 24px where the
+ * border it replaced was 1px. That is the whole of the cost and it is paid once,
+ * whether the strip is open or shut. Nothing else about the readings moved —
+ * same two columns, same widths (469 and 277 of 766), same wrapping.
+ */
+.baseBar {
+  margin-top: 10px;
+}
+
+/**
+ * THE SEAM: the band's own top rule, with a chevron tab crimped into the middle.
+ *
+ * ── LOW PROFILE against a REAL TARGET, which is the whole brief ─────────
+ *
+ * "Low profile but easy enough to tap" is two requirements that pull opposite
+ * ways, and they are separated here into PAINT and BOX:
+ *
+ *   THE PAINT never changes size. `.seamTab` is 56 × 18px at every width and
+ *   every pointer type — a crease in a hairline, which is what a seam is meant
+ *   to look like. At the 14px this file's glyph family renders at, the chevron's
+ *   5-of-24 rise is 2.9px of ink. 18px is 8 under a `.layerBtn` and 4 under a
+ *   `.crumb`, which was the shortest control on the page until this one.
+ *
+ *   THE BOX is the `<button>` around it, and it is transparent. Its padding is
+ *   what makes the target: 3px 14px on a mouse gives 84 × 24px, and 13px 20px on
+ *   a coarse pointer gives 96 × 44px. Both measured in a browser. So a thumb gets
+ *   the 44px the brief asked for while the drawing on screen is 18px tall either
+ *   way, and the tab does not move when the box grows — it is centred in it.
+ *
+ * MEASURED, AND WHAT THE MEASUREMENT SETTLED. The obvious alternative — keep the
+ * box at 24px and expand the hit area with an absolutely positioned pseudo-
+ * element — was worked through and REJECTED. To reach 44px it needs ±10px of
+ * overflow, and the gap between this row and `.canvasHold` is EXACTLY 10px,
+ * measured at 1512 and at 390 alike. So the expanded box would finish flush
+ * against the artwork's bottom edge with nothing in hand: any later change to
+ * that margin, or a 44 that becomes a 48, puts an invisible lid over the bottom
+ * strip of the drawing surface — the exact hazard `.canvasZoom`'s note spends
+ * three paragraphs on. Padding costs 20px of page height on a coarse pointer
+ * (measured) and costs nothing else; a lid over the canvas costs a stroke.
+ *
+ * BECAUSE NOTHING OVERFLOWS, none of the three canvas hazards apply here. This
+ * row is a SIBLING of `.canvasHold` in normal flow, below it, and its target is
+ * exactly its own box — it cannot reach the artwork, so it needs no
+ * `pointer-events` dance, no `:has(.canvas:active)` retreat and no inert
+ * disabled state. It is also never disabled: there is always something to fold.
+ *
+ * CHECKED RATHER THAN ASSUMED, at 1512 × 982 and at 390 × 844, with the button
+ * at both 24px and 44px: the gap from the button's top to `.canvasHold`'s bottom
+ * is 10px and to `.canvasZoom`'s bottom is 15px, at every one of those four
+ * combinations — the cluster sits at `bottom: 5px` inside the hold, so it is
+ * always 5px further away than the artwork's edge. `.canvasHud` and
+ * `.candidateBar` are at the TOP of the hold, `.crumbs` is above it in flow, and
+ * `.emptyHint` sits at `max(8%, 44px)` off the hold's bottom — 54px above this
+ * row's top at 390, where the floor binds, and 64px at 1512, where the
+ * percentage does. Nothing here overlaps anything.
+ *
+ * ── The row is not the button ───────────────────────────────────────────
+ *
+ * The hairlines are this row's two pseudo-elements and take no press. A
+ * full-width strip that toggled on any press would be the button bar the owner
+ * asked this not to be, and it would swallow presses meant for the readings
+ * below. Only the centred tab acts.
+ */
+.timelineSeam {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* The rule `.baseline` used to draw for itself, in two halves with the tab
+   between them. Same colour, same weight, same place. */
+.timelineSeam::before,
+.timelineSeam::after {
+  content: "";
+  flex: 1 1 auto;
+  height: 1px;
+  background: var(--rule);
+}
+
+.seamBtn {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 3px 14px;
+  border: 0;
+  background: none;
+  color: var(--bone-faint);
+  cursor: pointer;
+}
+
+/* The paint. Its size is fixed on purpose — see the note above: the target grows
+   and this does not. */
+.seamTab {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 18px;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  background: var(--plate-2);
+}
+
+.seamBtn:hover .seamTab {
+  border-color: var(--bone-faint);
+}
+
+.seamBtn:hover {
+  color: var(--bone);
+}
+
+.seamBtn:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: 1px;
+  border-radius: 2px;
+}
+
+/**
+ * THE SLIDE — height and visibility, and nothing else.
+ *
+ * `max-height` AND `visibility`, and the second is not decoration. A strip
+ * clipped to zero height still holds four focusable controls — the rail, both
+ * marks, the clear — and a browser that Tab-focuses one of them scrolls a
+ * clipped container to reach it, which is a control the hand cannot see moving a
+ * playhead it cannot find. `visibility: hidden` takes the whole subtree out of
+ * the Tab order and out of the accessibility tree; it is DELAYED on the way out,
+ * by exactly the collapse's own duration, so the strip is still drawn while it
+ * is folding, and it is instant on the way in, because the base rule below does
+ * not mention `visibility` at all.
+ *
+ * `max-height` AND NOT `height: auto`, which is not animatable, and not
+ * `grid-template-rows: 0fr → 1fr`, which is — but only in browsers new enough
+ * that a fallback would be needed anyway. THE CAP IS 240px AGAINST A STRIP
+ * MEASURED IN A BROWSER at 83.3px on a 766px desktop plate and 107.3px on a
+ * 344px plate at 390 — the widest the rows ever wrap. A cap that is too generous
+ * only makes the first frames of the collapse look slow; a cap that is too tight
+ * would clip the marks off the bottom of the strip and leave them clipped. So it
+ * is set at better than twice the worst measurement and the easing carries the
+ * difference.
+ */
+.timelineSlide {
+  overflow: hidden;
+  max-height: 240px;
+  opacity: 1;
+  transition: max-height 190ms cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 120ms linear;
+}
+
+.timelineSlide[data-open="off"] {
+  max-height: 0;
+  opacity: 0;
+  visibility: hidden;
+  transition: max-height 190ms cubic-bezier(0.4, 0, 1, 1),
+    opacity 100ms linear, visibility 0s linear 190ms;
+}
+
+/**
+ * THE STRIP itself, unchanged from the rail but for where its margin is.
+ *
+ * VIOLET, because it is the preview's colour. `.rewindBar` argues the hue in
+ * full — violet is already ROTATION on this canvas, the console's word for a
+ * symmetry acting over time, and it has never once meant "this is live". A
+ * playhead that moved the plate in the drawing's own accent would be the one
+ * control on the page whose colour claimed it was editing.
+ *
+ * ── The rail's coordinate system, which the filmstrip will inherit ──────
+ *
+ * `--tl-at`, `--tl-in` and `--tl-out` are percentages along ONE axis, all three
+ * from `timeline.railPercent`, so the thumb and the marks it sets cannot land in
+ * different places. The axis has one more stop than the drawing has beats: its
+ * left end is the animation's GROUND — the plate the replay opens on — and its
+ * right end is the last step. `timeline.GROUND` argues that.
+ *
+ * A FILMSTRIP IS DEFERRED and would need no new geometry: it is this axis
+ * repeated once per row, reading the same three properties, under a ruler that
+ * is already correct — and the move gave it three times the width to repeat
+ * across. Nothing here draws a frame cell.
+ *
+ * The margin is now on TOP, not the bottom: in the rail this sat above a list
+ * and needed clearing below; here it hangs from a seam and needs clearing above.
+ * It is inside the clipped wrapper, so a folded strip costs none of it.
+ */
+.timeline {
+  --tl-accent: #a78bfa;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 7px;
+  padding: 6px 8px 7px;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  background: var(--plate-2);
+}
+
+.timeline[data-live="on"] {
+  border-color: color-mix(in srgb, var(--tl-accent) 42%, var(--rule));
+}
+
+.timelineHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.timelineKey {
+  font-size: 8.5px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+}
+
+.timelineNow {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.timelineNow b {
+  color: var(--tl-accent);
+  font-weight: 500;
+}
+
+.timelineRow {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 22px;
+}
+
+.timelineRail {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 22px;
+}
+
+/**
+ * The part that PLAYS, drawn under the thumb.
+ *
+ * A band and not two ticks, because the question a person actually has of a cut
+ * is "how much of it is left", and a filled region answers that at a glance
+ * where two hairlines make them subtract. Inert: this and the two marks are
+ * `pointer-events: none`, so the only grabbable thing on the track is the range
+ * input's own thumb — a decoration that could eat a drag would make the rail
+ * unusable at exactly the widths this panel has.
+ */
+.timelineBand {
+  position: absolute;
+  left: var(--tl-in, 0%);
+  right: calc(100% - var(--tl-out, 100%));
+  top: 50%;
+  height: 9px;
+  transform: translateY(-50%);
+  border-radius: 1px;
+  background: color-mix(in srgb, var(--tl-accent) 22%, transparent);
+  pointer-events: none;
+}
+
+.timelineMarkIn,
+.timelineMarkOut {
+  position: absolute;
+  top: 50%;
+  width: 2px;
+  height: 15px;
+  transform: translateY(-50%);
+  background: var(--tl-accent);
+  pointer-events: none;
+}
+
+.timelineMarkIn {
+  left: var(--tl-in, 0%);
+}
+
+.timelineMarkOut {
+  left: var(--tl-out, 100%);
+  margin-left: -2px;
+}
+
+/**
+ * The playhead itself: the same range input the rewind scrub is, in the same
+ * 3px bone bar, so the two controls on this page that move through the drawing's
+ * past are recognisably one instrument.
+ *
+ * TRANSPARENT TRACK, unlike `.scrub`'s filled one. The band under it is already
+ * saying which part plays, and a second fill would be two statements about one
+ * axis in two colours.
+ */
+.timelineScrub {
+  position: relative;
+  width: 100%;
+  height: 22px;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.timelineScrub::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--rule-bright);
+}
+
+.timelineScrub::-moz-range-track {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--rule-bright);
+}
+
+.timelineScrub::-webkit-slider-thumb {
+  appearance: none;
+  width: 3px;
+  height: 17px;
+  margin-top: -7px;
+  border: 0;
+  border-radius: 2px;
+  background: var(--bone);
+  box-shadow: 0 0 0 1px rgba(10, 9, 8, 0.85), 0 0 10px rgba(0, 0, 0, 0.6);
+}
+
+.timelineScrub::-moz-range-thumb {
+  width: 3px;
+  height: 17px;
+  border: 0;
+  border-radius: 2px;
+  background: var(--bone);
+  box-shadow: 0 0 0 1px rgba(10, 9, 8, 0.85), 0 0 10px rgba(0, 0, 0, 0.6);
+}
+
+.timelineScrub:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* The same 26px the panel's own row buttons are, so the strip and the list
+   under it are one piece of furniture rather than two sizes of control. */
+.timelineBtn {
+  flex: none;
+  width: 24px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--rule-bright);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--bone-dim);
+}
+
+.timelineBtn:hover:not(:disabled) {
+  color: var(--bone);
+  border-color: var(--bone-faint);
+}
+
+/* Dimmed AND refused, on the panel's own rule: a control that cannot act
+   carries the real attribute, so it leaves the Tab order too. */
+.timelineBtn:disabled {
+  opacity: 0.35;
+}
+
+.timelineOpen {
+  flex: 1 1 auto;
+  height: 22px;
+  border: 1px solid var(--rule-bright);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--bone-dim);
+  font-size: 8.5px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+}
+
+.timelineOpen:hover:not(:disabled) {
+  color: var(--bone);
+  border-color: var(--tl-accent);
+}
+
+.timelineOpen:disabled {
+  opacity: 0.4;
+}
+
+.timelineMarks {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* The sentence the marks produced. It is the LAST thing in the strip and it is
+   allowed to shrink, because the buttons beside it must not: a readout that
+   pushes a control off the rail is a readout that broke the control. */
+.timelineSaid {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  font-size: 8.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.timelineSaid[data-cut="on"] {
+  color: var(--tl-accent);
+}
+
+/* A thumb wants a target. The rail keeps its height — a 22px track already runs
+   the full width of the band — and everything beside it grows. */
+@media (max-width: 700px) {
+  .timelineBtn,
+  .timelineOpen {
+    height: 34px;
+  }
+  .timelineBtn {
+    width: 34px;
+  }
+}
+
+/**
+ * THE SEAM'S TARGET, and it is keyed on the POINTER rather than on the width.
+ *
+ * A deliberate departure from the two rules above it, which grow at 700px. The
+ * seam is the one control here that has to be findable by a thumb on a device
+ * that is not narrow — a tablet is 1024px wide and coarse — and it is the one
+ * whose paint is small enough that missing it is likely. Width is a proxy for
+ * the hand; `(pointer: coarse)` is the hand. `.layerBtn` already sizes this way,
+ * so the file has both dialects and this is the one that means what it says.
+ *
+ * 13 + 18 + 13 = 44px, which is what the brief asked for. WORTH RECORDING: 44px
+ * is NOT this file's usual touch size — `.hudBtn` grows to 38, `.layerBtn` and
+ * `.timelineBtn` to 34, and 44 appears once before this, as the FLOOR under
+ * `.emptyHint`'s offset, which is a clearance and not a target. This control is
+ * given the larger number because its paint is the smallest on the page and
+ * because the owner named the constraint.
+ *
+ * IT COSTS 20px OF PAGE HEIGHT on a coarse pointer — the box goes from 24px to
+ * 44 — and nothing else. It is paid in the band under the plate, where the only
+ * thing below is prose; the canvas is above and does not move.
+ */
+@media (pointer: coarse) {
+  .seamBtn {
+    padding: 13px 20px;
+  }
+}
+
 /* ---------- the baseline: status and legend, under the artwork ---------- */
 
 /**
@@ -3479,14 +3685,22 @@
  * COLUMNS, divided by a hairline, each wrapping inside its own width — the two
  * texts genuinely beside each other, which is what was asked for, rather than
  * one line bought by ellipsising a fact or by shrinking the type past reading.
+ *
+ * ITS MARGIN AND ITS RULE ARE NOW SOMEBODY ELSE'S — see `.baseBar`. The 10px
+ * that held this band off the canvas is on the wrapper, and the hairline that
+ * ruled it off is drawn by `.timelineSeam`'s two pseudo-elements, in the same
+ * colour at the same weight. Only the `padding-top` stayed, because that is the
+ * gap between the rule and the text, and the rule may now have a whole timeline
+ * between it and this band.
+ *
+ * MEASURED, the readings ended up 23px lower than before the seam existed — a
+ * 24px row where there had been a 1px border. `.baseBar` carries the number.
  */
 .baseline {
   display: flex;
   align-items: flex-start;
   gap: 8px 20px;
   padding-top: 10px;
-  margin-top: 10px;
-  border-top: 1px solid var(--rule);
 }
 
 /**
@@ -3702,6 +3916,28 @@
   .presetBtn,
   .schemeRule,
   .driftCell {
+    transition: none;
+  }
+
+  /**
+   * THE SLIDEOUT ARRIVES AND LEAVES AT ONCE.
+   *
+   * Its end states — the strip on screen, or not — are the whole of what it has
+   * to say, exactly as `.dimFade`'s are, so arriving there instantly loses
+   * nothing. The travel is the largest single movement this page makes on a
+   * press and it is under the reader's eye, which is the case the preference
+   * exists for.
+   *
+   * WRITTEN OUT RATHER THAN ADDED TO THE LIST ABOVE, because dropping the
+   * transition on `.timelineSlide[data-open="off"]` would drop the DELAY on
+   * `visibility` with it — and that delay is not decoration, it is what keeps
+   * the strip drawn while it folds. With no transition at all there is nothing
+   * to keep it drawn FOR, so hiding it on the same tick is not just acceptable
+   * here, it is the correct end state; stating it explicitly is what makes that
+   * a decision rather than a side effect of a shorthand.
+   */
+  .timelineSlide,
+  .timelineSlide[data-open="off"] {
     transition: none;
   }
 }
