@@ -258,6 +258,280 @@
   color: var(--bone-faint);
 }
 
+/* ---------- the timeline: a playhead over the layers ---------- */
+
+/**
+ * THE TIME RULER, above the track stack.
+ *
+ * The owner asked for "the standard Flash/video editing style timeline+layers
+ * style … just a playhead", with the layers kept as the vertical list they
+ * already are. So this is a ruler over the list and not a column beside it:
+ * three rows of furniture, 62px, above a list that did not move by a pixel.
+ *
+ * VIOLET, because it is the preview's colour. `.rewindBar` argues the hue in
+ * full — violet is already ROTATION on this canvas, the console's word for a
+ * symmetry acting over time, and it has never once meant "this is live". A
+ * playhead that moved the plate in the drawing's own accent would be the one
+ * control on the page whose colour claimed it was editing.
+ *
+ * ── The rail's coordinate system, which the filmstrip will inherit ──────
+ *
+ * `--tl-at`, `--tl-in` and `--tl-out` are percentages along ONE axis, all three
+ * from `timeline.railPercent`, so the thumb and the marks it sets cannot land in
+ * different places. The axis has one more stop than the drawing has beats: its
+ * left end is the animation's GROUND — the plate the replay opens on — and its
+ * right end is the last step. `timeline.GROUND` argues that.
+ *
+ * A FILMSTRIP IS DEFERRED and would need no new geometry: it is this axis
+ * repeated once per row, reading the same three properties, under a ruler that
+ * is already correct. Nothing here draws a frame cell.
+ */
+.timeline {
+  --tl-accent: #a78bfa;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 8px;
+  padding: 6px 8px 7px;
+  border: 1px solid var(--rule);
+  border-radius: 2px;
+  background: var(--plate-2);
+}
+
+.timeline[data-live="on"] {
+  border-color: color-mix(in srgb, var(--tl-accent) 42%, var(--rule));
+}
+
+.timelineHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.timelineKey {
+  font-size: 8.5px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+}
+
+.timelineNow {
+  font-size: 9.5px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.timelineNow b {
+  color: var(--tl-accent);
+  font-weight: 500;
+}
+
+.timelineRow {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 22px;
+}
+
+.timelineRail {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 22px;
+}
+
+/**
+ * The part that PLAYS, drawn under the thumb.
+ *
+ * A band and not two ticks, because the question a person actually has of a cut
+ * is "how much of it is left", and a filled region answers that at a glance
+ * where two hairlines make them subtract. Inert: this and the two marks are
+ * `pointer-events: none`, so the only grabbable thing on the track is the range
+ * input's own thumb — a decoration that could eat a drag would make the rail
+ * unusable at exactly the widths this panel has.
+ */
+.timelineBand {
+  position: absolute;
+  left: var(--tl-in, 0%);
+  right: calc(100% - var(--tl-out, 100%));
+  top: 50%;
+  height: 9px;
+  transform: translateY(-50%);
+  border-radius: 1px;
+  background: color-mix(in srgb, var(--tl-accent) 22%, transparent);
+  pointer-events: none;
+}
+
+.timelineMarkIn,
+.timelineMarkOut {
+  position: absolute;
+  top: 50%;
+  width: 2px;
+  height: 15px;
+  transform: translateY(-50%);
+  background: var(--tl-accent);
+  pointer-events: none;
+}
+
+.timelineMarkIn {
+  left: var(--tl-in, 0%);
+}
+
+.timelineMarkOut {
+  left: var(--tl-out, 100%);
+  margin-left: -2px;
+}
+
+/**
+ * The playhead itself: the same range input the rewind scrub is, in the same
+ * 3px bone bar, so the two controls on this page that move through the drawing's
+ * past are recognisably one instrument.
+ *
+ * TRANSPARENT TRACK, unlike `.scrub`'s filled one. The band under it is already
+ * saying which part plays, and a second fill would be two statements about one
+ * axis in two colours.
+ */
+.timelineScrub {
+  position: relative;
+  width: 100%;
+  height: 22px;
+  margin: 0;
+  appearance: none;
+  background: transparent;
+  cursor: ew-resize;
+  touch-action: none;
+}
+
+.timelineScrub::-webkit-slider-runnable-track {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--rule-bright);
+}
+
+.timelineScrub::-moz-range-track {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--rule-bright);
+}
+
+.timelineScrub::-webkit-slider-thumb {
+  appearance: none;
+  width: 3px;
+  height: 17px;
+  margin-top: -7px;
+  border: 0;
+  border-radius: 2px;
+  background: var(--bone);
+  box-shadow: 0 0 0 1px rgba(10, 9, 8, 0.85), 0 0 10px rgba(0, 0, 0, 0.6);
+}
+
+.timelineScrub::-moz-range-thumb {
+  width: 3px;
+  height: 17px;
+  border: 0;
+  border-radius: 2px;
+  background: var(--bone);
+  box-shadow: 0 0 0 1px rgba(10, 9, 8, 0.85), 0 0 10px rgba(0, 0, 0, 0.6);
+}
+
+.timelineScrub:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* The same 26px the panel's own row buttons are, so the strip and the list
+   under it are one piece of furniture rather than two sizes of control. */
+.timelineBtn {
+  flex: none;
+  width: 24px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--rule-bright);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--bone-dim);
+}
+
+.timelineBtn:hover:not(:disabled) {
+  color: var(--bone);
+  border-color: var(--bone-faint);
+}
+
+/* Dimmed AND refused, on the panel's own rule: a control that cannot act
+   carries the real attribute, so it leaves the Tab order too. */
+.timelineBtn:disabled {
+  opacity: 0.35;
+}
+
+.timelineOpen {
+  flex: 1 1 auto;
+  height: 22px;
+  border: 1px solid var(--rule-bright);
+  border-radius: 2px;
+  background: transparent;
+  color: var(--bone-dim);
+  font-size: 8.5px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+}
+
+.timelineOpen:hover:not(:disabled) {
+  color: var(--bone);
+  border-color: var(--tl-accent);
+}
+
+.timelineOpen:disabled {
+  opacity: 0.4;
+}
+
+.timelineMarks {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* The sentence the marks produced. It is the LAST thing in the strip and it is
+   allowed to shrink, because the buttons beside it must not: a readout that
+   pushes a control off the rail is a readout that broke the control. */
+.timelineSaid {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  font-size: 8.5px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--bone-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+.timelineSaid[data-cut="on"] {
+  color: var(--tl-accent);
+}
+
+/* A thumb wants a target. The rail keeps its height — a 22px track is already
+   the full width of the panel — and everything beside it grows. */
+@media (max-width: 700px) {
+  .timelineBtn,
+  .timelineOpen {
+    height: 34px;
+  }
+  .timelineBtn {
+    width: 34px;
+  }
+}
+
 /* ---------- the layers panel ---------- */
 
 /**
@@ -2013,27 +2287,35 @@
 /* ---------- zoom ---------- */
 
 /**
- * ZOOM, in the status line and LABELLED.
+ * ZOOM: `−  1×  +`, ON THE CANVAS.
  *
- * It shipped as `−  1×  +` in the action strip with no label, no glyph and no
- * tooltip, and a reviewer read it as "I don't know what these do" — which was
- * the honest reading, because nothing on screen said. The fix is the word. It
- * wears the same micro-key the bench groups wear, so the function is legible
- * standing still, at a glance, with no pointer anywhere near it.
+ * ── Where it has been ───────────────────────────────────────────────────
  *
- * And it moved. Zoom does not touch the drawing: it is a fact about the frame
- * you are looking at, which is what every other item on the status line is,
- * while the strip it used to sit in is the things that CHANGE — save, load,
- * wipe. One row of that misfiling was `1×` sitting between `history` and `svg`.
+ * It shipped in the action strip beside save, load and the button that wipes
+ * the plate, with no label, no glyph and no tooltip, and a reviewer read it as
+ * "I don't know what these do" — the honest reading, because nothing on screen
+ * said. It gained a `zoom` micro-key and moved to the seam of the deck, between
+ * the controls that say what the hand is holding and the ones that say what has
+ * been done, on the argument that zoom changes the WINDOW and not the drawing.
+ *
+ * ── Where it is ─────────────────────────────────────────────────────────
+ *
+ * The same argument, followed one step further, and this time by the owner: a
+ * fact about the window belongs ON the window. It is at the canvas's bottom-left
+ * corner now — see `.canvasZoom`, which owns the placement, the legibility and
+ * the three `pointer-events` defences that putting a button on a drawing surface
+ * requires.
+ *
+ * The `zoom` KEY did not come with it, and that is not a relapse into the
+ * unlabelled form. A group key is the deck's device for a run of glyph buttons
+ * with no words on them; these three are `−`, `1×` and `+`, which is a label
+ * apiece, and they now sit at the corner of the thing they scale rather than in
+ * a row of unrelated tools. The tooltips and the accessible names say the rest,
+ * and each one names its key — `(−)`, `(0)`, `(+)`.
+ *
+ * What is left below is the STEPPER itself, which is unchanged: it was never the
+ * part that was mispositioned.
  */
-.zoomGroup {
-  display: grid;
-  grid-template-rows: var(--deck-row) var(--deck-row);
-  gap: 3px;
-  align-items: center;
-  justify-items: start;
-}
-
 .zoomStepper {
   display: inline-flex;
   border: 1px solid var(--rule-bright);
@@ -2437,10 +2719,16 @@
  * over shape, replay over history, save over load, help over new — and that is
  * what makes the band 63px tall (`2r + 3`) at every width. Flattened, each of
  * them lays its two cells side by side and the band is 46px: ONE control row of
- * 30px, with the group keys lifted onto a caption line above it, exactly as
- * `.zoomGroup` has always drawn its own. 17px of canvas back, and every group
- * still labelled — no glyph in this deck is ever unlabelled, which is the rule
- * that made the icons legal in the first place.
+ * 30px, with the group keys lifted onto a caption line above it, exactly as the
+ * zoom group used to draw its own. 17px of canvas back, and every group still
+ * labelled — no glyph in this deck is ever unlabelled, which is the rule that
+ * made the icons legal in the first place.
+ *
+ * THE WIDTHS BELOW ARE NOW A CEILING. They were measured with the zoom group in
+ * the deck, and zoom has since left it for the canvas, so the deck needs LESS
+ * than every figure in the table. Nothing was re-measured and nothing was
+ * loosened on the strength of it: a threshold that is now comfortable is not a
+ * reason to move a threshold.
  *
  * ── WHAT WAS MEASURED, and where the brief was wrong ────────────────────
  *
@@ -2537,11 +2825,10 @@
     gap: 3px 7px;
   }
 
-  /* ZOOM already reads key-over-control; it only has to stop reserving a whole
-     control row for the caption. */
-  .zoomGroup {
-    grid-template-rows: auto var(--deck-row);
-  }
+  /* ZOOM used to need a rule here — it already read key-over-control and only
+     had to stop reserving a whole control row for its caption. It has left the
+     deck for the canvas (see `.canvasZoom`), so the deck is one group shorter
+     and the measurements above are now a ceiling rather than a fit. */
 
   .deckMemory,
   .deckFile,
@@ -2820,6 +3107,96 @@
   }
 }
 
+/**
+ * ZOOM, ON THE ARTWORK, at the bottom left — asked for, and the opposite corner
+ * to the HUD.
+ *
+ * WHY IT IS THE SAME PROBLEM AGAIN. Three buttons on a drawing surface is three
+ * chances to swallow a stroke, and the HUD's note above lists the three defences
+ * that stop it. Every one of them applies here, and one of them applies HARDER:
+ *
+ *  1. THE ROW IS INERT. `pointer-events: none` here, taken back only by the
+ *     BUTTONS — not by `.zoomStepper`, which is a bordered box with a background
+ *     and would otherwise make its own 1px rule and its two internal seams into
+ *     live targets. So the cluster's footprint is exactly the three button
+ *     rectangles and every pixel of chrome around them belongs to the plate.
+ *
+ *  2. WHILE A PRESS IS LIVE ON THE CANVAS THE BUTTONS DROP OUT TOO. `:active`
+ *     stays on the element the press landed on until it is released, so a stroke
+ *     that begins anywhere on the plate turns the cluster inert for the duration
+ *     and drags straight through it. This is not a nicety: `DrawBoard` releases
+ *     pointer capture on press — it has to, because it reads the cell off
+ *     `event.target` — so without this a drag across the zoom row would stop
+ *     firing moves and skip every cell underneath.
+ *
+ *  3. AND DISABLED MEANS INERT, which matters more here than it did at the top
+ *     left. Chrome dispatches NOTHING for a press that lands on a disabled
+ *     control — not even to its ancestors — so a disabled button is a hole in
+ *     the drawing surface that swallows a stroke and gives nothing back. Undo
+ *     and redo are disabled only on a drawing nobody has touched; `−` and the
+ *     `1×` reset are disabled AT ZOOM 1, which is the state every drawing starts
+ *     in and spends most of its life in. Two thirds of this cluster would have
+ *     been dead pixels on the default canvas.
+ *
+ * WHAT IT DOES NOT COLLIDE WITH, checked rather than assumed. `.baseline` is a
+ * SIBLING of `.canvasHold` in normal flow, so an absolutely positioned child of
+ * the hold cannot reach it. `.crumbs` is also in normal flow and ABOVE the hold.
+ * `.candidateBar` is at the top right and `.canvasHud` at the top left. The two
+ * things that DO live near this corner are `.emptyHint` and `.dropNote`, which
+ * are centred at `8%` from the bottom — clear of a 30px cluster on a desktop
+ * plate and NOT clear of a 38px one on a short phone canvas, so their offset is
+ * floored at 44px. See the note there.
+ *
+ * The canvas is CENTRED in the hold and may be narrower than it, in which case
+ * this sits in the gutter rather than on the artwork. That is exactly what
+ * `.canvasHud` has always done at the other corner; one convention, not two.
+ */
+.canvasZoom {
+  position: absolute;
+  bottom: 5px;
+  left: 5px;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  pointer-events: none;
+  /* `.zoomStepper`'s own rules are written against the deck's row height and
+     the stepper is no longer in the deck. It gets one of its own, at the 30px
+     the HUD buttons opposite it are — the same button in a different place. */
+  --deck-row: 30px;
+}
+
+/* Legible over whatever has been painted under it, on the HUD's reasoning: the
+   deck's controls could borrow the plate's background and these cannot. */
+.canvasZoom .zoomStepper {
+  background: rgba(10, 9, 8, 0.78);
+  backdrop-filter: blur(2px);
+}
+
+.canvasZoom button {
+  pointer-events: auto;
+}
+
+.canvasHold:has(.canvas:active) .canvasZoom button {
+  pointer-events: none;
+}
+
+.canvasZoom button:hover:not(:disabled) {
+  color: var(--bone);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+/* Hazard 3. The `opacity` is `.zoomStepper`'s own; the refusal is this corner's
+   requirement and is the reason this rule exists at all. */
+.canvasZoom button:disabled {
+  pointer-events: none;
+}
+
+@media (max-width: 700px) {
+  .canvasZoom {
+    --deck-row: 38px;
+  }
+}
+
 /* A destructive or transforming brush must never be a state you can only infer
    from a control you are not looking at. The flag sits ON the artwork, in the
    HUD row beside undo and redo. */
@@ -2974,9 +3351,20 @@
   outline-offset: 3px;
 }
 
+/**
+ * `8%` FLOORED AT 44px, and the floor is the zoom cluster's doing.
+ *
+ * These two notes are centred near the bottom of the plate and the zoom stepper
+ * now sits in that band at the left. Measured: on a desktop plate around 700px
+ * tall, 8% is 56px and clears a 30px cluster at `bottom: 5px` with room to
+ * spare — unchanged, which is the point. On a 300px phone canvas 8% is 24px and
+ * the 38px cluster reaches 43px, so the centred line would have run through it.
+ * 44px is the first offset that clears the tallest cluster at every width, and
+ * it changes nothing at any width where the percentage already did.
+ */
 .emptyHint {
   position: absolute;
-  inset: auto 0 8% 0;
+  inset: auto 0 max(8%, 44px) 0;
   text-align: center;
   font-size: 11px;
   letter-spacing: 0.16em;
@@ -3058,9 +3446,11 @@
   pointer-events: none;
 }
 
+/* The same floor as `.emptyHint`, for the same reason and measured the same
+   way — the two are one line in two states and must not sit at two heights. */
 .dropNote {
   position: absolute;
-  inset: auto 0 8% 0;
+  inset: auto 0 max(8%, 44px) 0;
   text-align: center;
   font-size: 11px;
   letter-spacing: 0.16em;

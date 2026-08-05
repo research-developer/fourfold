@@ -163,8 +163,20 @@ import {
   animationCensus,
   animationSteps,
   animationTiming,
+  boundAnimation,
   type AnimationStep,
+  type InOut,
 } from "@/lib/replay";
+import {
+  actAtStep,
+  beatsOf,
+  GROUND,
+  markIn,
+  markOut,
+  spanSaid,
+  stepAtAct,
+  type Beats,
+} from "@/lib/timeline";
 import { gifSteps } from "@/lib/gif";
 import {
   act as journalAct,
@@ -537,6 +549,26 @@ interface Rewind {
    */
   comp: Composition;
   playing: boolean;
+  /**
+   * The beat list this preview's PLAYHEAD reads — which act produced each
+   * animation step, in the frame that was on screen when the preview opened.
+   *
+   * IT RIDES ON THE PREVIEW rather than beside it, and that is what makes it
+   * safe to hold at all. Counting the beats means flattening every state of the
+   * journal — measured at ~205 ms for a depth-5 plate with 256 acts, and it does
+   * not cache, because `everyComposition` mints fresh compositions on every call
+   * — so it cannot be kept warm across strokes. It does not have to be: the
+   * brush is switched off while a preview stands (`previewing` gates every
+   * write), so the journal this was counted from cannot move underneath it.
+   *
+   * `frame` is the one thing that CAN change while a preview is up — the depth,
+   * the view and the sector are not gated on `previewing` — so it is recorded
+   * and compared rather than trusted. A stale frame closes the playhead rather
+   * than reporting a step count for a picture nobody is looking at; see
+   * `frameKey` and `standPlayhead`.
+   */
+  beats: Beats;
+  frame: string;
 }
 
 /**
@@ -1180,6 +1212,32 @@ export default function DrawPage() {
    * at a dozen call sites.
    */
   const [rewind, setRewind] = useState<Rewind | null>(null);
+  /**
+   * The in point and the out point — which part of the drawing a replay plays.
+   *
+   * `null` IS "NO MARKS", and it is the whole replay. That is `clampSpan`'s own
+   * reading of an absent span — "so a drawing with no marks set behaves exactly
+   * as it did before this existed" — so the resting value here and the resting
+   * value in the model are the same value, and nothing has to translate.
+   *
+   * IN STEP SPACE, not act space: these are indices into `AnimationStep[]`, the
+   * same space `emit.EmitLayer.reveal` and `replay.InOut` are in. See
+   * `lib/timeline.ts` for the map to the journal's own index and why the two
+   * cannot be the same number.
+   *
+   * OUTLIVES THE PREVIEW, deliberately. A cut is a property of the drawing — it
+   * is what the two exports will write — and not of the panel that happens to be
+   * open, so closing the preview leaves it standing and the panel keeps
+   * reporting it. It can therefore be stale after an edit or a frame change, and
+   * that is handled the way the model says to handle it: every reader runs it
+   * through `clampSpan` first, which is exactly what `clampSpan` is for.
+   *
+   * NAMED `playSpan` and not `span`, because this file already has one: the
+   * BAND span, how many orbit positions a striped brush lays. Two things called
+   * `span` in a 7000-line component is how a colour rail comes to be indexed by
+   * an out point.
+   */
+  const [playSpan, setPlaySpan] = useState<InOut | null>(null);
   const [stepMs, setStepMs] = useState(STEP_MS_DEFAULT);
   const [gifWidth, setGifWidth] = useState(GIF_WIDTH_DEFAULT);
   /**
@@ -2956,6 +3014,51 @@ export default function DrawPage() {
   const steps = past.length;
 
   /**
+   * WHICH PICTURE the beats were counted for.
+   *
+   * `animationSteps` drops a gesture that changed nothing IN THIS FRAME, so the
+   * beat list is a fact about the journal AND about what is on screen: the same
+   * drawing framed as sector 3 has fewer beats than the whole hexagon, and a
+   * depth change re-resolves every address. The depth, the view and the sector
+   * are NOT gated on `previewing` — `pickDepth`, `pickView` and `pickSector` all
+   * run while a preview stands — so this is compared rather than assumed.
+   *
+   * The book's own id already carries the kind and the depth; the frame adds
+   * which sector is on screen. `showTiling` is deliberately absent: it decides
+   * the fill an erase is drawn IN, and `changedCells` never looks at it.
+   */
+  const frameKey = `${book.id}|${canvas.view.mode}|${
+    canvas.view.mode === "sector" ? canvas.view.sector : "-"
+  }`;
+
+  /**
+   * The beat list for the frame on screen — one entry per animation step,
+   * holding the act that produced it.
+   *
+   * THE EXPENSIVE CALL IN THIS FILE, and it is deliberately not a `useMemo`.
+   * Measured at depth 5 with 256 acts: `everyComposition` 17 ms, flattening its
+   * 257 states 172 ms, and the walk itself 16 ms — about 205 ms, none of which
+   * caches, because `everyComposition` mints fresh compositions every time and
+   * `layers.flatten`'s memo is keyed on their identity. A `useMemo` on `[comp,
+   * past]` would therefore pay all of it again on every committed stroke, which
+   * is a fifth of a second of hitch on every press of the brush.
+   *
+   * So it is called ONCE, by `standPlayhead`, at the moment a person asks for a
+   * playhead — and the answer is then valid for as long as it is up, because the
+   * brush is off while a preview stands.
+   *
+   * Nothing here is new: these are the first three lines of `animationModel`,
+   * without the baked frame and the polygons, which the playhead does not need.
+   */
+  const frameBeats = useCallback((): number[] => {
+    const shown = canvas.view.mode === "sector" ? canvas.shown : undefined;
+    return beatsOf(
+      everyComposition(comp, past).map((c) => flattenComposition(c, book)),
+      shown
+    );
+  }, [comp, past, canvas, book]);
+
+  /**
    * Open a preview, or move an open one to the other instrument.
    *
    * REPLAY opens at the BEGINNING and starts playing, because that is the whole
@@ -2966,6 +3069,17 @@ export default function DrawPage() {
    * Everything that names a cell of the live plate is dropped on the way in: a
    * standing candidate is a promise about a plate that is no longer on screen,
    * and committing it would paint onto a state nobody is looking at.
+   *
+   * ── The beats are counted HERE, and the cost is on purpose ─────────────
+   *
+   * `frameBeats()` runs on the way in, so the playhead in the layers panel is
+   * live for every way of opening a preview — P, M, the two deck buttons and the
+   * panel's own PLAYHEAD — rather than for one of them. It costs up to ~205 ms
+   * on the largest drawing this program will hold (see `frameBeats`), spent once
+   * on a deliberate press that is about to show an animation, which is the one
+   * place in this file where a fifth of a second is not a hitch. Every
+   * alternative that avoided it made the panel and the preview disagree about
+   * whether there was a playhead.
    */
   const openRewind = useCallback(
     (kind: "replay" | "history") => {
@@ -2985,6 +3099,8 @@ export default function DrawPage() {
         index,
         comp: stepComposition(compRef.current, past, steps, index),
         playing: kind === "replay",
+        beats: frameBeats(),
+        frame: frameKey,
       });
       setAnnounce(
         kind === "replay"
@@ -2992,7 +3108,7 @@ export default function DrawPage() {
           : `history — ${steps} gesture${steps === 1 ? "" : "s"}; drag the scrub to preview an earlier state. Nothing is changed until REVERT`
       );
     },
-    [steps, past, disarm, stepMs]
+    [steps, past, disarm, stepMs, frameBeats, frameKey]
   );
 
   const closeRewind = useCallback((why: string) => {
@@ -3078,6 +3194,126 @@ export default function DrawPage() {
     }, stepMs);
     return () => window.clearTimeout(id);
   }, [rewind, steps, past, stepMs]);
+
+  // ── the playhead ────────────────────────────────────────────────────────
+
+  /**
+   * THE PLAYHEAD IS NOT A SECOND SCRUB. It is the SAME position, read in the
+   * space the animation is actually written in.
+   *
+   * There is one preview in this program and one index in it — `rewind.index`,
+   * a count of committed ACTS — and everything below leaves that as the
+   * authority for what is on the plate. What the panel shows is that same
+   * position mapped through `rewind.beats` into STEP space, and what the two
+   * marks are stored in is step space, because that is the space `replay.InOut`,
+   * `boundAnimation` and `emit.EmitLayer.reveal` all live in.
+   *
+   * Building a second position would have meant two things that can disagree
+   * about what the plate is showing. Building the playhead in ACT space instead
+   * would have been simpler and wrong: `animationSteps` drops a gesture that
+   * changed nothing in this frame, so an act index is not an animation step,
+   * marks made on it would name beats the replay does not have, and they would
+   * name different ones the moment the view changed. `lib/timeline.ts` carries
+   * the argument in full.
+   *
+   * THE OLD SCRUB STAYS, in the rewind bar, in act space. It is not the same
+   * reading and it should not be: it can stand on a rename or a reorder, which
+   * the animation has no beat for, and REVERT counts in exactly those acts.
+   */
+  /**
+   * Is there a beat list, and was it counted for the picture that is on screen?
+   *
+   * Both halves matter. No preview means no beats at all — they are only ever
+   * counted on the way into one. A STALE frame means beats that describe a
+   * different picture, and reporting their count beside a plate they were not
+   * counted from is the one lie this strip could tell, so a frame change closes
+   * the playhead and offers to count again.
+   */
+  const playFresh = rewind !== null && rewind.frame === frameKey;
+  const playSteps = playFresh ? rewind.beats.length : 0;
+  const playAt = playFresh ? stepAtAct(rewind.beats, rewind.index) : null;
+
+  /**
+   * Stand the playhead up — the panel's own way in.
+   *
+   * Three cases, and the third is the one worth having: a preview is already up
+   * but the FRAME has moved under it (a depth change, a flip to sector view),
+   * so the beats were counted for a picture nobody is looking at. Recount in
+   * place rather than reopening, which would jump the plate.
+   */
+  const standPlayhead = useCallback(() => {
+    if (steps === 0) {
+      setAnnounce("no playhead — no gesture has been committed yet");
+      return;
+    }
+    if (rewind === null) {
+      // HISTORY rather than REPLAY: it opens at the live state, so standing the
+      // playhead up does not jump the picture. `openRewind` argues that split.
+      openRewind("history");
+      return;
+    }
+    const beats = frameBeats();
+    setRewind((r) => (r === null ? r : { ...r, beats, frame: frameKey }));
+    setAnnounce(
+      `playhead — ${beats.length} animation step${
+        beats.length === 1 ? "" : "s"
+      } in this frame, over ${steps} committed gesture${steps === 1 ? "" : "s"}`
+    );
+  }, [steps, rewind, openRewind, frameBeats, frameKey]);
+
+  /**
+   * Move the playhead to a rail position, and the one preview with it.
+   *
+   * `GROUND` is a rail position and not a step — it is the plate the animation
+   * opens on, which in act space is state 0 — so it is the one value that does
+   * not go through `actAtStep`.
+   */
+  const seekPlayhead = useCallback(
+    (to: number) => {
+      if (rewind === null) return;
+      const beats = rewind.beats;
+      const step = Math.min(Math.max(GROUND, Math.round(to)), beats.length - 1);
+      seekRewind(step <= GROUND ? 0 : actAtStep(beats, step), false);
+      setAnnounce(
+        step <= GROUND
+          ? `before step 0 — the plate the replay opens on, ${beats.length} step${
+              beats.length === 1 ? "" : "s"
+            } to come`
+          : `step ${step} of ${beats.length - 1}`
+      );
+    },
+    [rewind, seekRewind]
+  );
+
+  /**
+   * Set a mark where the playhead stands.
+   *
+   * `timeline.markIn`/`markOut` route every edit through `replay.clampSpan`, so
+   * the panel cannot form a span the payload writer would refuse and an inverted
+   * pair collapses the way the model says it does. The announcement reports the
+   * span that RESULTED rather than the one that was asked for, which is the only
+   * way a person learns that setting an out point before their own in point gave
+   * them a one-step replay.
+   */
+  const setMark = useCallback(
+    (end: "in" | "out") => {
+      if (rewind === null || playAt === null || playSteps === 0) return;
+      const next =
+        end === "in"
+          ? markIn(playSpan, playAt, playSteps)
+          : markOut(playSpan, playAt, playSteps);
+      setPlaySpan(next);
+      setAnnounce(`${end} point at step ${playAt} — ${spanSaid(next, playSteps)}`);
+    },
+    [rewind, playAt, playSteps, playSpan]
+  );
+
+  const clearMarks = useCallback(() => {
+    setPlaySpan(null);
+    setAnnounce(
+      "in and out points cleared — the replay and both animated exports play the whole drawing"
+    );
+  }, []);
 
   /**
    * What reverting to the previewed state would cost, computed against the LIVE
@@ -5181,16 +5417,44 @@ export default function DrawPage() {
       shown
     );
     if (frames.length === 0) return null;
-    return { baked, cells, overlay, shown, states, frames };
-  }, [comp, past, bakedFrame, canvas, book, showTiling]);
+    /**
+     * THE CUT, APPLIED ONCE, HERE.
+     *
+     * `boundAnimation` is the one place the marks are read — its header says so
+     * and gives the reason: two encoders reading two marks would be two chances
+     * to be off by one, and two encoders reading one value is none. So the SVG
+     * and the GIF are each handed a `ground` and a `steps` that have already
+     * been cut, and neither of them learns what an in point is.
+     *
+     * `states[0]` is the plate the journal began from, which is what `ground`
+     * has always been; the fold of everything before the in point INTO it is
+     * `boundAnimation`'s own work. The marks are clamped there too, so a span
+     * left over from a longer drawing or a wider frame lands inside this one
+     * rather than being refused — the UI-facing rule, see `clampSpan`.
+     */
+    const cut = boundAnimation(states[0], frames, playSpan);
+    return {
+      baked,
+      cells,
+      overlay,
+      shown,
+      states,
+      /** Every beat the drawing has. What the census and the timing count. */
+      frames,
+      cut,
+    };
+  }, [comp, past, bakedFrame, canvas, book, showTiling, playSpan]);
 
   const animationText = useCallback(
     (grouping: "orbit" | "cell") => {
       const model = animationModel();
       if (model === null) return null;
-      const { baked, cells, overlay, shown, states, frames } = model;
+      const { baked, cells, overlay, shown, states, cut } = model;
+      // THE CENSUS COUNTS WHAT THE FILE HOLDS, so it counts the CUT steps and
+      // not the drawing's. It is what the announcement reports as "23 gestures,
+      // one CSS rule per gesture", and a rule is written per step that plays.
       return {
-        census: animationCensus(frames),
+        census: animationCensus(cut.steps),
         text: animatedSvg({
           width: canvas.geom.width,
           height: canvas.geom.height,
@@ -5207,9 +5471,15 @@ export default function DrawPage() {
             canvas.view.mode === "sector"
               ? `sector ${canvas.view.sector}`
               : "hexagon"
-          }, depth ${depth}, ${frames.length} gesture${
-            frames.length === 1 ? "" : "s"
-          } at ${stepMs} ms`,
+          }, depth ${depth}, ${cut.steps.length} gesture${
+            cut.steps.length === 1 ? "" : "s"
+          } at ${stepMs} ms${
+            // The title says the drawing was CUT rather than leaving a reader to
+            // wonder why a 60-gesture plate exported an 8-gesture loop.
+            cut.folded === 0 && cut.dropped === 0
+              ? ""
+              : ` — in ${cut.span?.in ?? 0}, out ${cut.span?.out ?? 0}`
+          }`,
           // The same payload the still carries, so a replay is also a drawing:
           // dropping one back on the plate restores the finished plate exactly.
           payload: payloadFromPaint(
@@ -5223,12 +5493,19 @@ export default function DrawPage() {
               ? { sector: canvas.view.sector }
               : undefined
           ),
-          ground: states[0],
-          steps: frames,
+          // THE CUT PAIR, SPREAD TOGETHER. `boundAnimation` returns a `ground`
+          // with the prefix already folded in and a `steps` already truncated,
+          // and they only mean what they say as a pair — a folded ground with
+          // the uncut steps would draw the front of the drawing twice.
+          ground: cut.ground,
+          steps: cut.steps,
           stepMs,
           // Derived from THIS replay's step length and gesture count — see
-          // `replay.animationTiming`.
-          ...animationTiming(stepMs, frames.length),
+          // `replay.animationTiming`, which says in as many words that the count
+          // is the BOUNDED one: a hundred-gesture drawing cut to five plays a
+          // five-step cycle, and a hold scaled to the hundred would be four
+          // fifths of a loop spent on a still frame.
+          ...animationTiming(stepMs, cut.steps.length),
           grouping,
         }),
       };
@@ -5291,7 +5568,7 @@ export default function DrawPage() {
       setAnnounce("nothing to animate — no committed gesture changed a cell in this frame");
       return;
     }
-    const { cells, overlay, shown, states, frames } = model;
+    const { cells, overlay, shown, cut } = model;
     const run = gifSteps({
       viewWidth: canvas.geom.width,
       viewHeight: canvas.geom.height,
@@ -5305,17 +5582,22 @@ export default function DrawPage() {
       weldPaint: weld,
       seamWidth: canvas.geom.seamWidth,
       overlay,
-      ground: states[0],
-      steps: frames,
+      // THE SAME CUT PAIR the SVG is handed, from the same `boundAnimation`
+      // call — which is the whole reason that call lives in `animationModel`
+      // and not in either encoder. See its header.
+      ground: cut.ground,
+      steps: cut.steps,
       stepMs,
       // The SAME hold the SVG gets, so the two encodings of one replay loop at
       // the same rate. A GIF carries no fade — see the note above.
-      holdMs: animationTiming(stepMs, frames.length).holdMs,
+      holdMs: animationTiming(stepMs, cut.steps.length).holdMs,
     });
     setGifBusy(true);
     setGifAt(0);
     setAnnounce(
-      `writing a GIF — ${frames.length} frame${frames.length === 1 ? "" : "s"} at ${gifWidth} px`
+      `writing a GIF — ${cut.steps.length} frame${
+        cut.steps.length === 1 ? "" : "s"
+      } at ${gifWidth} px`
     );
 
     const channel = new MessageChannel();
@@ -5909,6 +6191,22 @@ export default function DrawPage() {
             session={session}
             book={book}
             frozen={previewing}
+            /* The playhead rides IN this panel, on the owner's own reading of
+               the Flash arrangement: a time ruler over the track stack, with the
+               vertical list underneath it exactly as it was. `LayersPanel`'s
+               header argues the placement and says what a filmstrip would add
+               later; nothing here draws one. */
+            timeline={{
+              steps: playFresh ? playSteps : null,
+              at: playAt,
+              span: playSpan,
+              acts: steps,
+              onOpen: standPlayhead,
+              onSeek: seekPlayhead,
+              onMarkIn: () => setMark("in"),
+              onMarkOut: () => setMark("out"),
+              onClearMarks: clearMarks,
+            }}
             onSelect={pickLayer}
             onToggleVisible={flipVisible}
             onToggleLocked={flipLocked}
@@ -6567,68 +6865,17 @@ export default function DrawPage() {
                   </div>
                 </div>
 
-                {/* ZOOM, which shipped as `−  1×  +` with no label, no glyph
-                    and no tooltip — three unmarked buttons that a reviewer read
-                    as "I don't know what these do", which was the honest
-                    reading, because nothing on screen said. Two things change.
+                {/* ZOOM HAS LEFT THE DECK for the canvas's own bottom-left
+                    corner — see `.canvasZoom`, where the three buttons now are
+                    and where the reasoning for the move lives. It is the same
+                    journey UNDO and REDO made to the top-left in an earlier
+                    round, for the same reason and against the same three
+                    pointer hazards: a control you use WHILE looking at the
+                    artwork does not belong at the far end of a deck above it.
 
-                    It is LABELLED, in the same micro-key every other group in
-                    this deck wears, so the function is legible standing still
-                    with no pointer anywhere near it — which is the whole of the
-                    defect. And it has MOVED: it used to sit in the run that
-                    holds save, load and the button that wipes the plate, and it
-                    is not one of those. Zoom changes nothing about the drawing;
-                    it changes the window. So it sits on the seam of this deck,
-                    after the controls that say what the hand is holding and
-                    before the ones that say what has been done — belonging to
-                    neither, which is exactly right.
-
-                    The middle button is the readout AND the reset, so the
-                    factor is always on screen and 1× is always one click away.
-                    It exists so that Space-drag has something to pan, and the
-                    tooltip on `+` is where that is said. */}
-                <div className={styles.zoomGroup} role="group" aria-labelledby="zoom-key">
-                  <span className={styles.benchKey} id="zoom-key">
-                    zoom
-                  </span>
-                  <span className={styles.zoomStepper}>
-                    <button
-                      type="button"
-                      onClick={() => setZoomTo(zoom / 2)}
-                      disabled={zoom <= 1}
-                      title="zoom out — show more of the figure"
-                      aria-label="zoom out"
-                    >
-                      −
-                    </button>
-                    <button
-                      type="button"
-                      className={styles.zoomNow}
-                      onClick={() => setZoomTo(1)}
-                      disabled={zoom === 1}
-                      title="fit the whole figure"
-                      // ROUNDED FOR DISPLAY ONLY. The stepper's own factors are
-                      // powers of two and print exactly; a drill-in lands on
-                      // whatever makes the focused cells fill the frame, and
-                      // "3.4641016151377544×" is a number nobody asked to read.
-                      // The state itself is left alone — see `setZoomTo`.
-                      aria-label={`zoom ${
-                        Math.round(zoom * 10) / 10
-                      } times — click to fit the whole figure`}
-                    >
-                      {Math.round(zoom * 10) / 10}×
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setZoomTo(zoom * 2)}
-                      disabled={zoom >= ZOOM_MAX}
-                      title="zoom in — hold Space and drag to pan"
-                      aria-label="zoom in"
-                    >
-                      +
-                    </button>
-                  </span>
-                </div>
+                    Nothing else in this group moved and no key changed: `+`,
+                    `−` and `0` are still bound in the window handler and still
+                    listed under "view" in `lib/shortcuts.ts`. */}
 
                 {/* MEMORY, now one column of two: the two controls that only
                     LOOK at the drawing.
@@ -7403,6 +7650,74 @@ export default function DrawPage() {
                   )
                 )}
               </div>
+
+              {/* ZOOM, ON THE ARTWORK, at the bottom left.
+                  Asked for in as many words, and it is the right corner: zoom
+                  is a fact about the WINDOW you are looking through, so it
+                  belongs on the window rather than 700px away at the end of a
+                  deck. It is the same move undo and redo made to the opposite
+                  corner, and it inherits all three of the pointer hazards that
+                  move documented — `.canvasZoom` in the stylesheet carries them
+                  one by one, including the one that bites hardest here: `−` is
+                  disabled at 1×, which is the DEFAULT state of every fresh
+                  drawing, and a disabled button that still hit-tests is a hole
+                  in the drawing surface that swallows a stroke and gives nothing
+                  back. Chrome dispatches nothing at all for a press that lands
+                  on one — not even to its ancestors — so `pointer-events: none`
+                  while disabled is the only fix.
+
+                  BOTTOM LEFT and not bottom right: the candidate bar owns the
+                  top right and its COMMIT has to stay findable, undo and redo
+                  own the top left, and the empty-plate hint is centred. The
+                  fourth corner was the one still free.
+
+                  The middle button is the readout AND the reset, exactly as it
+                  was in the deck, so the factor is always on screen and 1× is
+                  always one click away. */}
+              <div
+                className={styles.canvasZoom}
+                role="group"
+                aria-label="zoom the view"
+              >
+                <span className={styles.zoomStepper}>
+                  <button
+                    type="button"
+                    onClick={() => setZoomTo(zoom / 2)}
+                    disabled={zoom <= 1}
+                    title="zoom out — show more of the figure (−)"
+                    aria-label="zoom out"
+                  >
+                    −
+                  </button>
+                  <button
+                    type="button"
+                    className={styles.zoomNow}
+                    onClick={() => setZoomTo(1)}
+                    disabled={zoom === 1}
+                    title="fit the whole figure (0)"
+                    // ROUNDED FOR DISPLAY ONLY. The stepper's own factors are
+                    // powers of two and print exactly; a drill-in lands on
+                    // whatever makes the focused cells fill the frame, and
+                    // "3.4641016151377544×" is a number nobody asked to read.
+                    // The state itself is left alone — see `setZoomTo`.
+                    aria-label={`zoom ${
+                      Math.round(zoom * 10) / 10
+                    } times — click to fit the whole figure`}
+                  >
+                    {Math.round(zoom * 10) / 10}×
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setZoomTo(zoom * 2)}
+                    disabled={zoom >= ZOOM_MAX}
+                    title="zoom in — hold Space and drag to pan (+)"
+                    aria-label="zoom in"
+                  >
+                    +
+                  </button>
+                </span>
+              </div>
+
               {/* Commit rides ON the plate, opposite the tool flag.
                   It used to sit in the tool strip, and from there it was a
                   control that ARRIVED: a standing candidate pushed the strip to
