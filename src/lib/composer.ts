@@ -89,6 +89,15 @@ export function invertMove(move: Move): Move {
             (e): CellEdit<Address> => ({ cell: e.cell, from: e.to, to: e.from })
           ),
         },
+        // SWAPPED, on the same line of reasoning as the edits above and in the
+        // same breath, which is the whole reason `layers.MoveGesture` is a
+        // `{ from, to }` pair. The inverse of a paint that stripped a gesture is
+        // a move that RESTORES it going forwards, and forwards is the only
+        // direction these are ever applied in: `revertMoves` hands them to
+        // `layers.act`, which is an ordinary journal rung. Left out, REVERT
+        // dropped `mode` and `orbit` for good and said "⌘Z brings them all back"
+        // while doing it.
+        gesture: { from: move.gesture.to, to: move.gesture.from },
       };
     case "rename":
       return { kind: "rename", layer: move.layer, from: move.to, to: move.from };
@@ -255,6 +264,28 @@ export function actStrokes(past: readonly Act[]): Stroke<Address>[] {
  * A layer that holds no paint of its own still gets a `<g>`: it may be a group,
  * and a group with children and no paint is exactly what a pasted composition
  * grafts in as.
+ *
+ * ── The gesture, written where a stranger can read it ───────────────────
+ *
+ * `reveal`, `mode` and `orbit` are copied straight off the layer, ONE FOR ONE
+ * and with no arithmetic anywhere, so that `emit.ts` can put them into the
+ * markup as `data-reveal`, `data-mode` and `data-orbit` — which is what makes a
+ * `<g>` in Illustrator an addressable stroke with its symmetry attached rather
+ * than an anonymous compound path. The fields are the layer's OWN, on the same
+ * rule as the switches: nothing is resolved under an ancestor.
+ *
+ * ABSENT STAYS ABSENT, and it is written as three `!== undefined` tests rather
+ * than a spread of the layer, because the whole point is that a layer nobody
+ * recorded a gesture for produces the file it produced before this existed —
+ * `emit.ts` writes no attribute for an absent field, `artfile.ts` writes no key,
+ * and the bytes do not move. Spreading `{ ...l }` here would carry `plate` and
+ * `children` into an `EmitLayer` as well, so the explicit form is also the
+ * correct one.
+ *
+ * NOTHING IS DERIVED. `orbit` is not filled in from `mode`, `mode` is not
+ * defaulted to 1, and neither is checked against the other — a stabilised seed
+ * gives `mode: 6, orbit: 3` and that is the ordinary case. See
+ * `layers.LayerGesture`.
  */
 export function emitLayersOf(
   comp: Composition,
@@ -267,6 +298,11 @@ export function emitLayersOf(
     const own = switchesOf(comp, l.id);
     if (!own.visible) out.hidden = true;
     if (own.locked) out.locked = true;
+    // The gesture, read off the LAYER — it is on the node and the switches are
+    // not, and `layers.LayerGesture` argues that split.
+    if (l.reveal !== undefined) out.reveal = l.reveal;
+    if (l.mode !== undefined) out.mode = l.mode;
+    if (l.orbit !== undefined) out.orbit = l.orbit;
     if (l.plate.size !== 0) out.paint = resolvePlate(l.plate, book);
     if (l.children.length !== 0) out.children = l.children.map(one);
     return out;
@@ -287,6 +323,28 @@ export function emitLayersOf(
  *
  * `name` falls back to the file's id, because a layer with no name is a row you
  * cannot talk about.
+ *
+ * ── THE GESTURE COMES IN, and it used to be dropped here ────────────────
+ *
+ * `reveal`, `mode` and `orbit` are carried onto the `Layer`. They were not, and
+ * the loss was SILENT AND TOTAL: `emit.ts` has always written the three, `parse`
+ * has always read them back, and `artfile.ts` has always validated them — the
+ * format round-tripped provenance perfectly at every nesting depth — but a
+ * `Layer` had no slot for them, so this function read `paint`, `hidden`,
+ * `locked`, `name` and `children` and let the rest fall on the floor. Open a
+ * provenance-carrying SVG and save it again and the symmetry of every stroke was
+ * gone, with no error, no warning, and a file that still looked identical.
+ * Measured before the fix: `stackFromEmit` of a `{ reveal: 2, mode: 6, orbit: 3 }`
+ * layer and `emitLayersOf` straight back out gave `undefined` for all three.
+ *
+ * Copied ONE FOR ONE, with the same `!== undefined` tests the writer uses, so a
+ * file that says nothing yields a layer that says nothing rather than a layer
+ * carrying three `undefined`s. Nothing is derived and nothing is cross-checked:
+ * `mode: 6, orbit: 3` is a stabilised seed and arrives as it left.
+ *
+ * UNLIKE THE SWITCHES, these do not come back beside the stack. The switches
+ * have to, because a `Layer` does not hold them; the gesture is ON the layer, so
+ * it rides in the returned tree. `layers.LayerGesture` argues that placement.
  */
 export function stackFromEmit(
   list: readonly EmitLayer[],
@@ -316,7 +374,19 @@ export function stackFromEmit(
     // The children are read AFTER this layer's own id is minted, so the ids
     // ascend in paint order and a file reads the way the panel does.
     const children = l.children === undefined ? [] : l.children.map(one);
-    return { id, name: l.name ?? l.id, plate, children };
+    // Spread rather than assigned, so a field the file does not state is a key
+    // the layer does not have. `{ reveal: l.reveal }` with `l.reveal` undefined
+    // would make every imported layer carry all three keys, and "absent" would
+    // stop being a shape anything can test for.
+    return {
+      id,
+      name: l.name ?? l.id,
+      plate,
+      children,
+      ...(l.reveal === undefined ? {} : { reveal: l.reveal }),
+      ...(l.mode === undefined ? {} : { mode: l.mode }),
+      ...(l.orbit === undefined ? {} : { orbit: l.orbit }),
+    };
   };
   const stack = list.map(one);
   return { stack, nextId: n, switches };

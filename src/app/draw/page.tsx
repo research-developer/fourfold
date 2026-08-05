@@ -10,6 +10,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import DrawBoard, {
+  focusFrame,
   PAINT_SEAM,
   SEAM,
   TILE,
@@ -20,7 +21,32 @@ import DrawBoard, {
   type ViewWindow,
 } from "@/components/DrawBoard";
 import { ADJUSTMENTS, ADJUST_NAMES, type AdjustName } from "@/lib/adjust";
-import { ARMS, armMaskOver, clipStamp, type Isolation } from "@/lib/arms";
+import { ARMS, clipStamp, type Isolation } from "@/lib/arms";
+import {
+  ROOT,
+  STEP_LABEL,
+  armResolver,
+  armStep,
+  clipMask,
+  enter,
+  exit,
+  exitTo,
+  focusCells,
+  focusedArm,
+  focusedSector,
+  gestureFor,
+  gestureIds,
+  hexagonDeeper,
+  pathLabel,
+  samePath,
+  scopeFor,
+  sectorResolver,
+  sectorStep,
+  seedMask,
+  type FocusPath,
+  type FocusResolvers,
+  type FocusStep,
+} from "@/lib/focus";
 import {
   cellCount,
   extractArt,
@@ -73,6 +99,15 @@ import {
 import { buildFigure, type Convention } from "@/lib/figure";
 import { buildHexagon, type Hexagon } from "@/lib/hexagon";
 import {
+  EMPTY_PROPOSAL,
+  proposalHolds,
+  proposeSeed,
+  seedStamp,
+  stampGroups,
+  unionCells,
+  type Proposal,
+} from "@/lib/propose";
+import {
   clipToRegion,
   imageStamp,
   latticeView,
@@ -91,7 +126,16 @@ import {
   PRESET_NAMES,
   type PresetName,
 } from "@/lib/presets";
-import { SHORTCUTS } from "@/lib/shortcuts";
+import {
+  ALT_REST,
+  SHORTCUTS,
+  altDeclined,
+  altDown,
+  altLost,
+  altUp,
+  shapeAlt,
+  type AltState,
+} from "@/lib/shortcuts";
 import {
   hexagonSurface,
   BRUSH_SCOPES,
@@ -134,6 +178,7 @@ import {
   find as findLayer,
   flatten as flattenComposition,
   fromPlate,
+  gestureOf,
   graft,
   layerId,
   newSession,
@@ -152,6 +197,7 @@ import {
   undo as undoSession,
   type Composition,
   type Layer,
+  type LayerGesture,
   type LayerId,
   type Outcome,
   type Session,
@@ -368,6 +414,20 @@ const MAX_IMPORT = 16;
 const ZOOM_MAX = 8;
 
 /**
+ * How long the drill-in zoom takes, in milliseconds.
+ *
+ * SHORT ON PURPOSE. The transition is not decoration: with the plate zoomed and
+ * five sixths of it dulled in one frame, there is nothing on screen that says
+ * the new picture is a part of the old one, and a person who looks away for the
+ * length of a click comes back to what reads as a different drawing. The travel
+ * is the sentence "this came from there". 180 ms is long enough to be seen as
+ * motion and short enough that nobody waits for it.
+ *
+ * `prefers-reduced-motion` skips it entirely; see `easeFocus`.
+ */
+const FOCUS_MS = 180;
+
+/**
  * How long a replay holds each gesture, in milliseconds.
  *
  * The range is set by the two things a replay is for. At the fast end it has to
@@ -421,6 +481,16 @@ const TICK_LIMIT = 64;
 
 /** The board's handlers, switched off while a preview is standing. */
 const NOTHING = () => {};
+
+/**
+ * "No proposal is standing", as one shared array.
+ *
+ * Module scope rather than a fresh `[]` per render, so the board's `candidate`
+ * prop keeps its identity across every render in which nothing is proposed and
+ * the ghost layer does not re-render for a pointer that is merely moving. Same
+ * reasoning as `propose.EMPTY_PROPOSAL`, one level up the pipe.
+ */
+const NO_SPECS: readonly PreviewSpec[] = [];
 
 function TransportGlyph({ playing }: { playing: boolean }) {
   return (
@@ -495,6 +565,28 @@ const subscribeCoarse = (onChange: () => void) => {
 };
 const coarseNow = () => window.matchMedia("(pointer: coarse)").matches;
 const coarseOnServer = () => false;
+
+/**
+ * `prefers-reduced-motion`, read the same way `(pointer: coarse)` is.
+ *
+ * A store rather than a one-shot read for the same reason that one is: the
+ * setting can change while the page is open — macOS's Reduce Motion is a switch
+ * in the accessibility pane, not a boot flag — and a value sampled once would
+ * leave the drill-in animating for someone who has just asked it not to.
+ *
+ * FALSE ON THE SERVER, which is the same lie `coarseOnServer` tells and for the
+ * same reason: there is no media query in a render that has no window, and the
+ * first client render corrects it before anything can move. Nothing animates
+ * during hydration, so the wrong value is never acted on.
+ */
+const subscribeMotion = (onChange: () => void) => {
+  const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+  mq.addEventListener("change", onChange);
+  return () => mq.removeEventListener("change", onChange);
+};
+const motionNow = () =>
+  window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const motionOnServer = () => false;
 
 interface Canvas {
   /** The model. Always the hexagon; the view says which part is drawn. */
@@ -813,7 +905,7 @@ const GLYPH_LEGEND: readonly { icon: React.ReactNode; what: string }[] = [
   { icon: <ShapeGlyph shape="line" />, what: "line — drag along a lattice row" },
   { icon: <ShapeGlyph shape="ring" />, what: "ring — a level set of the hex norm" },
   { icon: <DragGlyph mode="paint" />, what: "drag paints continuously" },
-  { icon: <DragGlyph mode="propose" />, what: "drag proposes; tap to commit" },
+  { icon: <DragGlyph mode="propose" />, what: "drag gathers; tap to commit" },
   { icon: <ActionGlyph name="undo" />, what: "undo a whole gesture" },
   { icon: <ActionGlyph name="redo" />, what: "redo it" },
   { icon: <ActionGlyph name="replay" />, what: "replay the drawing being made" },
@@ -821,6 +913,31 @@ const GLYPH_LEGEND: readonly { icon: React.ReactNode; what: string }[] = [
   { icon: <ActionGlyph name="save" />, what: "save — SVG or PNG" },
   { icon: <ActionGlyph name="load" />, what: "load an SVG onto the plate" },
 ];
+
+/**
+ * What ONE focus step calls itself, for a breadcrumb button.
+ *
+ * `focus.ts` has this function — `stepLabel` — and does not export it; what it
+ * exports is `pathLabel`, which joins every step into one string with a
+ * separator. That is the right shape for a sentence and the wrong shape for a
+ * row of buttons, and splitting the joined string back apart would be parsing a
+ * display string, which breaks the moment a gesture step's label contains the
+ * separator. So the per-step spelling is written out here, using `STEP_LABEL`
+ * and `gestureIds` — both exported — so the words themselves still come from the
+ * model. The right fix is for `focus.ts` to export its `stepLabel`; that file is
+ * outside this change's lane, so it is flagged rather than edited.
+ *
+ * The `gesture` case is not reachable from this page yet — nothing here pushes a
+ * gesture step — and is written anyway, because the alternative is a breadcrumb
+ * that prints a raw comma-separated id list the first time the filmstrip drives
+ * this mechanism.
+ */
+function crumbLabel(step: FocusStep): string {
+  if (step.kind !== "gesture") return `${STEP_LABEL[step.kind]} ${step.id}`;
+  const ids = gestureIds(step);
+  if (ids.length === 0) return "no gestures";
+  return ids.length === 1 ? `gesture ${ids[0]}` : `${ids.length} gestures`;
+}
 
 export default function DrawPage() {
   /**
@@ -860,20 +977,78 @@ export default function DrawPage() {
    */
   const [scope, setScope] = useState<BrushScope>("hexagon");
   /**
-   * One ftype ARM at a time, INSIDE the framed sector.
+   * WHICH THING THE HAND IS INSIDE — one stack, from the whole plate inward.
    *
-   * `null` is off. Offered in the sector view alone, which is the nesting the
-   * figure actually has: hexagon, then sector, then arm. In hexagon view the
-   * scope control is the same question asked one level up, and stacking both
-   * would be a pair of controls nobody can hold in mind at once.
+   * This replaces the `isolation` state that used to sit here, and it is the
+   * page's whole share of `lib/focus.ts`. `focusedArm(focus)` is the old
+   * `Isolation` value, so every consumer of it below is unchanged; what is new is
+   * that the same stack can also hold a SECTOR, and later a layer or a gesture,
+   * without a fourth piece of state and a fourth control.
+   *
+   * ── What it is NOT: the frame, and not the roaming brush sector ─────────
+   *
+   * `viewMode` and `sector` stay exactly where they are, and that is deliberate
+   * rather than unfinished. They are different questions:
+   *
+   *   viewMode  WHICH PART OF THE MODEL IS DRAWN. A reframe — the sector view
+   *             turns one sector apex-up at twice the scale and draws nothing
+   *             else. Drilling in is the opposite: it zooms and DULLS, so the
+   *             rest of the figure is still on screen. Folding the two together
+   *             would make "isolate" throw away the picture it is supposed to be
+   *             showing you the inside of.
+   *
+   *   sector    WHICH SECTOR THE POINTER IS OVER, kept stickily by `noteSector`
+   *             so a `sector`-scoped brush roams the whole plate with each stroke
+   *             staying local to where it started. That is a per-STROKE fact and
+   *             it changes on every pointer move; a focus is a standing state a
+   *             person chose. Driving the focus from the pointer would zoom and
+   *             dim the plate as the hand crossed a seam.
+   *
+   * So the focus COMPOSES with both rather than replacing either: see `effScope`
+   * for how one expression takes the scope buttons and the focus together, and
+   * `reframe` for why a frame change drops the focus.
    */
-  const [isolation, setIsolation] = useState<Isolation>(null);
+  const [focus, setFocus] = useState<FocusPath>(ROOT);
   const [reliefOn, setReliefOn] = useState(false);
   const [reading, setReading] = useState<Reading>("convex");
   const [schemeName, setSchemeName] = useState<SchemeName>("hexad");
   const [base, setBase] = useState<Swatch>(() => swatchFromHex("#d4a017"));
 
-  const [tool, setTool] = useState<Tool>("paint");
+  /**
+   * The tool the user CHOSE, which is not always the tool in force.
+   *
+   * Holding Option/Alt with nothing pressed is a momentary eraser (see the Alt
+   * block further down), and the whole of that feature is the two lines below:
+   * `pickedTool` is the selection and `tool` is what the program does with it.
+   *
+   * ── Why an override and not a save/restore ──────────────────────────────
+   *
+   * The obvious build is `prev = tool; setTool("erase")` on the way down and
+   * `setTool(prev)` on the way up. It was rejected, and not on taste:
+   *
+   *  · IT CAN GET STUCK. Every path that fails to reach the restore — a missed
+   *    keyup, an unmount mid-hold, a throw between the two — leaves a
+   *    DESTRUCTIVE tool selected with nothing on screen saying it is temporary,
+   *    and the user's own selection destroyed. Here the momentary state is one
+   *    boolean whose false is the resting value; losing track of it can only
+   *    fail toward the tool the user actually picked.
+   *
+   *  · IT CLOBBERS A MID-HOLD CHANGE. The brief asks that release restore the
+   *    previous tool "including if the user changed tools some other way
+   *    mid-hold". A save/restore would write the stale saved value back over
+   *    the new choice. This restores it exactly by never overwriting it: click
+   *    ADJUST while the eraser is held and `pickedTool` is adjust from that
+   *    instant, so the release reveals adjust rather than reinstating paint.
+   *    There is no restore step to get wrong, because there is no save.
+   *
+   * Everything downstream — the paint pipeline, the ghost, the cursor, the HUD
+   * flag, the pressed state of the tool buttons, the canvas label — reads
+   * `tool` and needs no further change. That is the point of putting the
+   * override at the name rather than at forty call sites.
+   */
+  const [pickedTool, setPickedTool] = useState<Tool>("paint");
+  const [eraseHeld, setEraseHeld] = useState(false);
+  const tool: Tool = eraseHeld ? "erase" : pickedTool;
   const [adjustName, setAdjustName] = useState<AdjustName>("hue+");
   const [band, setBand] = useState<BandFamily | null>(null);
   const [progName, setProgName] = useState<ProgressionName>("off");
@@ -881,7 +1056,50 @@ export default function DrawPage() {
   const [progOrigin, setProgOrigin] = useState(0);
   /** `null` = follow the pointer type; anything else is the user's own choice. */
   const [dragChoice, setDragChoice] = useState<DragMode | null>(null);
-  const [candidate, setCandidate] = useState<number | null>(null);
+  /**
+   * The standing proposal: the seeds a `propose` drag has gathered, in order.
+   *
+   * It was a single `number | null` — one candidate, replaced by every cell the
+   * finger crossed — and that is the limitation this list removes. A propose
+   * drag now ACCUMULATES applications exactly as a paint drag does, and the only
+   * difference between the two modes is when the plate changes.
+   *
+   * The shape argument is written out in `propose.ts`: ordered, because
+   * `StrokeMark.groups` is defined in stroke order and a progression lays its
+   * gradient along that order; distinct, because a duplicate seed is invisible in
+   * the ghost and still spends a colouring event at commit. Nothing here holds
+   * the CELLS the proposal covers — those are derived from the seeds by the same
+   * `brushStamp` the commit will use, so the ghost and the stroke cannot come to
+   * disagree.
+   */
+  const [proposal, setProposal] = useState<Proposal>(EMPTY_PROPOSAL);
+  /**
+   * The refused commit that is still standing: WHICH proposal, and WHY.
+   *
+   * Holds the proposal ITSELF rather than a flag, and that is what makes it
+   * self-clearing. A refusal is only worth saying while it is still true, and it
+   * stops being true the instant the proposal changes — one more seed gathered,
+   * the whole thing dropped, a focus change that cleared it, a commit that
+   * finally landed. `proposeSeed` hands back the SAME array when nothing changed
+   * and a new one when something did, so `blocked.proposal === proposal` is
+   * exactly the question "is the standing proposal the one that was refused", and
+   * every one of the dozen places that write `setProposal` clears this without
+   * knowing it exists. A boolean would have needed all of them to remember.
+   *
+   * IT HOLDS ITS OWN SENTENCE, and the version that did not was wrong in a way
+   * the identity check could not catch. `why` used to live in `announce`, spliced
+   * into the standing line at render — but `announce` is the shared channel and
+   * moves on its own: with the same proposal still up, one ⌘Z made the live
+   * region read "undid painted 12 cells on L1 … — nothing was laid and there is
+   * nothing to undo; the proposal still stands", which is a flat contradiction
+   * one keystroke from the refusal. The reason is frozen here at the moment of
+   * refusal, where it cannot be re-rented. `endStroke` hands back the words for
+   * exactly this. See `said`.
+   */
+  const [blocked, setBlocked] = useState<{
+    readonly proposal: Proposal;
+    readonly why: string;
+  } | null>(null);
 
   /**
    * The drawing: a TREE of address plates, and the journal of what was done to
@@ -1009,6 +1227,85 @@ export default function DrawPage() {
   /** Space is down. A ref as well, because the key handler reads it. */
   const [spaceHeld, setSpaceHeld] = useState(false);
   const panned = useRef(false);
+
+  /**
+   * Every pointer currently pressed, anywhere on the window.
+   *
+   * THE DISCRIMINATOR for Option/Alt, and the only thing it is for. `shortcuts.
+   * altDown` asks one question — was a pointer already down when the key went
+   * down — and this answers it.
+   *
+   * ── Why a window listener and not a flag lifted out of `DrawBoard` ──────
+   *
+   * The board knows perfectly well when a press is live; it keeps `drawing`,
+   * `anchor`, `proposing` and `panFrom` for exactly that. Lifting one of them
+   * would have made the discriminator "a press on the CANVAS", which is the
+   * narrower and arguably more faithful reading — the shape modifier only means
+   * anything while a canvas gesture is running.
+   *
+   * This is the wider one — ANY press, including one on a rail button — and the
+   * choice is deliberate, because the two readings differ only in cases where
+   * the wider one REFUSES TO ARM a destructive tool: hold a zoom button down,
+   * press Alt, and you get the shape modifier's inert branch instead of a live
+   * eraser. Erring toward "the eraser did not arm" is free; erring the other way
+   * costs the user cells. It also needs no new prop, cannot be desynchronised
+   * from the board's four refs, and sees presses that begin outside the canvas
+   * entirely.
+   *
+   * ── A `Set`, and what that does NOT buy ────────────────────────────────
+   *
+   * This comment used to claim that a `Set` of ids "cannot leave a permanent
+   * phantom press behind on a touchscreen", and on a touchscreen that is exactly
+   * backwards. Touch pointer ids are minted per contact and a released one is not
+   * handed out again, so an id whose `pointerup` never arrives is in this set for
+   * the life of the page — and `size > 0` then reads "a pointer is down" forever,
+   * which latches the momentary eraser OFF for the whole session. That is the
+   * one failure the discriminator can have, and it is the destructive-tool one in
+   * the safe direction, which is why it went unnoticed.
+   *
+   * The `Set` is still the right structure, for reasons the old comment did not
+   * give. It is IDEMPOTENT: a repeated `pointerdown` for one id cannot count
+   * twice, and a `pointerup` for a pointer whose press we never saw cannot take
+   * the census below zero — a counter does both. And a MOUSE keeps one id for the
+   * life of the page, so for the mouse a `Set` heals itself: press, lose the
+   * release, press again, release, and the id is gone. A counter would sit at one
+   * forever after the same sequence. A counter fixes nothing here; what fixes it
+   * is `clear` on the two events that mean "the presses this page can see are no
+   * longer this page's business", which the census effect below listens for.
+   *
+   * The board already leans on window-level `pointerup`/`pointercancel` — "a
+   * gesture can finish anywhere" — so this adds no assumption that the drawing
+   * surface was not already making.
+   */
+  const pointers = useRef<Set<number>>(new Set());
+  /**
+   * What the live Option/Alt hold means. See `shortcuts.AltState`.
+   *
+   * A REF as well as `eraseHeld` state, and the two are not two sources of
+   * truth: `applyAlt` is the only writer of either and writes both, the ref is
+   * what the window listeners read (they must see the value THIS event, not the
+   * one the last render closed over), and the state is what the picture reads.
+   * `compRef` beside `session.composition` is the same arrangement for the same
+   * reason.
+   */
+  const altRef = useRef<AltState>(ALT_REST);
+  /**
+   * The animation frame the drill-in zoom is travelling on, or `null`.
+   *
+   * THERE IS STILL ONE TRANSFORM AND ONE WRITER OF IT. This does not hold a
+   * second zoom; it holds a timer that writes `zoom` and `centre` — the same two
+   * pieces of state the zoom stepper, the pan and `reframe` write — a few times
+   * on its way to a value. Everything that sets the view cancels it first
+   * (`stopEasing`), so the last thing the user asked for is always the thing that
+   * wins, and a manual zoom during a drill-in is not a fight between two
+   * mechanisms but an interruption of one.
+   *
+   * The alternative was to DERIVE the transform from the focus path. It was
+   * rejected because it makes manual zoom impossible while focused: the stepper
+   * would set a value that the next render recomputed away, which is a control
+   * that visibly does nothing.
+   */
+  const easing = useRef<number | null>(null);
   /**
    * Why the last load did not happen.
    *
@@ -1059,13 +1356,31 @@ export default function DrawPage() {
    */
   const paintingInto = useRef<LayerId | null>(null);
   /**
-   * Whether this gesture has already said why it is refusing.
+   * The gesture that layer carried BEFORE this stroke started, for the rung.
+   *
+   * `layers.applyMove` strips a layer's `mode`/`orbit` when it is painted into,
+   * because those two numbers describe the cells that were there and painting
+   * changes them. Undo has to write them back, so the rung carries them as its
+   * move's `gesture.from` — and it has to be the value from before the FIRST
+   * application, because by the time `endStroke` builds the rung the live
+   * `paintInto` calls have already stripped it. Captured beside `paintingInto`
+   * and cleared with it, so the two can only ever describe the same gesture.
+   */
+  const paintingWas = useRef<LayerGesture>({});
+  /**
+   * The sentence this gesture has already said in refusing, or `null`.
    *
    * A drag over a locked layer applies the brush sixty times a second and every
    * one of them refuses; without this the live region would repeat one sentence
    * until the pointer came up, which is how a screen reader is made useless.
+   *
+   * IT HOLDS THE WORDS AND NOT A FLAG, because `endStroke` has to hand them back
+   * to `commitProposal`, which keeps the refused proposal standing and has to be
+   * able to say WHY without reading `announce` — a piece of state it cannot see
+   * the fresh value of, and which the next unrelated announcement would take
+   * over. The words are the layer model's own; see `layers.paintTarget`.
    */
-  const refusedRef = useRef(false);
+  const refusedRef = useRef<string | null>(null);
   /**
    * Colouring events spent by the gesture in progress.
    *
@@ -1089,14 +1404,42 @@ export default function DrawPage() {
   const scheme = SCHEMES[schemeName];
   const adjust = ADJUSTMENTS[adjustName];
   /**
-   * The scope the brush is actually under.
+   * The scope the brush is actually under — the FRAME, the BUTTON and the FOCUS,
+   * in one expression.
    *
    * The sector view forces it, rather than the control being disabled there: a
    * framed sector's brush is the sector's own D₃ by definition, and the `scope`
    * state is left where the user put it so returning to hexagon view returns to
    * the group they had chosen.
+   *
+   * ── The three-way button and `scopeFor` are NOT two answers ─────────────
+   *
+   * `focus.scopeFor(path, repeatAll)` takes a BOOLEAN — "repeat in all six" —
+   * and the button here is a three-way. The brief that asked for the focus stack
+   * anticipated the buttons being removed and the boolean taking their place;
+   * they are staying for now, so the two have to compose rather than contend, and
+   * this is the composition:
+   *
+   *   sector6 pressed   → `repeatAll` is true, and `scopeFor` answers `sector6`
+   *                       WHEREVER the focus is. That IS the toggle; there is no
+   *                       second spelling of it.
+   *   sector pressed    → the roaming brush, named outright. The button says
+   *                       "this sector and nothing outside it" and the sector it
+   *                       means comes from the pointer (`noteSector`), so the
+   *                       focus has nothing to add and must not override it.
+   *   hexagon pressed   → `scopeFor` decides, which is the new behaviour: D₆ at
+   *                       the root, and the sector's own D₃ once you have drilled
+   *                       into a sector. Drilling in is a statement about where
+   *                       you are working, and the group follows it.
+   *
+   * `scopeFor`'s own header is worth reading here: `repeatAll` is honoured AT THE
+   * ROOT on purpose, and that is why the `sector6` branch is tested first rather
+   * than being conditioned on a sector being focused.
    */
-  const effScope: BrushScope = viewMode === "sector" ? "sector" : scope;
+  const effScope: BrushScope =
+    viewMode === "sector" || scope === "sector"
+      ? "sector"
+      : scopeFor(focus, scope === "sector6");
   const modes = SCOPE_MODES[effScope];
   /** A sector is a copy of the base triangle, so a sector brush wears D₃'s face. */
   const glyphKind: CanvasKind = effScope === "hexagon" ? "hexagon" : "triangle";
@@ -1105,6 +1448,21 @@ export default function DrawPage() {
   // the brush does — is unreachable on touch unless the press itself proposes.
   const coarse = useSyncExternalStore(subscribeCoarse, coarseNow, coarseOnServer);
   const dragMode = dragChoice ?? defaultDragMode(coarse);
+  /**
+   * Has the reader asked not to be moved about?
+   *
+   * Read here rather than left entirely to CSS because the drill-in's travel is
+   * a JavaScript tween over `zoom` and `centre` — an SVG `viewBox` is not an
+   * animatable CSS property in any engine, so `@media (prefers-reduced-motion)`
+   * in the stylesheet cannot reach it. The dim layer's fade IS a CSS transition
+   * and is switched off in the sheet, which is where that kind of thing belongs;
+   * the two together are the whole of the setting's effect here.
+   */
+  const reduceMotion = useSyncExternalStore(
+    subscribeMotion,
+    motionNow,
+    motionOnServer
+  );
 
   /**
    * The model. One figure, rebuilt only when the cut changes.
@@ -1233,21 +1591,88 @@ export default function DrawPage() {
   }, [zoom, centre, canvas]);
 
   /**
-   * Which cells the brush may touch — the ISOLATE control, sector view only.
+   * What a focus step MEANS on this plate.
    *
-   * The three ftype arms are a genuine partition of a sector minus its hub
-   * rather than a mask, and membership is the first non-X digit of the address,
-   * which every hexagon cell carries because every one of them is a copy of a
-   * base triangle cell. See `arms.ts`, including why the hub is excluded and
-   * what clipping costs the 3- and 6-fold brushes.
+   * Two kinds are reachable from the canvas — a sector and an arm — and both
+   * resolve off fields the hexagon's cells already carry, so nothing here
+   * computes a coordinate. Rebuilt with the figure, which is the discipline
+   * `focus.setResolver` asks for: a resolver caches, so a new figure needs a new
+   * one.
    *
-   * No sector test is needed: the SECTOR-scoped surface cannot carry a cell out
-   * of its own sector, and only the framed sector is on screen to be clicked.
+   * `layer` and `gesture` are deliberately absent. `focus.ts` supports both and
+   * the layers panel and the filmstrip will supply them; a resolver with no
+   * control to drive it would be an untested code path standing in for a feature.
+   * A step whose kind has no resolver is treated as holding everything, so
+   * nothing here breaks when one arrives.
    */
-  const keepCell = useMemo(
-    () => armMaskOver(hex.cells, viewMode === "sector" ? isolation : null),
-    [hex, viewMode, isolation]
+  const resolvers = useMemo<FocusResolvers>(
+    () => ({
+      sector: sectorResolver(hex.cells),
+      arm: armResolver(hex.cells),
+    }),
+    [hex]
   );
+
+  /**
+   * The arm the focus names, or `null`. The old `isolation` state, DERIVED.
+   *
+   * Kept under its old name because half a dozen readouts and the arm control
+   * itself are written in terms of it, and re-spelling them would have made this
+   * change look bigger than it is while testing nothing new.
+   */
+  const isolation: Isolation = focusedArm(focus);
+
+  /**
+   * Which cells the brush's STAMP may keep — arms, and only arms.
+   *
+   * This was `armMaskOver(hex.cells, isolation)` and it is `clipMask` now, which
+   * is the same predicate arrived at from the path instead of from one nullable
+   * value: `armResolver` declares `clips: true` and nothing else does, so the
+   * mask an arm-less path produces is the constant `true` it always was.
+   *
+   * THE SECTOR IS NOT IN HERE, and that is the property the whole module turns
+   * on. A `sector6` stroke seeded inside a focused sector must still reach all
+   * six — that group is defined as one sector's D₃ repeated six times, and a clip
+   * to the focused sector would make the toggle a control that does nothing.
+   * `focus.ts` states it and `test/focus.test.ts` measures it.
+   *
+   * One behaviour genuinely changed and is flagged rather than slipped in: the
+   * old mask was live only while a sector was FRAMED (`viewMode === "sector"`).
+   * An arm can now be focused in the hexagon view too — that is what drilling in
+   * with a double-tap does — and the clip applies there, which is the point of
+   * being able to drill in at all.
+   */
+  const keepCell = useMemo(() => clipMask(focus, resolvers), [focus, resolvers]);
+
+  /**
+   * Where a pointer may land: inside every MASKING step of the path.
+   *
+   * Illustrator's isolation mode, and the sentence `focus.seedMask` uses for it:
+   * inside the thing, the outside stays visible and stops being selectable. At
+   * the root this is the constant `true` — one shared closure, not an allocation
+   * per cell — so the common case costs a call and the guards below are free.
+   */
+  const inFocus = useMemo(() => seedMask(focus, resolvers), [focus, resolvers]);
+
+  /**
+   * The cells the focus HOLDS, as a set, or `null` at the root.
+   *
+   * `holdMask` and not `seedMask`, which is what `focusCells` is built on and
+   * what the display wants: a step that does not restrict the hand — a layer, a
+   * gesture — is still a thing you can point at on screen, and framing the
+   * whole plate for it would be the one answer that is useless.
+   *
+   * INTERSECTED WITH THE FRAME. In the sector view the geometry only draws one
+   * sector, and an arm step alone holds its arm in all six; a set carrying cells
+   * that are not on screen would put the dim layer's complement and the zoom box
+   * in two different places. `canvas.inView` admits everything in the hexagon
+   * view, so this is a no-op on the common path.
+   */
+  const focusHeld = useMemo<ReadonlySet<number> | null>(() => {
+    if (focus.length === 0) return null;
+    const held = focusCells(focus, resolvers, hex.cells.length);
+    return new Set(held.filter((i) => canvas.inView(i)));
+  }, [focus, resolvers, hex, canvas]);
 
   /** `(4^d − 1)/3` — the size §D predicts for one arm of one sector. */
   const armSize = (4 ** depth - 1) / 3;
@@ -1262,10 +1687,20 @@ export default function DrawPage() {
    * inside the hexagon view names the one sector it acts in, and SECTOR ×6 all
    * six copies, which is what that group actually contains.
    */
+  /*
+   * Written against `effScope` rather than against the `scope` BUTTON, which is
+   * a fix and not a tidy-up. Drilling into a sector takes the brush from D₆ to
+   * that sector's D₃ without the button moving, and the axis overlay is a
+   * picture of the group the brush is using — reading the button here would have
+   * drawn the hexagon's six diameters over a plate whose brush was mirroring
+   * about one sector's three medians. The sector NAMED is the focused one when
+   * there is one, and otherwise the roaming one the pointer left behind.
+   */
   const guideSectors = useMemo(() => {
-    if (viewMode === "sector" || scope === "hexagon") return null;
-    return scope === "sector" ? [sector] : [0, 1, 2, 3, 4, 5];
-  }, [viewMode, scope, sector]);
+    if (viewMode === "sector" || effScope === "hexagon") return null;
+    if (effScope === "sector6") return [0, 1, 2, 3, 4, 5];
+    return [focusedSector(focus) ?? sector];
+  }, [viewMode, effScope, focus, sector]);
 
   const guides = useMemo(
     () =>
@@ -1273,10 +1708,19 @@ export default function DrawPage() {
         canvas.frame,
         mode,
         guideSectors,
-        viewMode === "hexagon" && scope === "sector6" ? 6 : 0
+        viewMode === "hexagon" && effScope === "sector6" ? 6 : 0
       ),
-    [canvas, mode, guideSectors, scope, viewMode]
+    [canvas, mode, guideSectors, effScope, viewMode]
   );
+
+  /**
+   * The most recent seed of the standing proposal, or `null` when none stands.
+   *
+   * The LAST one, because it is the one the finger was on when it lifted, so it
+   * is what the span readout and the relief template should be about. The rest
+   * of the proposal is behind it and is not where the hand is.
+   */
+  const lastSeed = proposal.length === 0 ? null : proposal[proposal.length - 1];
 
   /**
    * The cell the readouts and the relief take their cue from.
@@ -1285,10 +1729,10 @@ export default function DrawPage() {
    * numbered it by exactly one render when the depth changes.
    */
   const seedCell =
-    (hover ?? candidate ?? cursor) === null ||
-    (hover ?? candidate ?? cursor)! >= canvas.geom.cells.length
+    (hover ?? lastSeed ?? cursor) === null ||
+    (hover ?? lastSeed ?? cursor)! >= canvas.geom.cells.length
       ? null
-      : (hover ?? candidate ?? cursor)!;
+      : (hover ?? lastSeed ?? cursor)!;
 
   /**
    * Remember which sector a cell was in.
@@ -1466,15 +1910,24 @@ export default function DrawPage() {
    * not move are split out as `inert` rather than dropped: "the brush reaches
    * here and will do nothing" is the rule that stops it behaving as a fill, and
    * it is worth seeing.
+   *
+   * `colourBase` defaults to the base the NEXT stroke would start from, which is
+   * what a hover ghost and a one-seed proposal both want. A multi-seed proposal
+   * passes its own, one step of the progression per seed, because that is what
+   * the commit will actually lay — see `proposalSpecs`.
    */
   const specFromStamp = useCallback(
-    (stamp: ReturnType<typeof brushStamp>, seed: number): PreviewSpec => {
+    (
+      stamp: ReturnType<typeof brushStamp>,
+      seed: number,
+      colourBase: Swatch = effectiveBase
+    ): PreviewSpec => {
       const all = stamp.cells;
       if (tool === "erase") {
         return { cells: all, colours: [], inert: [], seed, erasing: true };
       }
       const colours = stampColours(
-        { tool, scheme, base: effectiveBase, adjust },
+        { tool, scheme, base: colourBase, adjust },
         paint,
         stamp
       );
@@ -1507,20 +1960,26 @@ export default function DrawPage() {
 
   /** The free brush at a seed: one stamp, clipped to the isolated arm. */
   const specFor = useCallback(
-    (seed: number | null): PreviewSpec | null => {
+    (seed: number | null, colourBase?: Swatch): PreviewSpec | null => {
       if (seed === null || seed >= canvas.geom.cells.length) return null;
+      // NO GHOST OUTSIDE THE FOCUS, on the same rule as the paint guard: the
+      // ghost's whole job is to promise exactly what the stroke will lay, and
+      // `paintAt` refuses this seed, so a ghost here would promise a stroke that
+      // is not going to happen. It matters most at the moment it is most
+      // tempting to skip — hovering across the dulled five sixths of the plate
+      // on the way to a control.
+      if (!inFocus(seed)) return null;
       // Clipped, so the ghost promises exactly what the stroke will lay. A
       // preview that reached outside the isolated arm would be teaching the
-      // wrong brush.
+      // wrong brush. `seedStamp` is the same call `paintAt` makes, so the ghost
+      // and the stroke are one function apart rather than two copies.
       return specFromStamp(
-        clipStamp(
-          brushStamp(canvas.surface, canvas.bands, seed, shape),
-          keepCell
-        ),
-        seed
+        seedStamp(canvas.surface, canvas.bands, seed, shape, keepCell),
+        seed,
+        colourBase
       );
     },
-    [canvas, shape, keepCell, specFromStamp]
+    [canvas, shape, keepCell, inFocus, specFromStamp]
   );
 
   /**
@@ -1581,23 +2040,90 @@ export default function DrawPage() {
     };
   }, [shapeDrag, shapeStampFor, specFromStamp]);
 
-  const candidateSpec = useMemo(
-    () =>
-      shapeTool === "free" && dragMode === "propose" ? specFor(candidate) : null,
-    [shapeTool, dragMode, specFor, candidate]
-  );
+  /**
+   * The standing proposal, drawn: ONE GHOST PER SEED, in the order proposed.
+   *
+   * Not one merged ghost, and the reason is the reason the seeds are kept
+   * separately at all. A stamp's `span` is per application — the realised orbit
+   * size for a plain brush, the number of image bands for a band brush, and both
+   * of those vary from seed to seed — so a merged ghost would have to pick one
+   * span and would then show hues the commit is not going to lay. Per seed, each
+   * ghost is exactly `specFor` of that seed, which is exactly what `paintAt`
+   * will do to it.
+   *
+   * ── The base advances per seed, because the commit's does ───────────────
+   *
+   * A proposal of five seeds commits as five applications of the brush, and
+   * `paintAt` spends one colouring event per application, so the progression
+   * steps once per seed and the run comes out as a gradient. The preview has to
+   * step with it or it would show five copies of one hue and then lay five
+   * different ones — the exact failure `brush.stampColours` exists to prevent
+   * from the other side. `liveEvents` is 0 throughout, because a proposal has
+   * not touched the plate; the k-th seed is therefore the k-th step.
+   *
+   * Only the PAINT tool spends events (see `brush.EventLog`), so erase and
+   * adjust hold the base still across the whole proposal, which is what they do
+   * on a paint drag too.
+   *
+   * ── Only the free brush proposes ────────────────────────────────────────
+   *
+   * `line` and `ring` are excluded, and not merely left out. They are ANCHORED
+   * gestures: the press names a cell, the drag names a second, and nothing is
+   * painted until the release — so they already show a live preview under a
+   * pressed finger and already commit as one stroke, which is the whole of what
+   * propose mode was invented to give the free brush. There is also nothing to
+   * accumulate: a proposal is a run of applications at seeds, and a line is one
+   * figure with an anchor and an extent, not a set of seeds. Adding a candidate
+   * stage to them would mean a second tap for no preview that the drag did not
+   * already give.
+   */
+  const proposalSpecs = useMemo(() => {
+    if (shapeTool !== "free" || dragMode !== "propose") return NO_SPECS;
+    if (proposal.length === 0) return NO_SPECS;
+    const out: PreviewSpec[] = [];
+    proposal.forEach((seed, k) => {
+      const at = specFor(
+        seed,
+        prog.at(base, progressionIndex(events, progOrigin, tool === "paint" ? k : 0))
+      );
+      if (at !== null) out.push(at);
+    });
+    return out;
+  }, [
+    shapeTool,
+    dragMode,
+    proposal,
+    specFor,
+    prog,
+    base,
+    events,
+    progOrigin,
+    tool,
+  ]);
 
-  // A hover ghost and a standing proposal at once is two answers to one
-  // question. The proposal wins: it is the one that can be committed. An
-  // anchored drag outranks both — it is the thing under the finger.
+  /**
+   * The hover ghost now stands ALONGSIDE the proposal rather than yielding to it.
+   *
+   * It used to yield, and while the candidate was a single cell that was right:
+   * two ghosts would have been two answers to "what will be committed". A
+   * proposal is a SET now, and the two ghosts answer different questions — the
+   * marching dashes are what stands, the solid ghost is what the next application
+   * would add — so suppressing the second one costs the keyboard its preview
+   * entirely, since arrowing around with a proposal up would show nothing at the
+   * cursor at all. They are already told apart by two channels at once (fill
+   * strength and a marching dash; see `DrawBoard.Ghost`), which is what makes
+   * showing both legible rather than confusing.
+   *
+   * An anchored drag still outranks both — it is the thing under the finger.
+   */
   const preview = useMemo(
     () =>
       dragSpec !== null
         ? dragSpec.spec
-        : candidateSpec === null && shapeTool === "free"
+        : shapeTool === "free"
         ? specFor(hover)
         : null,
-    [dragSpec, candidateSpec, shapeTool, specFor, hover]
+    [dragSpec, shapeTool, specFor, hover]
   );
 
   // ── the canvas is a different set of cells now ──────────────────────────
@@ -1631,7 +2157,7 @@ export default function DrawPage() {
     setProgOrigin(0);
     setHover(null);
     setCursor(null);
-    setCandidate(null);
+    setProposal(EMPTY_PROPOSAL);
     setAnnounce(why);
   }, []);
 
@@ -1740,14 +2266,275 @@ export default function DrawPage() {
    * sector frame is twice the scale and turned by 120°, so carrying a window
    * across would land it somewhere nobody asked for.
    */
+  // ── drilling in ─────────────────────────────────────────────────────────
+
+  /**
+   * Stop the drill-in travel dead.
+   *
+   * Called by EVERYTHING that writes the view — the stepper, the pan, the
+   * reframe, the next drill-in — because a timer still writing `zoom` after the
+   * user has asked for a different one is the "two writers" bug the whole
+   * arrangement exists to avoid. Idempotent, so callers do not have to know
+   * whether one is running.
+   */
+  const stopEasing = useCallback(() => {
+    if (easing.current === null) return;
+    cancelAnimationFrame(easing.current);
+    easing.current = null;
+  }, []);
+
+  // A page unmounted mid-travel would leave a frame callback holding setState.
+  useEffect(() => stopEasing, [stopEasing]);
+
+  /**
+   * Travel to a zoom and a centre, over `FOCUS_MS`.
+   *
+   * `prefers-reduced-motion` SKIPS THE TRAVEL AND KEEPS THE DESTINATION, which
+   * is the right reading of that setting: the person has asked not to be moved
+   * across the screen, not to be denied the zoom. A version that also refused to
+   * zoom would have turned an accessibility preference into a missing feature.
+   *
+   * The `requestAnimationFrame` test is for the same reason the media query is
+   * read through a store: this file is rendered on the server as well, and a
+   * callback that is never invoked there is still a callback that must not throw
+   * if some future path invokes it.
+   *
+   * The intermediate values are FRACTIONAL, which breaks the "zoom is a power of
+   * two" habit the stepper had. Flagged rather than papered over: the readout is
+   * rounded for display (see the zoom stepper) and `setZoomTo` still doubles and
+   * halves whatever it is handed, so the stops remain a power of two apart from
+   * wherever a drill-in left off. Snapping the drill-in to a power of two was the
+   * alternative and it is worse — it would frame the focused cells at up to twice
+   * or half the size asked for, which is the one thing "fills the canvas" means.
+   */
+  const easeTo = useCallback(
+    (to: { zoom: number; cx: number; cy: number }) => {
+      stopEasing();
+      const settle = () => {
+        setZoom(to.zoom);
+        // `null` at 1×, matching `setZoomTo`, so the `view` memo returns the
+        // untouched viewBox the board has always drawn at rest.
+        setCentre(to.zoom <= 1 ? null : { x: to.cx, y: to.cy });
+      };
+      if (reduceMotion || typeof requestAnimationFrame !== "function") {
+        settle();
+        return;
+      }
+      const z0 = zoom;
+      const x0 = centre?.x ?? canvas.geom.width / 2;
+      const y0 = centre?.y ?? canvas.geom.height / 2;
+      const t0 = performance.now();
+      const step = () => {
+        const u = Math.min(1, (performance.now() - t0) / FOCUS_MS);
+        if (u >= 1) {
+          easing.current = null;
+          settle();
+          return;
+        }
+        // Ease out, not linear: the picture leaves quickly and arrives slowly,
+        // which is what makes a short move readable as a move rather than as a
+        // cut. Cubic because it is the cheapest curve that does it.
+        const k = 1 - (1 - u) ** 3;
+        setZoom(z0 + (to.zoom - z0) * k);
+        setCentre({ x: x0 + (to.cx - x0) * k, y: y0 + (to.cy - y0) * k });
+        easing.current = requestAnimationFrame(step);
+      };
+      easing.current = requestAnimationFrame(step);
+    },
+    [reduceMotion, zoom, centre, canvas, stopEasing]
+  );
+
+  /**
+   * Go to a focus path: zoom to it, dim around it, and say where you are.
+   *
+   * ONE FUNCTION for every route in — the canvas double-tap, the two keys, the
+   * breadcrumb, the arm buttons and Escape — so there is one place that decides
+   * what entering and leaving a focus does and no control can implement half of
+   * it. That is the same discipline `pickView` and `pickScope` are written under.
+   *
+   * Three things happen besides the path itself.
+   *
+   * THE BRUSH MODE IS CLAMPED. Drilling into a sector can take `effScope` from
+   * `hexagon` to `sector`, and mode 12 is D₆'s reflections — a subgroup of D₆ and
+   * of nothing else. `pickScope` and `pickView` already apply exactly this rule
+   * when they change the scope; this is the third door into the same room.
+   *
+   * THE PROPOSAL IS DROPPED. A standing proposal is a set of seeds gathered under
+   * the group and the mask that were in force when it was gathered; committing it
+   * after the focus moved would lay a stroke nobody previewed. `pickScope` and
+   * `pickIsolation` have always done this for the same reason.
+   *
+   * THE VIEW TRAVELS. `focusFrame` over the cells the path HOLDS — `focusCells`
+   * is built on `holdMask`, which is the framing mask — intersected with what the
+   * frame actually draws. A path that holds NOTHING keeps the frame it has, which
+   * is what `focusCells` documents as the answer for a fresh layer, a hidden
+   * layer, an erase gesture or a query that matched nothing.
+   *
+   * THE INTERSECTION WITH `inView` IS LOAD-BEARING and not defensive. A framed
+   * sector's `geom.cells` is the WHOLE model, index-aligned — `view.plateFrame`
+   * maps every cell so the board can keep using model indices — and the ones in
+   * the other five sectors land outside the triangle frame entirely. A box taken
+   * over them would zoom to a rectangle containing five sectors that are not
+   * drawn. `canvas.inView` admits everything in the hexagon view, so the common
+   * path pays one predicate per cell and nothing else.
+   *
+   * KNOWN IMPRECISION, under the relief only. The box is taken over the FLAT
+   * vertices while the board draws the deformed ones. The deformation pins the
+   * rim at scale 1 and shrinks inward, so the drawn cells are never outside the
+   * flat box — the frame is a little loose rather than cropping, which is the
+   * error worth having. Threading the bend through would mean re-deriving the box
+   * per template ring, at the pointer's rate, to fix a gap of a few pixels.
+   */
+  const applyFocus = useCallback(
+    (next: FocusPath) => {
+      if (samePath(next, focus)) return;
+      setFocus(next);
+      setProposal(EMPTY_PROPOSAL);
+
+      const nextScope: BrushScope =
+        viewMode === "sector" || scope === "sector"
+          ? "sector"
+          : scopeFor(next, scope === "sector6");
+      const m = SCOPE_MODES[nextScope].includes(mode) ? mode : 6;
+      if (m !== mode) setMode(m);
+
+      if (next.length === 0) {
+        easeTo({
+          zoom: 1,
+          cx: canvas.geom.width / 2,
+          cy: canvas.geom.height / 2,
+        });
+        setAnnounce(
+          `the whole plate — nothing is dimmed and the brush reaches everywhere${
+            m === mode ? "" : `. Brush dropped to ${m}-fold`
+          }`
+        );
+        return;
+      }
+
+      const held = focusCells(next, resolvers, hex.cells.length).filter((i) =>
+        canvas.inView(i)
+      );
+      const frame = focusFrame(canvas.geom, held, ZOOM_MAX);
+      if (frame !== null) easeTo(frame);
+      setAnnounce(
+        `inside ${pathLabel(next)} — ${held.length} cell${
+          held.length === 1 ? "" : "s"
+        }${
+          frame === null
+            ? ", which name nothing to look at, so the frame is unchanged"
+            : `, zoomed to fill the frame`
+        }. The rest of the plate is dulled and the brush will not reach it. Double-tap a dulled cell, or press O, to step back out${
+          m === mode ? "" : `. Brush dropped to ${m}-fold — mode 12 is D₆'s alone`
+        }`
+      );
+    },
+    [focus, viewMode, scope, mode, resolvers, hex, canvas, easeTo]
+  );
+
+  /** The plate's own nesting rule: root → sector → arm → stop. See `focus.ts`. */
+  const deeper = useMemo(() => hexagonDeeper(hex.cells), [hex]);
+
+  /**
+   * A clean double-tap on a cell. `gestureFor` decides what it means.
+   *
+   * The whole decision is one call, and deliberately: "inside" is `seedMask`'s
+   * inside, "outside" is its complement, and the two cases are therefore total
+   * over the plate with no third case where a tap means neither. The board knows
+   * none of this — it reports a cell and this reads the answer off the model.
+   *
+   * EXIT POPS ONE LEVEL. Not to the root: `focus.exit`'s header gives the reason
+   * and it is the reason this page wanted the mechanism at all — "leave this arm
+   * but stay in this sector" has to be expressible, and a gesture that dropped to
+   * the root would make the middle of a three-level stack unreachable except by
+   * re-entering from scratch.
+   */
+  const onFocusTap = useCallback(
+    (i: number) => {
+      const act = gestureFor(focus, i, resolvers, deeper);
+      if (act === null) {
+        // Two ways to get here and both are no-ops: a double-tap at the root on
+        // a cell that names nothing, and a double-tap at the bottom of the stack.
+        // The second is worth a sentence, because a gesture that does nothing
+        // twice in a row reads as a broken control rather than as an edge.
+        if (focus.length > 0) {
+          setAnnounce(
+            `${pathLabel(focus)} — there is nothing further in from here${
+              focusedArm(focus) === null
+                ? "; the hub belongs to no arm"
+                : ""
+            }`
+          );
+        }
+        return;
+      }
+      applyFocus(
+        act.act === "exit" ? exit(focus) : enter(focus, act.step)
+      );
+    },
+    [focus, resolvers, deeper, applyFocus]
+  );
+
+  /**
+   * The keyboard's way IN — the cursor's cell, one level deeper.
+   *
+   * A REAL SECOND PATH and not a courtesy. Every scope and arm control on this
+   * page is a `<button>` with an `aria-label` precisely because a canvas gesture
+   * is a mouse-and-finger affordance, and a drill-in that could only be reached
+   * by double-tapping the plate would be the first control here that a keyboard
+   * cannot work. It reads the CURSOR, falling back to the hover, because those
+   * are the two things that already mean "where the hand is".
+   *
+   * Strictly IN, where the canvas gesture is in-or-out. From the keyboard the
+   * direction is chosen by which key was pressed, so inferring it from where the
+   * cursor happens to be sitting would make one key do two unrelated things.
+   */
+  const drillIn = useCallback(() => {
+    const at = cursor ?? hover;
+    if (at === null) {
+      setAnnounce(
+        "no cell under the cursor — put it on the plate with the lattice keys or the arrows first"
+      );
+      return;
+    }
+    if (!inFocus(at)) {
+      setAnnounce(
+        `the cursor is outside ${pathLabel(
+          focus
+        )} — press O to step out, or move it inside first`
+      );
+      return;
+    }
+    const step = deeper(at, focus);
+    if (step === undefined) {
+      setAnnounce(`${pathLabel(focus)} — there is nothing further in from here`);
+      return;
+    }
+    applyFocus(enter(focus, step));
+  }, [cursor, hover, inFocus, focus, deeper, applyFocus]);
+
+  /** The keyboard's way OUT, and the tail of the Escape chain. One level. */
+  const drillOut = useCallback(() => {
+    if (focus.length === 0) return;
+    applyFocus(exit(focus));
+  }, [focus, applyFocus]);
+
   const reframe = useCallback(() => {
+    stopEasing();
     setZoom(1);
     setCentre(null);
     setHover(null);
     setCursor(null);
-    setCandidate(null);
+    setProposal(EMPTY_PROPOSAL);
     setShapeDrag(null);
-  }, []);
+    // THE FOCUS GOES TOO, and this is a deviation from what isolation used to do
+    // — it survived a sector change. It should not. A focus step names a sector
+    // by NUMBER, so carrying `[sector 2, arm A]` across a change of frame would
+    // leave the breadcrumb saying "sector 2" while sector 3 is on screen, and the
+    // dim layer holding cells the new frame does not draw. The frame change is
+    // the bigger gesture and the focus is the thing inside it.
+    setFocus(ROOT);
+  }, [stopEasing]);
 
   const pickView = useCallback(
     (next: "hexagon" | "sector") => {
@@ -1806,7 +2593,7 @@ export default function DrawPage() {
     const m = SCOPE_MODES[next].includes(mode) ? mode : 6;
     setScope(next);
     setMode(m);
-    setCandidate(null);
+    setProposal(EMPTY_PROPOSAL);
     setAnnounce(
       `brush scope ${next} — ${SCOPE_LABEL[next]}${
         m === mode ? "" : `; brush dropped to ${m}-fold`
@@ -1861,7 +2648,7 @@ export default function DrawPage() {
       setDepth(d);
       setHover(null);
       setCursor(null);
-      setCandidate(null);
+      setProposal(EMPTY_PROPOSAL);
       setShapeDrag(null);
       setAnnounce(
         `depth ${d}, ${cellCount("hexagon", d)} cells — every layer carried across, ${
@@ -1872,15 +2659,35 @@ export default function DrawPage() {
     [depth, docCensus]
   );
 
+  /**
+   * The arm buttons, now spelled as a focus path.
+   *
+   * KEPT, and the brief that added the focus stack says to keep them: they are
+   * being replaced by a different control later, and removing them in the same
+   * pass as the drill-in would leave the arm reachable only by double-tapping,
+   * which is a mouse-and-finger gesture.
+   *
+   * The path is REBUILT rather than pushed onto, and that is the whole of the
+   * work here. `[sector s, arm A]` and not `[arm A]`, because an arm step alone
+   * holds its arm in ALL SIX sectors — `armOfWord` reads the address, which every
+   * sector's copy of a cell shares — and the control says "one third of the
+   * framed sector". Pressing B while A is isolated therefore replaces the arm
+   * instead of nesting one inside another, which is what `focus.enter`'s header
+   * says a caller that can produce a nonsense pair should do.
+   *
+   * A SECTOR STEP APPEARS EVEN THOUGH THE SECTOR IS ALREADY FRAMED. It has to:
+   * the frame is a camera and the focus is a mask, and it is the focus that
+   * `holdMask` reads when it decides which cells to dim and which box to zoom to.
+   *
+   * OFF goes to the ROOT rather than to `[sector s]`. The two look identical in
+   * the sector view — the frame draws that sector and nothing else, so a sector
+   * focus dims nothing and zooms to what is already on screen — but they read
+   * differently, and a button labelled "off" that left a breadcrumb standing
+   * would be saying that something is still isolated.
+   */
   const pickIsolation = (next: Isolation) => {
     if (next === isolation) return;
-    setIsolation(next);
-    setCandidate(null);
-    setAnnounce(
-      next === null
-        ? "isolation off — the whole sector"
-        : `isolated to arm ${next} — the ftype-${next} triskelion arm of sector ${sector}, ${armSize} cells; the hub belongs to no arm and is out of reach`
-    );
+    applyFocus(next === null ? ROOT : [sectorStep(sector), armStep(next)]);
   };
 
   // ── painting ────────────────────────────────────────────────────────────
@@ -1900,12 +2707,23 @@ export default function DrawPage() {
       // A preview is not a canvas. Gated here as well as at the board's
       // handlers, because the keyboard reaches this function by three routes.
       if (previewing) return;
+      // OUTSIDE THE FOCUS IS INERT — Illustrator's isolation rule, and the
+      // sentence `focus.seedMask` is written in. At the root this predicate is
+      // the constant `true`, so this line costs one call on the common path.
+      //
+      // SILENT, unlike the locked-layer refusal below, and that is a choice
+      // rather than an omission. A refusal announced here would fire on every
+      // application of a drag — sixty a second — and the two cases are not
+      // alike: a locked layer looks exactly like an unlocked one, whereas the
+      // cells this refuses are the ones visibly dulled on screen, and the
+      // sentence that says so was already said when the focus was entered.
+      if (!inFocus(i)) return;
       const target = paintTarget(compRef.current);
       if (!target.ok) {
         // Once per gesture, not once per application: a drag over a locked
         // layer would otherwise repeat the same sentence sixty times a second.
-        if (!refusedRef.current) {
-          refusedRef.current = true;
+        if (refusedRef.current === null) {
+          refusedRef.current = target.said;
           setAnnounce(target.said);
         }
         return;
@@ -1915,10 +2733,11 @@ export default function DrawPage() {
       // takes this rather than a bare id, so painting somewhere the brush may
       // not is not expressible; see `layers.Target`.
       const into = target.value;
-      const stamp = clipStamp(
-        brushStamp(canvas.surface, canvas.bands, i, shape),
-        keepCell
-      );
+      // The same call the ghost makes — see `specFor` — so what is previewed and
+      // what is laid are one function apart. A proposal's commit reaches this
+      // line once per seed, each with its own stamp and therefore its own
+      // `span`; see `commitProposal`.
+      const stamp = seedStamp(canvas.surface, canvas.bands, i, shape, keepCell);
       if (stamp.cells.length === 0) return;
       // Recomputed per application rather than taken from `effectiveBase`, so a
       // drag lays a gradient along its own path instead of one flat colour.
@@ -1953,13 +2772,21 @@ export default function DrawPage() {
       // The symmetry this application used, recorded before the indices are
       // forgotten. `groups` is null for a plain orbit — where there is no
       // grouping, not a grouping of one — so the orbit itself is the group,
-      // which is exactly the shape the animated export wants.
-      for (const g of stamp.groups ?? [stamp.cells]) {
-        if (g.length === 0) continue;
+      // which is exactly the shape the animated export wants. APPENDED, never
+      // merged: a gesture that applied the brush N times has N groups in the
+      // order it applied them, which is what `StrokeMark.groups` is and what
+      // `provenance.gestureLayers` reads to nest a mixed-orbit gesture.
+      for (const g of stampGroups(stamp)) {
         pendingGroups.current.push(g.map((c) => book.addr[c]));
       }
       // The gesture belongs to the layer it STARTED on, and `endStroke`
       // journals against that id rather than against wherever it ended.
+      //
+      // The layer's OWN recorded gesture is taken at the same moment, and only
+      // at the first application: `paintInto` strips it, so every later
+      // application would read the stripped value and the rung would have nothing
+      // for undo to write back. Read BEFORE the paint, for the same reason.
+      if (paintingInto.current === null) paintingWas.current = gestureOf(into.layer);
       paintingInto.current = into.layer.id;
       compRef.current = paintInto(compRef.current, into, edits);
       pending.current = mergeEdits(pending.current, edits);
@@ -1967,6 +2794,7 @@ export default function DrawPage() {
     },
     [
       previewing,
+      inFocus,
       canvas,
       book,
       keepCell,
@@ -1981,33 +2809,58 @@ export default function DrawPage() {
     ]
   );
 
+  /**
+   * Close the gesture, and say whether it JOURNALLED.
+   *
+   * The answer is the whole reason this returns anything. Three of the four ways
+   * out of here push no rung — a refusal the layer model already announced, a
+   * gesture whose edits were all no-ops, and a gesture that never named a layer
+   * — and from the outside they used to be indistinguishable from a commit.
+   * `commitProposal` is the caller that cannot live with that: it must not throw
+   * away N gathered seeds on the strength of a call that did nothing.
+   * `journalled` true means one rung was pushed and one undo takes it back;
+   * false means the plate is exactly as it was and there is nothing to undo.
+   * Every path says which, because a caller that guessed would be guessing about
+   * the journal.
+   *
+   * `said` is the sentence this call leaves standing — the layer model's own
+   * words for a refusal, the brush's for a gesture that moved nothing, the whole
+   * commit line for one that landed. Returned rather than left in `announce`
+   * because a caller that keeps its proposal has to be able to REPEAT the reason
+   * later, and `announce` is a shared channel that the next undo or tool change
+   * will have taken over by then. See `blocked`.
+   */
   const endStroke = useCallback(
-    (how: "stroke" | "commit" = "stroke") => {
+    (how: "stroke" | "commit" = "stroke"): { journalled: boolean; said: string } => {
       const edits = pending.current;
       const used = pendingEvents.current;
       const groups = pendingGroups.current;
       const into = paintingInto.current;
+      const was = paintingWas.current;
       const refused = refusedRef.current;
       pending.current = [];
       pendingEvents.current = 0;
       pendingGroups.current = [];
       paintingInto.current = null;
-      refusedRef.current = false;
+      paintingWas.current = {};
+      refusedRef.current = null;
       setLiveEvents(0);
       // The refusal has already been said, in the layer model's own words. A
       // second sentence here would either repeat it or, worse, contradict it
       // with "nothing changed" — which is true and useless.
-      if (refused && edits.length === 0) return;
+      if (refused !== null && edits.length === 0) {
+        return { journalled: false, said: refused };
+      }
       if (edits.length === 0 || into === null) {
         // Not silence. A gesture that changed nothing is the most confusing
         // thing an adjustment brush can do, and the reason is always the same
         // one worth teaching: there was no colour under it to transform.
-        setAnnounce(
+        const nothing =
           tool === "adjust"
             ? "nothing adjusted — the brush found no paint under it"
-            : "nothing changed"
-        );
-        return;
+            : "nothing changed";
+        setAnnounce(nothing);
+        return { journalled: false, said: nothing };
       }
       const mark: StrokeMark<Address> | undefined =
         groups.length === 0 ? undefined : { mode, groups };
@@ -2023,22 +2876,22 @@ export default function DrawPage() {
       setSession((s) =>
         journalAct(
           { ...s, composition: compRef.current },
-          [{ kind: "paint", layer: into, stroke }],
+          [{ kind: "paint", layer: into, stroke, gesture: { from: was } }],
           `painted ${edits.length} cells on ${name}`,
           used
         )
       );
       const verb =
         tool === "erase" ? "erased" : tool === "adjust" ? adjustName : "painted";
-      setAnnounce(
-        `${how === "commit" ? "committed — " : ""}${verb} ${edits.length} cell${
-          edits.length === 1 ? "" : "s"
-        } on ${name} with the ${mode}-fold brush${
-          band === null ? "" : `, band ${band}`
-        }${isolation === null ? "" : `, arm ${isolation}`} — ${
-          flattenComposition(compRef.current, book).size
-        } on the plate`
-      );
+      const landed = `${how === "commit" ? "committed — " : ""}${verb} ${
+        edits.length
+      } cell${edits.length === 1 ? "" : "s"} on ${name} with the ${mode}-fold brush${
+        band === null ? "" : `, band ${band}`
+      }${isolation === null ? "" : `, arm ${isolation}`} — ${
+        flattenComposition(compRef.current, book).size
+      } on the plate`;
+      setAnnounce(landed);
+      return { journalled: true, said: landed };
     },
     [tool, adjustName, mode, band, isolation, book]
   );
@@ -2124,7 +2977,7 @@ export default function DrawPage() {
       }
       disarm();
       setShapeDrag(null);
-      setCandidate(null);
+      setProposal(EMPTY_PROPOSAL);
       setHover(null);
       const index = kind === "replay" ? 0 : steps;
       setRewind({
@@ -2346,10 +3199,20 @@ export default function DrawPage() {
       // `journalAct` APPLIES as well as records, and the effect on `compRef`
       // puts the ref back in step on the next render — so there is exactly one
       // place the composition is written and no chance of the two disagreeing.
+      // `gesture.from` is read here rather than captured earlier because this
+      // route applies nothing before journalling: the layer still carries
+      // whatever gesture the paint is about to invalidate.
       setSession((s) =>
         journalAct(
           { ...s, composition: compRef.current },
-          [{ kind: "paint", layer: into.id, stroke }],
+          [
+            {
+              kind: "paint",
+              layer: into.id,
+              stroke,
+              gesture: { from: gestureOf(into) },
+            },
+          ],
           said(edits.length),
           spent
         )
@@ -2540,48 +3403,202 @@ export default function DrawPage() {
 
   // ── propose and commit ──────────────────────────────────────────────────
 
+  /**
+   * One more application onto the standing proposal. NOTHING TOUCHES THE PLATE.
+   *
+   * The board calls this on the press and again on every cell a propose-mode
+   * drag enters, which is the same event stream `paintAt` gets in paint mode —
+   * that symmetry is the feature. `proposeSeed` drops a repeat of a seed already
+   * held and hands back the same array, so a finger resting on a cell boundary
+   * does not even cause a render; see `propose.ts` for why a duplicate would be
+   * worse than useless.
+   *
+   * The hover ghost is cleared because during a drag the pointer IS the gesture,
+   * and a stale hover from before the press would be a second ghost claiming to
+   * be somewhere the finger is not.
+   */
   const propose = useCallback(
     (i: number) => {
       if (previewing) return;
+      // The same guard `paintAt` carries, and it has to be here as well rather
+      // than only at the commit: a proposal is a promise about what a commit
+      // will lay, so gathering a seed the brush may not use would show a ghost
+      // that commits to nothing.
+      if (!inFocus(i)) return;
       noteSector(i);
-      setCandidate(i);
+      setProposal((p) => proposeSeed(p, i));
       setCursor(i);
       setHover(null);
     },
-    [previewing, noteSector]
+    [previewing, inFocus, noteSector]
   );
 
-  const commitCandidate = useCallback(() => {
-    if (candidate === null || previewing) return;
-    paintAt(candidate);
-    endStroke("commit");
-    setCandidate(null);
-  }, [candidate, previewing, paintAt, endStroke]);
+  /**
+   * A commit was asked for and laid nothing. Say why, and keep the work.
+   *
+   * ONE DOOR for every way that can happen — a locked target, a brush that would
+   * change no cell, a tap the browser took away — so the sentence and the "still
+   * standing" clause can never come apart. The proposal is deliberately NOT
+   * cleared here: that is the whole of the fix, and `commitProposal`'s header
+   * says what clearing it used to cost.
+   */
+  const blockProposal = useCallback(
+    (why: string) => {
+      // There is no such thing as a blocked EMPTY proposal, and the guard is not
+      // only tidiness: `EMPTY_PROPOSAL` is one shared constant, so storing it
+      // here would make `blocked === proposal` true for every empty proposal
+      // afterwards — the identity trick the whole arrangement rests on, defeated
+      // by the one value that is not unique.
+      if (proposal.length === 0) return;
+      setBlocked({ proposal, why });
+      // `said` renders `blocked.why` while the proposal stands, so this is not
+      // what the user hears now — it is what `announce` should hold once the
+      // proposal is gone, so the last thing said stays true after a drop.
+      setAnnounce(why);
+    },
+    [proposal]
+  );
 
-  const dropCandidate = useCallback(() => {
-    if (candidate === null) return;
-    setCandidate(null);
-    setAnnounce("candidate dropped");
-  }, [candidate]);
+  /**
+   * The whole proposal, laid down as ONE RUNG OF THE JOURNAL.
+   *
+   * This is the decision the whole feature turns on, so it is worth saying
+   * plainly what makes it hold. `paintAt` journals NOTHING: it applies the brush
+   * into `compRef` and accumulates the gesture in refs — the merged edits, the
+   * colouring events spent, and one `StrokeMark` group per application.
+   * `endStroke` is the only function on this page that pushes a paint rung, and
+   * it is called exactly ONCE here, after the loop. So a five-seed proposal is
+   * one rung and one undo takes back all five, rather than five rungs and a
+   * lottery about how many presses of ⌘Z put the plate back.
+   *
+   * The loop is also what keeps the record honest in the other two ways. Each
+   * seed gets its own `brushStamp`, so each keeps its own `span` and its own
+   * scheme positions — merging the seeds into one stamp would collapse those and
+   * repaint the proposal in hues the ghost never showed. And each pushes its own
+   * entry into `pendingGroups`, in the order applied, which is exactly what
+   * `StrokeMark.groups` is defined to be and what `provenance.gestureLayers`
+   * reads to decide whether the gesture is one layer or a parent with a child per
+   * orbit. No merged super-group is invented anywhere.
+   *
+   * Seeds whose applications change nothing simply contribute nothing: `paintAt`
+   * returns before spending an event or pushing a group when the stamp is empty
+   * or the edits are all no-ops, and `endStroke` declines to journal a gesture
+   * with no edits at all. So a proposal entirely over cells the brush cannot
+   * touch commits nothing and says so, rather than pushing an empty rung.
+   *
+   * ── A COMMIT THAT LAID NOTHING DOES NOT SPEND THE PROPOSAL ──────────────
+   *
+   * This used to clear the proposal unconditionally, and on a locked target layer
+   * that was the worst outcome available: `paintAt` refuses all N seeds, the live
+   * region says "L2 is locked", and the N gathered applications are gone — with
+   * no rung, so ⌘Z cannot bring them back either. The user unlocks the layer and
+   * finds there is nothing left to commit.
+   *
+   * So the proposal is spent ONLY on the strength of `endStroke`'s answer, and
+   * `dropProposal`'s discipline applies to every other outcome: say plainly that
+   * the plate is unchanged and that the work is still standing, rather than
+   * leaving the user to infer it from a sentence about a lock. `blockProposal`
+   * is that sentence; see `said` for why it cannot simply go into `announce`.
+   *
+   * ── AND IT IS GATED THE SAME WAY THE BUTTON IS ─────────────────────────
+   *
+   * `proposalCommits === 0` disables the COMMIT button — an adjustment proposal
+   * over bare tiling really would change nothing — but the button is one of three
+   * doors into this function. The other two are a tap on the ghost and Enter on a
+   * held seed, and until now neither was gated at all, so the gesture routes did
+   * something the visible control refused to do: spend the proposal on a commit
+   * that laid nothing. The gate is here, at the one place all three arrive, which
+   * is also the only place it cannot be forgotten by a fourth caller.
+   */
+  const commitProposal = useCallback(() => {
+    if (proposal.length === 0 || previewing) return;
+    // The same number `proposalCommits` reports and the button is disabled on,
+    // recomputed rather than shared because that memo is declared below this
+    // callback. It is a union over a handful of orbits, once per commit.
+    if (unionCells(proposalSpecs.map((s) => s.cells)).length === 0) {
+      blockProposal(
+        tool === "adjust"
+          ? "nothing to commit — the brush found no paint under any of these applications"
+          : "nothing to commit — the brush would change no cell here"
+      );
+      return;
+    }
+    for (const seed of proposal) paintAt(seed);
+    const end = endStroke("commit");
+    if (end.journalled) {
+      setProposal(EMPTY_PROPOSAL);
+      setBlocked(null);
+      return;
+    }
+    // `endStroke` hands back the words it left standing — the layer model's own
+    // for a refusal, the brush's for a gesture that moved nothing. This adds the
+    // half they cannot know: the proposal is still there.
+    blockProposal(end.said);
+  }, [proposal, proposalSpecs, previewing, tool, paintAt, endStroke, blockProposal]);
+
+  /**
+   * The browser took the commit tap away before the finger came up.
+   *
+   * `DrawBoard.proposeRelease` lists the four ordinary ways that happens — palm
+   * rejection, an OS edge gesture, a second contact starting a pinch, a
+   * long-press menu — and every one of them is a thing a hand does on a phone,
+   * which is the platform propose mode exists for. The proposal is untouched, so
+   * the only failure available here is silence: a tap on the ghost that lays
+   * nothing and says nothing reads as a control that stopped working.
+   */
+  const commitCancelled = useCallback(() => {
+    blockProposal(
+      "the commit tap was cancelled — the browser took the pointer before your finger came up"
+    );
+  }, [blockProposal]);
+
+  /**
+   * Drop it. No plate change, no rung, nothing to undo — which is the sentence
+   * the live region says, because "dropped" alone leaves open whether the work
+   * went somewhere recoverable.
+   */
+  const dropProposal = useCallback(() => {
+    if (proposal.length === 0) return;
+    const n = proposal.length;
+    setProposal(EMPTY_PROPOSAL);
+    setAnnounce(
+      `proposal dropped — ${n} application${
+        n === 1 ? "" : "s"
+      } discarded; the plate is unchanged and there is nothing to undo`
+    );
+  }, [proposal]);
 
   const pickDragMode = (next: DragMode) => {
     if (next === dragMode) return;
     setDragChoice(next);
-    setCandidate(null);
+    setProposal(EMPTY_PROPOSAL);
     setAnnounce(
       next === "propose"
-        ? "drag proposes a candidate; tap it to commit"
+        ? "drag gathers a proposal; tap it or press Enter to commit it as one gesture"
         : "drag paints continuously"
     );
   };
 
+  /**
+   * Choose a tool. Writes the SELECTION, never the momentary override.
+   *
+   * Compared against `pickedTool` rather than against `tool`, and the difference
+   * is reachable: with the momentary eraser held, `tool` is already "erase", so
+   * comparing against it would make clicking the ERASE button a no-op — the one
+   * click whose whole meaning is "make this one stick". Against the selection it
+   * does what it says, and the release then reveals erase instead of undoing it.
+   */
   const pickTool = useCallback(
     (next: Tool) => {
-      if (next === tool) return;
-      setTool(next);
-      setAnnounce(`${next} tool — ${TOOL_LABEL[next]}`);
+      if (next === pickedTool) return;
+      setPickedTool(next);
+      setAnnounce(
+        eraseHeld && next !== "erase"
+          ? `${next} tool — ${TOOL_LABEL[next]}; erase is held, so it takes over when Option is released`
+          : `${next} tool — ${TOOL_LABEL[next]}`
+      );
     },
-    [tool]
+    [pickedTool, eraseHeld]
   );
 
   /**
@@ -2653,11 +3670,16 @@ export default function DrawPage() {
       // gesture is reachable from the keyboard: Enter anchors, the cluster
       // stretches, Enter lays it.
       setShapeDrag((d) => (d === null ? null : { ...d, at: next }));
-      if (shapeTool === "free" && dragMode === "propose") setCandidate(next);
-      else setHover(next);
+      // The HOVER ghost follows the cursor in both drag modes now. It used to
+      // move the candidate in propose mode, which was right while a proposal was
+      // one cell — arrowing moved the one thing that could be committed. A
+      // proposal is a set that only grows by an explicit Enter, so arrowing must
+      // not add to it; what the cursor wants is the ghost of the application
+      // Enter WOULD add, and that is exactly the hover ghost.
+      setHover(next);
       if (said !== null) setAnnounce(said);
     },
-    [dragMode, noteSector, shapeTool]
+    [noteSector]
   );
 
   const onArrow = useCallback(
@@ -2777,8 +3799,10 @@ export default function DrawPage() {
       if (start < 0) return;
       noteSector(start);
       setCursor(start);
-      if (dragMode === "propose") setCandidate(start);
-      else setHover(start);
+      // The first Enter only lands the cursor and its ghost — in both modes now,
+      // because in propose mode Enter is the ADD gesture and adding a seed the
+      // user has not yet seen a ghost of would be proposing blind.
+      setHover(start);
       return;
     }
     if (shapeTool !== "free") {
@@ -2793,7 +3817,13 @@ export default function DrawPage() {
       return;
     }
     if (dragMode === "propose") {
-      if (candidate === cursor) commitCandidate();
+      // Enter on a cell the proposal ALREADY holds commits the whole set; Enter
+      // anywhere else adds that cell to it. That is the one-candidate rule
+      // generalised rather than replaced — pressing Enter twice on one cell
+      // still proposes then commits — and it gives the keyboard the same two
+      // gestures the pointer has, where a tap inside the standing ghost commits
+      // and a tap outside it proposes.
+      if (proposalHolds(proposal, cursor)) commitProposal();
       else propose(cursor);
       return;
     }
@@ -2805,8 +3835,8 @@ export default function DrawPage() {
     cursor,
     canvas,
     dragMode,
-    candidate,
-    commitCandidate,
+    proposal,
+    commitProposal,
     propose,
     paintAt,
     endStroke,
@@ -2819,7 +3849,7 @@ export default function DrawPage() {
     (next: ShapeTool) => {
       setShapeTool(next);
       setShapeDrag(null);
-      setCandidate(null);
+      setProposal(EMPTY_PROPOSAL);
       setAnnounce(
         next === "free"
           ? "free brush — every cell the pointer crosses is an application"
@@ -2934,18 +3964,35 @@ export default function DrawPage() {
     }
   }, []);
 
+  /**
+   * The manual zoom. Still the only public way to set the factor by hand, and
+   * still the only place the clamp lives.
+   *
+   * It CANCELS a drill-in travel first, which is what keeps the "one writer"
+   * claim true: the tween and the stepper write the same state, so the last
+   * thing asked for has to be the thing that survives. A drill-in that a person
+   * zooms out of mid-flight stays where they put it, and the focus — the
+   * dimming, the breadcrumb, the inert outside — is untouched by that. THE ZOOM
+   * AND THE FOCUS ARE DELIBERATELY NOT LOCKED TOGETHER: the owner asked for
+   * isolate to zoom, not for zoom to become unavailable while isolated.
+   *
+   * The readout is rounded where it is displayed rather than here, because a
+   * drill-in lands on whatever factor makes the focused cells fill the frame and
+   * rounding the STATE would move the picture off the thing it just framed.
+   */
   const setZoomTo = useCallback(
     (z: number) => {
+      stopEasing();
       const next = Math.min(ZOOM_MAX, Math.max(1, z));
       setZoom(next);
       if (next === 1) setCentre(null);
       setAnnounce(
         next === 1
           ? "zoom 1× — the whole figure"
-          : `zoom ${next}× — hold Space and drag to pan`
+          : `zoom ${Math.round(next * 10) / 10}× — hold Space and drag to pan`
       );
     },
-    []
+    [stopEasing]
   );
 
   /**
@@ -2954,14 +4001,147 @@ export default function DrawPage() {
    */
   const onPan = useCallback(
     (dx: number, dy: number) => {
+      // A hand on the plate outranks a travel that is still arriving; without
+      // this the tween would keep writing the centre out from under the drag.
+      stopEasing();
       panned.current = true;
       setCentre((c) => ({
         x: (c?.x ?? canvas.geom.width / 2) - dx,
         y: (c?.y ?? canvas.geom.height / 2) - dy,
       }));
     },
-    [canvas]
+    [canvas, stopEasing]
   );
+
+  // ── Option / Alt: the momentary eraser ──────────────────────────────────
+  //
+  // THE CONFLICT. Option was already taken. `shapeStampFor` reads an `alt` flag
+  // and expands a line or a ring symmetrically about its anchor, `DrawBoard`
+  // reads it off the pointer event on every move so that letting go mid-drag
+  // un-expands the figure under the finger, and the window key handler has a
+  // bare `if (e.altKey) return` so that a stray Option can never fire a letter.
+  // All three of those stay.
+  //
+  // THE RULE, in the owner's words: "The erase should only work if you press
+  // opt/alt with no mouse down or drag. So if all you do is click and hold for
+  // even a fraction of a second and then hold option, it sets the centroid and
+  // scales symmetrically. Hold opt/alt the split second before clicking and it
+  // erases."
+  //
+  // So the meaning is fixed by ORDER, decided once, at the keydown, from
+  // `pointers`. `shortcuts.altDown` is that decision and it is pure, which is
+  // the only reason any of this is testable at all — vitest runs `environment:
+  // "node"` here, so nothing that needs a DOM can be asserted.
+  //
+  // WHAT IS NOT DONE HERE, and why. The hold is not cancelled when a press
+  // starts or ends; it lasts until the key comes up, "including across a
+  // subsequent press and drag", so a single Option hold can erase several
+  // gestures. And it is not converted into a tool CHANGE — see `pickedTool`.
+
+  /**
+   * The one writer of the Alt state, ref and render alike.
+   *
+   * Announces only on the edge that matters — whether the eraser is in force —
+   * so a hold that latches "modifier" says nothing HERE. That is right for the
+   * modifier it is named for: the shape modifier has a visible effect on the
+   * figure under the finger and has never announced itself, whereas arming a
+   * destructive brush from a key with no on-screen control is exactly the thing a
+   * live region is for.
+   *
+   * It is NOT right for the inert `brushOff` hold, which also latches "modifier"
+   * and has no figure and no effect to be its own announcement. That decline is
+   * said at the keydown, where the reason is still in hand; `shortcuts.
+   * altDeclined` is the predicate and the note there is the argument. This edge
+   * test is deliberately left alone rather than taught about a third case: it
+   * asks one question about a destructive tool and answers it the same way from
+   * everywhere, which is the property the whole arrangement rests on.
+   */
+  const applyAlt = useCallback(
+    (next: AltState) => {
+      const was = altRef.current;
+      altRef.current = next;
+      if (was.erasing === next.erasing) return;
+      setEraseHeld(next.erasing);
+      setAnnounce(
+        next.erasing
+          ? `erase held — ${shapeTool} shape, ${mode}-fold brush; release Option for the ${pickedTool} tool`
+          : `erase released — ${pickedTool} tool`
+      );
+    },
+    [shapeTool, mode, pickedTool]
+  );
+
+  /**
+   * The pointer census, and the last line of defence against a stuck eraser.
+   *
+   * CAPTURE PHASE, on the window, so this counts a press whatever else the page
+   * does with it — a control that stops propagation, a menu that swallows the
+   * click, the canvas releasing pointer capture on the way down.
+   *
+   * The second half is the guard. `PointerEvent.altKey` is the OS's own answer
+   * to "is Option held", taken at the instant of the press, so a press that
+   * arrives with it FALSE while this page believes the eraser is armed is proof
+   * the page is wrong — a keyup that went to another window, most likely. The
+   * hold is dropped, and the press is swallowed rather than let through.
+   *
+   * Swallowing it is the deliberate part. React attaches its own listeners at
+   * the root container, which is inside the window, so `stopPropagation` here
+   * means the board never sees this press at all: no stroke, no proposal, no
+   * tap toward a double-tap. It costs one ignored click in a state that should
+   * not be reachable, and it buys an absolute statement — NO ERASE GESTURE CAN
+   * BEGIN UNLESS THE POINTER EVENT ITSELF REPORTS OPTION HELD. Without it the
+   * disarm would still be correct but a render late, because `paintAt` reads
+   * `tool` from the closure it was built with, and this press would erase.
+   *
+   * THE CENSUS OWNS ITS OWN RECOVERY, in the same effect and not in the keyboard
+   * one, because a census that depends on somebody else's listener for its only
+   * way out of a wrong answer is a census with a bug waiting in the next edit.
+   * Press and hold on a rail button, Alt-Tab away, let go over there: the
+   * `pointerup` is delivered to the other window and never to this one, the id
+   * stays in the set, and every later `altDown` reads "a pointer is already down"
+   * and refuses to arm the momentary eraser — for the rest of the session. The
+   * hold that leaks is exactly the hold `blur` fires for, so `blur` is where the
+   * set is emptied, with `visibilitychange` behind it for the same reason
+   * `applyAlt(altLost())` has both: a page can be hidden without its window
+   * losing focus. Emptying is safe rather than merely convenient — a press that
+   * really is still down will announce itself again on its next `pointermove`
+   * only if it is on the canvas, but its `pointerup` still arrives and
+   * `delete` of an absent id is a no-op, so the worst case is one keydown read as
+   * "nothing pressed" while the page is not even in front of the user.
+   */
+  useEffect(() => {
+    const down = (e: PointerEvent) => {
+      pointers.current.add(e.pointerId);
+      if (e.altKey || altRef.current.hold === null) return;
+      const armed = altRef.current.erasing;
+      applyAlt(altLost());
+      if (armed) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    const up = (e: PointerEvent) => {
+      pointers.current.delete(e.pointerId);
+    };
+    const forget = () => {
+      pointers.current.clear();
+    };
+    const onHidden = () => {
+      if (document.visibilityState === "hidden") forget();
+    };
+    window.addEventListener("pointerdown", down, true);
+    window.addEventListener("pointerup", up, true);
+    window.addEventListener("pointercancel", up, true);
+    window.addEventListener("blur", forget);
+    document.addEventListener("visibilitychange", onHidden);
+    return () => {
+      window.removeEventListener("pointerdown", down, true);
+      window.removeEventListener("pointerup", up, true);
+      window.removeEventListener("pointercancel", up, true);
+      window.removeEventListener("blur", forget);
+      document.removeEventListener("visibilitychange", onHidden);
+    };
+  }, [applyAlt]);
 
   /**
    * Every shortcut, in one listener on the window.
@@ -2981,6 +4161,16 @@ export default function DrawPage() {
    */
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // BEFORE EVERY GUARD BELOW, including the ones that return.
+      //
+      // If this page believes Option is held and a keystroke arrives saying it
+      // is not, it is not — and dropping that belief must not depend on where
+      // the focus happens to be or on which of the six early returns this key
+      // takes. This is the cheap half of the stuck-modifier defence and it
+      // fires on the very next key the user presses; `blur` is the half that
+      // fires without them pressing anything.
+      if (!e.altKey && altRef.current.hold !== null) applyAlt(altLost());
+
       const el = document.activeElement;
       // A RANGE is not a text field. It has to swallow the arrows and Home/End,
       // which it does natively, but Escape has to keep closing the preview the
@@ -3016,7 +4206,7 @@ export default function DrawPage() {
           disarm("cancelled — nothing was changed");
           return;
         }
-        // Before the candidate and the anchored drag, and it cannot collide
+        // Before the proposal and the anchored drag, and it cannot collide
         // with either: both are dropped when a preview opens and neither can be
         // started while one stands.
         if (rewind !== null) {
@@ -3032,7 +4222,17 @@ export default function DrawPage() {
           setAnnounce(`${shapeTool} cancelled`);
           return;
         }
-        dropCandidate();
+        if (proposal.length > 0) {
+          dropProposal();
+          return;
+        }
+        // LAST, and it is the outermost thing there is. Escape unwinds from the
+        // inside out — menu, confirm, preview, anchored drag, proposal — and the
+        // focus is the only one of them that is not a transient: it is where you
+        // ARE rather than something you are part-way through, so nothing should
+        // be able to reach it while anything else is standing. One level per
+        // press, exactly as the double-tap does; see `focus.exit`.
+        drillOut();
         return;
       }
 
@@ -3044,8 +4244,49 @@ export default function DrawPage() {
         }
         return;
       }
-      // Option is the shape modifier, read off the pointer event. It is never a
-      // shortcut prefix, so a stray Alt must not fire a letter.
+      // OPTION / ALT DOWN — the one place the meaning of this hold is decided.
+      //
+      // Reached only after the text-field guard above, which is why holding
+      // Option while the hex input has focus arms nothing: a destructive brush
+      // that arms while you are typing a colour would be indefensible, and the
+      // release still disarms because `onUp` handles Alt outside every guard.
+      //
+      // `brushOff` covers the three states in which the plate is not editable.
+      // A hold latched there stays inert for its whole life rather than going
+      // live the moment the panel closes under a finger that never let go.
+      //
+      // AND IT SAYS SO. `applyAlt` announces on the `erasing` edge, and this
+      // decline has none — it substitutes the shape modifier, so nothing changes
+      // and nothing was said. That is right for the `pointerDown` decline, where
+      // the figure under the finger is the announcement, and wrong here, where
+      // there is no figure and no visible effect at all: a key that does nothing
+      // and says nothing is indistinguishable from a key that was not received.
+      // `altDeclined` carries the distinction; the sentence names WHICH of the
+      // three, because "close it and try again" is only actionable if the user
+      // knows what to close.
+      if (e.key === "Alt") {
+        const ctx = {
+          pointerDown: pointers.current.size > 0,
+          brushOff: previewing || helpOpen || saveOpen,
+        };
+        const declined = altDeclined(altRef.current, ctx);
+        applyAlt(altDown(altRef.current, ctx));
+        if (declined) {
+          setAnnounce(
+            `erase not armed — ${
+              previewing
+                ? "a preview is standing"
+                : helpOpen
+                ? "the help panel is open"
+                : "the save menu is open"
+            }, so the plate cannot be edited. Release Option and press it again once the plate is back`
+          );
+        }
+        return;
+      }
+      // Option is the shape modifier, read off the pointer event, and — since
+      // this change — the momentary eraser as well. Neither is a shortcut
+      // prefix, so a stray Alt must not fire a letter.
       if (e.altKey) return;
 
       // `?` is Shift and the slash key on a US layout, and browsers disagree
@@ -3129,7 +4370,13 @@ export default function DrawPage() {
         return;
       }
       if (k === "t") {
-        pickTool(TOOLS[(TOOLS.indexOf(tool) + 1) % TOOLS.length]);
+        // The SELECTION cycles, not the tool in force. Unreachable while the
+        // momentary eraser is held — `if (e.altKey) return` above sees to that
+        // — so the two are provably equal wherever this line runs; written
+        // against `pickedTool` anyway, because a reader should not have to
+        // prove that to know the cycle cannot be knocked out of step by a
+        // modifier.
+        pickTool(TOOLS[(TOOLS.indexOf(pickedTool) + 1) % TOOLS.length]);
         return;
       }
       if (k === "f") {
@@ -3160,6 +4407,30 @@ export default function DrawPage() {
       }
       if (k === "r") {
         pickRelief(!reliefOn);
+        return;
+      }
+      // DRILL IN and DRILL OUT, on the two letters nearest their own words.
+      //
+      // The keyboard path exists because every other control that narrows what
+      // the brush may touch — the three scope buttons, the four arm buttons — is
+      // a real button with a real label, and a drill-in reachable only by
+      // double-tapping the canvas would be the first one here that a keyboard
+      // cannot work. The breadcrumb is the other half: it is the way OUT that a
+      // Tab key can find, and it names every level rather than only the last.
+      //
+      // NOW LISTED IN THE HELP PANEL, under a group of their own — the gap the
+      // previous note here asked to have closed. `lib/shortcuts.ts` says why
+      // "focus" is not a sub-heading of "view". They are also still named in
+      // the breadcrumb's title text and in the sentence the focus announces,
+      // which is how they were discoverable before the panel caught up.
+      if (k === "i") {
+        drillIn();
+        return;
+      }
+      if (k === "o") {
+        if (focus.length === 0) {
+          setAnnounce("the whole plate — there is nothing to step out of");
+        } else drillOut();
         return;
       }
       // The two previews. P is the transport — open it, and then play/pause it
@@ -3219,6 +4490,22 @@ export default function DrawPage() {
      * tap was the paint. Nothing was given up.
      */
     const onUp = (e: KeyboardEvent) => {
+      // ALT FIRST, above every guard in this function, and unconditionally.
+      //
+      // The arm is refused in a text field; the DISARM never is. A release that
+      // could be swallowed by wherever the focus drifted to is a release that
+      // sometimes leaves a destructive brush on, and "sometimes" is the whole
+      // failure mode. There is no state to inspect and no branch: `altUp` is
+      // the resting state from anywhere.
+      if (e.key === "Alt") {
+        applyAlt(altUp());
+        return;
+      }
+      // The same evidence the keydown path uses, on the way up as well. A
+      // chord ending on a non-Alt key while we still believe Option is held
+      // says otherwise.
+      if (!e.altKey && altRef.current.hold !== null) applyAlt(altLost());
+
       if (e.key !== " ") return;
       const el = document.activeElement;
       if (
@@ -3236,21 +4523,55 @@ export default function DrawPage() {
       panned.current = false;
     };
 
-    // A window that loses focus mid-hold would keep Space down forever.
-    const onBlur = () => setSpaceHeld(false);
+    /**
+     * A window that loses focus mid-hold would keep Space down forever — and,
+     * since this change, a destructive brush on forever.
+     *
+     * THIS IS THE PRIMARY GUARD, not a fallback. Alt-Tab is the ordinary way to
+     * leave a browser window and it is done WITH THE KEY DOWN: the OS moves the
+     * focus, the keyup is delivered to whatever the user landed on, and this
+     * page is never told. Come back and the hand is holding nothing while the
+     * page believes otherwise. `blur` fires on the way out, before any of that
+     * can matter, so the eraser is already gone when the window is returned to.
+     */
+    const onBlur = () => {
+      setSpaceHeld(false);
+      applyAlt(altLost());
+    };
+
+    /**
+     * And the same on a tab switch.
+     *
+     * `blur` covers ⌘Tab and Alt-Tab on every browser measured, and covers
+     * ⌘Shift-[ / Ctrl-Tab too — so this is belt and braces rather than a case
+     * that was seen to leak. It is here because the failure it guards against
+     * is a DESTRUCTIVE tool left armed with nothing holding it, which is worth
+     * two listeners, and because `visibilitychange` catches the one shape of
+     * focus loss `blur` is not specified to: a page hidden without the window
+     * itself losing focus.
+     */
+    const onHide = () => {
+      if (document.visibilityState === "hidden") applyAlt(altLost());
+    };
 
     window.addEventListener("keydown", onKey);
     window.addEventListener("keyup", onUp);
     window.addEventListener("blur", onBlur);
+    document.addEventListener("visibilitychange", onHide);
     return () => {
       window.removeEventListener("keydown", onKey);
       window.removeEventListener("keyup", onUp);
       window.removeEventListener("blur", onBlur);
+      document.removeEventListener("visibilitychange", onHide);
     };
   }, [
     doUndo,
     doRedo,
-    dropCandidate,
+    dropProposal,
+    proposal,
+    focus,
+    drillIn,
+    drillOut,
     helpOpen,
     closeHelp,
     openHelp,
@@ -3271,7 +4592,9 @@ export default function DrawPage() {
     reading,
     reliefOn,
     band,
-    tool,
+    pickedTool,
+    applyAlt,
+    previewing,
     viewMode,
     sector,
     pickView,
@@ -4306,26 +5629,80 @@ export default function DrawPage() {
   /** Cells in the FRAME, and cells on the plate. They differ in sector view. */
   const total = canvas.shown.length;
   const modelTotal = hex.cells.length;
-  const live = candidateSpec ?? preview;
-  const reach = live === null ? null : live.cells.length + live.inert.length;
+  /**
+   * What a standing proposal comes to, in cells.
+   *
+   * The UNION over the applications, not the sum of them: two seeds of one orbit
+   * share every cell, and a proposal that reported 12 where the plate would
+   * change 6 would be counting the gesture rather than the drawing. `commits` is
+   * the cells that would actually take colour — which for the adjustment brush
+   * already excludes the inert ones, exactly as the one-cell candidate's count
+   * did — and `reach` adds back what the brush merely touches.
+   */
+  const proposalCommits = useMemo(
+    () => unionCells(proposalSpecs.map((s) => s.cells)).length,
+    [proposalSpecs]
+  );
+  const proposalReach = useMemo(
+    () => unionCells(proposalSpecs.flatMap((s) => [s.cells, s.inert])).length,
+    [proposalSpecs]
+  );
+  const standing = proposalSpecs.length > 0;
+  const reach = standing
+    ? proposalReach
+    : preview === null
+    ? null
+    : preview.cells.length + preview.inert.length;
   /**
    * What the live region says.
    *
-   * A standing candidate speaks for itself, DERIVED rather than pushed into
+   * A standing proposal speaks for itself, DERIVED rather than pushed into
    * `announce` from an effect — the proposal changes when the brush changes as
    * much as when the finger moves, and a derived string cannot fall out of step
    * with the ghost the way a stored one can. `announce` carries everything else:
    * strokes, undo, exports, tool changes, and the commit that clears the
-   * candidate.
+   * proposal.
+   *
+   * It names the count of APPLICATIONS as well as of cells, because those are
+   * now two different numbers and the first one is the one that decides how many
+   * steps of the progression the commit will spend. It also says "one gesture",
+   * which is the promise the commit has to keep: one rung, one undo.
+   *
+   * ── A REFUSED COMMIT HAS TO GET PAST THE STANDING SENTENCE ─────────────
+   *
+   * The standing branch MASKS `announce`, which is right while nothing has gone
+   * wrong and wrong the moment something has: a commit that was refused says why
+   * — "L2 is locked", in the layer model's own words — and now that a refused
+   * commit keeps its proposal, that sentence would be spoken to nobody. So a
+   * refusal that is still about THIS proposal leads, and the standing sentence
+   * follows it unchanged rather than being replaced, because what stands and how
+   * to act on it did not stop being true.
+   *
+   * THE REASON IS READ OFF `blocked` AND NOT OFF `announce`. Splicing the live
+   * `announce` into this template was the first attempt and it rented a channel
+   * that moves: `doUndo` does not clear the proposal, so ⌘Z after a refusal
+   * spliced "undid painted 12 cells" into "…nothing was laid and there is
+   * nothing to undo", a contradiction inside one aria-live sentence. `blocked`
+   * freezes the words with the proposal they are about, and both fall away
+   * together the moment that proposal changes.
    */
+  const standingSaid = !standing
+    ? ""
+    : `${proposalSpecs.length} application${
+        proposalSpecs.length === 1 ? "" : "s"
+      } proposed, last at cell ${
+        proposalSpecs[proposalSpecs.length - 1].seed
+      } — ${proposalReach} cell${
+        proposalReach === 1 ? "" : "s"
+      } under the ${tool} brush; tap the ghost or press Enter to commit them as one gesture, Escape to drop`;
   const said =
     dragSpec !== null
       ? `${dragSpec.said} — release to lay it, Escape to cancel`
-      : candidateSpec === null
+      : !standing
       ? announce
-      : `candidate proposed at cell ${candidateSpec.seed} — ${
-          candidateSpec.cells.length + candidateSpec.inert.length
-        } cells under the ${tool} brush; tap it or press Enter to commit, Escape to drop`;
+      : blocked?.proposal === proposal
+      ? `${blocked.why} — nothing was laid and there is nothing to undo; the proposal still stands. ${standingSaid}`
+      : standingSaid;
 
   const schemeGradient = `linear-gradient(90deg, ${tape
     .map((s, k) => `${s.hex} ${(100 * k) / Math.max(tape.length - 1, 1)}%`)
@@ -4550,15 +5927,21 @@ export default function DrawPage() {
           <section className={styles.section}>
             <div className={styles.sectionHead}>
               <h2 className={styles.sectionTitle}>Brush symmetry</h2>
+              {/* The group the brush IS under, which is `effScope` and the
+                  focused arm — not the scope BUTTON. Drilling into a sector
+                  changes the group without the button moving, and a readout
+                  that named the button would say D₆ over a plate whose brush is
+                  one sector's D₃. Also shorter than what stood here, because
+                  the sector view no longer needs a branch of its own: it forces
+                  `effScope` to `sector`, so it falls out of the same three
+                  cases. */}
               <span className={styles.sectionMeta}>
-                {viewMode === "sector"
-                  ? isolation === null
-                    ? `sector ${sector} · D₃`
-                    : `arm ${isolation} · ⟨m_${isolation}⟩`
-                  : scope === "hexagon"
+                {isolation !== null
+                  ? `arm ${isolation} · ⟨m_${isolation}⟩`
+                  : effScope === "hexagon"
                   ? "D₆ subgroups"
-                  : scope === "sector"
-                  ? `sector ${sector} · D₃`
+                  : effScope === "sector"
+                  ? `sector ${focusedSector(focus) ?? sector} · D₃`
                   : "C₆ × D₃"}
               </span>
             </div>
@@ -4638,13 +6021,25 @@ export default function DrawPage() {
                     </button>
                   ))}
                 </div>
+                {/* The hint describes `effScope` for the same reason the meta
+                    does. The one case worth saying out loud is the new one: the
+                    button says hexagon and the FOCUS has made the brush local,
+                    which is a state the button cannot show. */}
+                {scope === "hexagon" && effScope === "sector" && (
+                  <p className={styles.hint}>
+                    <b>Drilled into sector {focusedSector(focus)}.</b> The scope
+                    button still says <i>hexagon</i>, and it will be D₆ again the
+                    moment you step back out — but inside a sector the brush is
+                    that sector&rsquo;s own D₃. Press <b>O</b> or Escape to leave.
+                  </p>
+                )}
                 <p className={styles.hint}>
-                  {scope === "hexagon" ? (
+                  {effScope === "hexagon" ? (
                     <>
                       <b>D₆ — the whole plate.</b> Its three spine mirrors each
                       reflect <i>two opposite sectors at once</i>.
                     </>
-                  ) : scope === "sector" ? (
+                  ) : effScope === "sector" ? (
                     <>
                       <b>The sector&rsquo;s own D₃</b>, in sector{" "}
                       <b>{sector}</b> alone — three medians and a 120° turn
@@ -5092,12 +6487,12 @@ export default function DrawPage() {
                         title={
                           d === "paint"
                             ? "drag paints continuously"
-                            : "drag proposes a candidate — tap it to commit"
+                            : "drag gathers a proposal — tap it to commit the lot"
                         }
                         aria-label={
                           d === "paint"
                             ? "drag lays colour continuously"
-                            : "drag proposes a candidate; tap it to commit"
+                            : "drag gathers a proposal; tap it to commit every application as one gesture"
                         }
                         onClick={() => pickDragMode(d)}
                       >
@@ -5212,9 +6607,16 @@ export default function DrawPage() {
                       onClick={() => setZoomTo(1)}
                       disabled={zoom === 1}
                       title="fit the whole figure"
-                      aria-label={`zoom ${zoom} times — click to fit the whole figure`}
+                      // ROUNDED FOR DISPLAY ONLY. The stepper's own factors are
+                      // powers of two and print exactly; a drill-in lands on
+                      // whatever makes the focused cells fill the frame, and
+                      // "3.4641016151377544×" is a number nobody asked to read.
+                      // The state itself is left alone — see `setZoomTo`.
+                      aria-label={`zoom ${
+                        Math.round(zoom * 10) / 10
+                      } times — click to fit the whole figure`}
                     >
-                      {zoom}×
+                      {Math.round(zoom * 10) / 10}×
                     </button>
                     <button
                       type="button"
@@ -5425,8 +6827,20 @@ export default function DrawPage() {
                 most of the time. Folding it into the header row would make the
                 header jump by a row the moment the tool changed; here it opens
                 below the rule it belongs under, and costs canvas height only
-                while the adjust brush is actually in the hand. */}
-            {tool === "adjust" && (
+                while the adjust brush is actually in the hand.
+
+                ON `pickedTool`, NOT `tool`, and this is the one place in the
+                page where that distinction had to be made by hand. Everything
+                else reads the tool IN FORCE, which is what the momentary
+                eraser is for. This is layout: gated on `tool` it would unmount
+                the moment Option went down and remount when it came up, so
+                holding a key to erase would shunt the canvas up and down by a
+                row under the pointer — the exact jump the paragraph above says
+                this strip was moved out of the header to avoid. It is also the
+                honest reading: the strip says WHICH adjustment is selected,
+                the selection has not changed, and a momentary brush is not a
+                reason to hide a control the user will have back in a second. */}
+            {pickedTool === "adjust" && (
               <div className={styles.adjustBar}>
                 <span className={styles.benchKey} id="adjust-key">
                   adjustment
@@ -5754,6 +7168,72 @@ export default function DrawPage() {
               </p>
             )}
 
+            {/* WHERE YOU ARE, and every way back out.
+                Shown only when the path is non-empty, because at the root it
+                would be one crumb saying "the whole plate" beside a picture of
+                the whole plate.
+
+                PER-CRUMB, not `focus.pathLabel`. That function joins the whole
+                path into one string with a separator, and each level has to be
+                its own button here — `exitTo(focus, k)` per crumb is what makes
+                "leave this arm but stay in this sector" reachable in one click
+                from three levels down, which is the same thing `focus.exit`'s
+                header argues the double-tap must not give up. `pathLabel` is
+                still used, for the sentence the live region says, so the two
+                cannot come to describe different places.
+
+                IN NORMAL FLOW, above the plate, rather than floated on the
+                artwork beside undo. A floating strip over a drawing surface
+                needs the whole `pointer-events` dance the HUD carries, and it
+                would sit over the very cells a person is about to double-tap to
+                get back out. */}
+            {focus.length > 0 && (
+              <nav
+                className={styles.crumbs}
+                aria-label={`focus — ${pathLabel(focus)}`}
+              >
+                <button
+                  type="button"
+                  className={styles.crumb}
+                  aria-label="leave the focus — back to the whole plate, nothing dimmed"
+                  title="back to the whole plate (Escape steps out one level)"
+                  onClick={() => applyFocus(ROOT)}
+                >
+                  plate
+                </button>
+                {focus.map((step, k) => (
+                  <span key={`${step.kind}-${step.id}-${k}`} className={styles.crumbRow}>
+                    <span className={styles.crumbSep} aria-hidden="true">
+                      ›
+                    </span>
+                    <button
+                      type="button"
+                      className={styles.crumb}
+                      // The DEEPEST crumb is where you already are. It stays a
+                      // real button rather than becoming text, because `exitTo`
+                      // at the full depth is the identity and a control that
+                      // quietly turns into a label as you drill in is a control
+                      // whose Tab order changes shape under the hand.
+                      aria-current={k === focus.length - 1 ? "true" : undefined}
+                      aria-label={`focus on ${crumbLabel(step)} — ${
+                        k === focus.length - 1
+                          ? "where you are now"
+                          : "step back out to here"
+                      }`}
+                      title={
+                        k === focus.length - 1
+                          ? "where you are — press O or Escape to step out, I to go further in"
+                          : `back out to ${crumbLabel(step)}`
+                      }
+                      onClick={() => applyFocus(exitTo(focus, k + 1))}
+                    >
+                      {crumbLabel(step)}
+                    </button>
+                  </span>
+                ))}
+              </nav>
+            )}
+
             <div
               className={styles.canvasHold}
               data-tool={tool}
@@ -5772,7 +7252,7 @@ export default function DrawPage() {
                 // preview drops all three. The STATE is kept — the cursor comes
                 // back where it was left when the preview closes.
                 preview={previewing ? null : preview}
-                candidate={previewing ? null : candidateSpec}
+                candidate={previewing ? NO_SPECS : proposalSpecs}
                 cursor={previewing ? null : cursor}
                 guides={guides}
                 showGuides={showGuides}
@@ -5782,8 +7262,15 @@ export default function DrawPage() {
                 shape={shapeTool}
                 panning={spaceHeld}
                 view={view}
+                // NOT dropped while a preview stands, unlike the ghost and the
+                // cursor beside it. Those are promises about a plate that is not
+                // on screen; this is where the hand IS, and it is as true of a
+                // preview as of the live drawing — the preview is the same
+                // addresses, reconstructed.
+                focused={focusHeld}
                 className={styles.canvas}
                 candidateClass={styles.marching}
+                dimClass={styles.dimFade}
                 label={`${
                   rewind === null
                     ? "drawing plate"
@@ -5795,7 +7282,7 @@ export default function DrawPage() {
                 }. Q W E A D Z X C step the cursor on the lattice, W and X move a ring outward and inward, arrow keys walk it by screen direction, Enter ${
                   shapeTool === "free"
                     ? dragMode === "propose"
-                      ? "proposes then commits"
+                      ? "adds an application to the proposal, and commits the whole proposal when pressed on one it already holds"
                       : "paints"
                     : "anchors then lays the figure"
                 }. Press question mark for every shortcut.`}
@@ -5803,15 +7290,47 @@ export default function DrawPage() {
                 onPaint={previewing ? NOTHING : paintAt}
                 onStrokeEnd={previewing ? NOTHING : endStroke}
                 onPropose={previewing ? NOTHING : propose}
-                onCommit={previewing ? NOTHING : commitCandidate}
+                onCommit={previewing ? NOTHING : commitProposal}
+                onCommitCancelled={previewing ? NOTHING : commitCancelled}
                 onArrow={previewing ? NOTHING : onArrow}
                 onShapeDrag={
                   previewing
                     ? NOTHING
-                    : (anchor, at, alt) => setShapeDrag({ anchor, at, alt })
+                    : (anchor, at, alt) => {
+                        // The anchor is a seed like any other, so the focus
+                        // refuses it in the same place and on the same rule —
+                        // an anchored figure may not START outside the thing you
+                        // are inside. Where it REACHES is `clipToRegion`'s
+                        // business and it already confines a shape to the
+                        // anchor's own region of the symmetry surface.
+                        if (!inFocus(anchor)) return;
+                        // THE CROSSING GUARD, and the only place the two
+                        // meanings of Option could have met.
+                        //
+                        // The board reads `e.altKey` off every pointer event
+                        // and hands it up here as "expand about the anchor".
+                        // While the momentary eraser is held that flag is true
+                        // on every event of the gesture — so an unmasked line
+                        // drag would come out BOTH erasing and symmetric: two
+                        // modifiers from one press of one key, one of which
+                        // nobody asked for. `shapeAlt` drops it while the
+                        // eraser is in force. Read from the ref rather than
+                        // from `eraseHeld`, because this is an event handler
+                        // and the ref is this instant rather than the last
+                        // render's.
+                        setShapeDrag({
+                          anchor,
+                          at,
+                          alt: shapeAlt(altRef.current, alt),
+                        });
+                      }
                 }
                 onShapeEnd={previewing ? NOTHING : commitShape}
                 onPan={onPan}
+                // NOT gated on `previewing`: drilling in changes nothing about
+                // the drawing, and a person standing in a replay is exactly the
+                // person who wants to look closely at one arm of it.
+                onFocusTap={onFocusTap}
               />
               {/* The canvas HUD: UNDO, REDO, and the flag that says what the
                   brush is — top left, ON the artwork, in one row.
@@ -5863,9 +7382,23 @@ export default function DrawPage() {
                     {rewind.kind} · {rewind.index}/{steps}
                   </span>
                 ) : (
+                  /* The momentary eraser reuses this flag rather than raising a
+                     second indicator, because it IS the tool flag: `tool` is
+                     already "erase" while Option is held, so the chip, its
+                     hue, the `cell` cursor on the canvas, the pressed state of
+                     the ERASE button and the canvas label all say so with no
+                     further work. What it adds is the word HELD and a brighter
+                     rule, so a brush that will go away on its own is not
+                     mistaken for one that has been chosen — the difference
+                     matters, because one of them means "put the key down". */
                   tool !== "paint" && (
-                    <span className={styles.modeFlag} data-tool={tool} aria-hidden="true">
-                      {tool}
+                    <span
+                      className={styles.modeFlag}
+                      data-tool={tool}
+                      data-held={eraseHeld ? "on" : undefined}
+                      aria-hidden="true"
+                    >
+                      {eraseHeld ? "erase · held" : tool}
                     </span>
                   )
                 )}
@@ -5877,41 +7410,49 @@ export default function DrawPage() {
                   under the very finger that had just proposed. Floated over the
                   corner it costs no layout height at all, so nothing moves when
                   a proposal appears, and it is beside the ghost it acts on. */}
-              {candidateSpec !== null && (
+              {standing && (
                 <div className={styles.candidateBar}>
-                  <span className={styles.benchKey}>candidate</span>
+                  {/* The key names the count of APPLICATIONS, because that is
+                      what the drag gathered and what the mark will record — the
+                      button below already names the cells. One number each,
+                      rather than one control saying both. */}
+                  <span className={styles.benchKey}>
+                    proposal · {proposalSpecs.length}
+                  </span>
                   <div className={styles.commitRow}>
                     {/* Disabled at zero rather than hidden. An adjustment
-                        candidate over bare tiling really would do nothing, and
+                        proposal over bare tiling really would do nothing, and
                         a greyed COMMIT beside the dashed inert outlines says
                         that better than a button that shrugs. */}
                     <button
                       type="button"
                       className={styles.commitBtn}
-                      onClick={commitCandidate}
-                      disabled={candidateSpec.cells.length === 0}
+                      onClick={commitProposal}
+                      disabled={proposalCommits === 0}
                       aria-label={
-                        candidateSpec.cells.length === 0
+                        proposalCommits === 0
                           ? "nothing to commit — the brush would change no cell here"
-                          : `commit the standing candidate — ${candidateSpec.cells.length} cells`
+                          : `commit the standing proposal — ${proposalSpecs.length} application${
+                              proposalSpecs.length === 1 ? "" : "s"
+                            } over ${proposalCommits} cells, as one undoable gesture`
                       }
                     >
-                      commit {candidateSpec.cells.length}
+                      commit {proposalCommits}
                     </button>
                     <button
                       type="button"
-                      onClick={dropCandidate}
-                      aria-label="drop the standing candidate"
+                      onClick={dropProposal}
+                      aria-label="drop the standing proposal — nothing is painted"
                     >
                       drop
                     </button>
                   </div>
                 </div>
               )}
-              {paint.size === 0 && candidateSpec === null && !dropping && !previewing && (
+              {paint.size === 0 && !standing && !dropping && !previewing && (
                 <p className={styles.emptyHint}>
                   {dragMode === "propose"
-                    ? "drag to propose — tap the ghost to commit"
+                    ? "drag to gather a proposal — tap it to commit"
                     : "click or drag to paint — every stroke is an orbit"}
                 </p>
               )}
@@ -5958,7 +7499,11 @@ export default function DrawPage() {
                   )}{" "}
                   ·{" "}
                   {reach === null ? (
-                    <b>{dragMode === "propose" ? "drag to propose" : "hover to preview"}</b>
+                    <b>
+                      {dragMode === "propose"
+                        ? "drag to gather"
+                        : "hover to preview"}
+                    </b>
                   ) : (
                     <b>reach {reach}</b>
                   )}
@@ -6067,8 +7612,10 @@ export default function DrawPage() {
                   <Kbd>Esc</Kbd>
                 </span>
                 <span>
-                  drag moves a candidate; tap it or press Enter to commit it, Esc
-                  to drop it
+                  drag gathers a proposal, one application per cell it crosses
+                  and nothing on the plate; tap the ghost, or press Enter on a
+                  cell it already holds, to commit the whole thing as one
+                  undoable gesture; Esc drops it
                 </span>
               </li>
             ) : (

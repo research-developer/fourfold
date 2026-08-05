@@ -52,18 +52,71 @@ import { WELD_WIDTH, type PaintMap } from "@/lib/strokes";
  * symmetry brush is about to do — is therefore unreachable on a phone, where it
  * is needed most, because the first contact with the plate is already a stroke.
  *
- * `propose` mode makes the press itself the hover: a drag moves a CANDIDATE and
- * commits nothing, lifting the finger leaves it standing, and a tap on it lays
- * the paint. Two consequences fall out for free. The candidate survives a change
- * of brush, scheme or colour, so the settings can be auditioned against a
- * real proposal before anything is committed; and a mis-aimed first touch costs
- * nothing, which on a 390px screen is the difference between a drawing tool and
- * a guessing game.
+ * `propose` mode makes the press itself the hover: a drag GATHERS applications
+ * and commits nothing, lifting the finger leaves them standing, and a tap on
+ * them lays the paint. Two consequences fall out for free. The proposal survives
+ * a change of brush, scheme or colour, so the settings can be auditioned against
+ * a real proposal before anything is committed; and a mis-aimed first touch
+ * costs nothing, which on a 390px screen is the difference between a drawing
+ * tool and a guessing game.
  *
- * The commit gesture is a TAP ON THE CANDIDATE, not a tap anywhere, so the
- * "move it" and "keep it" gestures never contend: pressing inside the standing
- * proposal arms a commit and pressing outside it re-proposes. Dragging away
- * from an armed press disarms it, because that is a drag and not a tap.
+ * The commit gesture is a TAP ON THE PROPOSAL, not a tap anywhere, so the "add
+ * to it" and "keep it" gestures never contend: pressing inside the standing
+ * proposal arms a commit and pressing outside it adds. Dragging away from an
+ * armed press disarms it, because that is a drag and not a tap.
+ *
+ * ── The third gesture: DOUBLE-TAP, and what it had to be guarded against ──
+ *
+ * A double-tap drills the focus in or out (`lib/focus.ts` decides which; this
+ * component only reports the cell). Three guards, and each one is a bug that was
+ * reachable without it.
+ *
+ * THE BROWSER'S OWN DOUBLE-TAP. On touch, two quick taps are the UA's
+ * zoom-to-fit gesture and on a desktop they are a text selection. `touch-action:
+ * none` on the canvas already takes the first — it is set for drag-to-paint and
+ * happens to cover this — and `preventDefault` on the second press takes the
+ * second. Both are needed: `touch-action` does nothing about a mouse, and
+ * `preventDefault` on a touch pointerdown does not suppress a UA zoom that is
+ * decided from the touch stream rather than the pointer stream.
+ *
+ * IT IS DECIDED ON THE RELEASE, NOT THE PRESS. With a sector drilled into,
+ * "outside" is five sixths of the plate, so a stroke that begins with a slightly
+ * mis-aimed press would read as "leave this sector" if the second press alone
+ * decided it. So the second press only ARMS the gesture, and the release fires
+ * it — and only if the pointer never moved past `TAP_SLOP`. A press that turns
+ * into a drag arms nothing.
+ *
+ * WHAT THAT COSTS, stated rather than hidden: the armed press lays no paint, so
+ * a drag that BEGINS as the second of two quick taps on one cell is swallowed
+ * whole. The alternative — paint on the press and exit on the release as well —
+ * is the mis-aim the guard exists to stop, and the alternative to THAT is
+ * deferring every press by `DOUBLE_TAP_MS` to see whether a second one arrives,
+ * which is the 300 ms tap delay that touch UIs spent a decade removing. On a
+ * drawing surface a press has to mark immediately or the tool feels broken.
+ *
+ * The FIRST tap of the pair is an ordinary press and does whatever the tool
+ * does. Entering therefore costs one application; leaving costs nothing at all,
+ * because the exit tap lands outside the focus where the page already refuses to
+ * paint. That asymmetry is the right way round — leaving is the gesture a
+ * mis-aim can reach.
+ *
+ * A TAP ON A STANDING PROPOSAL IS NOT THE SECOND OF A PAIR. The commit gesture
+ * and the drill-in gesture are the same two taps on the same cell — gathering a
+ * proposal at X and then committing it IS "tap X, tap X" — so one of them has to
+ * be tested first and the other one loses. The commit wins; `commitsProposal`
+ * carries the reason. Outside a standing ghost, which is the whole plate
+ * whenever no proposal is up, the double-tap is unchanged.
+ *
+ * ── A drag gathers, it does not replace ─────────────────────────────────
+ *
+ * It used to replace: every cell the finger crossed became THE candidate and the
+ * one before it was forgotten, so the mode that exists for touch could lay
+ * exactly one application per gesture while the mode that exists for a mouse
+ * could lay a hundred. `onPropose` is now called on the press and on every cell
+ * the drag enters — the same event stream `onPaint` gets in paint mode, which is
+ * the whole point — and the page accumulates them. See `lib/propose.ts` for the
+ * accumulation rule, and `page.tsx`'s `commitProposal` for why the whole run
+ * commits as ONE rung of the journal.
  */
 
 export interface BoardCell {
@@ -143,6 +196,217 @@ export interface ViewWindow {
 }
 
 /**
+ * A zoom factor and a centre — the two numbers the page's view state holds.
+ *
+ * Returned rather than applied, because the page owns the transform and there is
+ * exactly one of it. See `focusFrame`.
+ */
+export interface FocusFrame {
+  zoom: number;
+  cx: number;
+  cy: number;
+}
+
+/**
+ * The window that makes a set of cells fill the canvas.
+ *
+ * Pure, and exported for the tests, because it is the one piece of drill-in that
+ * is real arithmetic and the page cannot be rendered under vitest — there is no
+ * jsdom here. Everything else about the gesture is structure.
+ *
+ * ── Why a bounding box of VERTICES and not of centroids ─────────────────
+ *
+ * A centroid box is the box of the cells' MIDDLES, which is smaller than the
+ * cells by about half a cell on each side, so framing to it crops the outer ring
+ * of whatever was focused. At depth 2 an arm is 5 cells and the error is a fifth
+ * of the picture; it shrinks with depth but never to nothing, and the one thing
+ * a "make this fill the canvas" gesture must not do is cut the thing off.
+ *
+ * ── `margin` is a FRACTION of the box, not a pixel inset ────────────────
+ *
+ * The canvas is scaled to the viewport by CSS and the figure is drawn in its own
+ * units, so a pixel inset would be a different visual gap at every depth and
+ * every window size. A fraction is the same gap everywhere.
+ *
+ * ── The cases that return `null`, and why they are not errors ───────────
+ *
+ * An empty cell list and a box of zero area both mean "there is nothing here to
+ * frame". `focus.focusCells` says outright that it may return nothing — a fresh
+ * layer, a hidden layer, an erase gesture, a query that matched nothing — and
+ * the documented answer is to KEEP THE FRAME YOU HAVE rather than zoom to a
+ * degenerate box. `null` is that answer, and it is a value rather than a throw so
+ * the caller's handling of it is one `if` at the one place it can happen.
+ *
+ * Indices that are not on this geometry are skipped rather than refused: the
+ * page hands over model indices and a framed sector's geometry only carries the
+ * ones it draws, so a focus naming cells in another sector is an ordinary state
+ * and not a bug.
+ */
+export function focusFrame(
+  geom: BoardGeometry,
+  cells: Iterable<number>,
+  maxZoom: number,
+  margin = 0.14
+): FocusFrame | null {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  for (const i of cells) {
+    const cell = geom.cells[i];
+    if (cell === undefined) continue;
+    for (const [x, y] of cell.verts) {
+      if (x < minX) minX = x;
+      if (x > maxX) maxX = x;
+      if (y < minY) minY = y;
+      if (y > maxY) maxY = y;
+    }
+  }
+  if (!Number.isFinite(minX)) return null;
+  const bw = (maxX - minX) * (1 + margin);
+  const bh = (maxY - minY) * (1 + margin);
+  if (bw <= 0 && bh <= 0) return null;
+  // A box with no width is a legitimate degenerate — a single column of cells —
+  // and `Infinity` is the honest scale for it, which the clamp then takes down
+  // to `maxZoom`. Only a box with NEITHER extent is nothing to look at.
+  const fit = Math.min(
+    bw <= 0 ? Infinity : geom.width / bw,
+    bh <= 0 ? Infinity : geom.height / bh
+  );
+  return {
+    zoom: Math.min(maxZoom, Math.max(1, fit)),
+    cx: (minX + maxX) / 2,
+    cy: (minY + maxY) / 2,
+  };
+}
+
+/** A completed zero-drag tap: which cell, and when it was let go. */
+export interface Tap {
+  cell: number;
+  t: number;
+}
+
+/**
+ * How long a second tap has to arrive within, in milliseconds.
+ *
+ * 400 rather than the ~300 a browser uses, because this gesture is made with a
+ * whole hand over a large target rather than with a thumb over a link, and
+ * because the cost of being slightly generous is bounded: a slow pair of taps
+ * that misses the window is two ordinary presses, which is what they would have
+ * been anyway.
+ */
+export const DOUBLE_TAP_MS = 400;
+
+/**
+ * How far the pointer may travel and still count as a tap, in CLIENT pixels.
+ *
+ * Client pixels and not canvas units, because this is about whether a hand held
+ * still — a fact about the hand — and the canvas may be at any zoom. A finger
+ * that never leaves its cell can still wander several pixels while it presses.
+ */
+export const TAP_SLOP = 8;
+
+/**
+ * Is this press the second half of a double-tap?
+ *
+ * SAME CELL, not merely nearby: two taps a cell apart are two taps, and on a
+ * plate whose cells are the things being addressed, "which cell" is the only
+ * identity that means anything. `TAP_SLOP` covers the hand's wobble WITHIN one
+ * press; it deliberately does not smear across cells.
+ *
+ * Pure and exported for the tests, for the same reason `focusFrame` is: this is
+ * the decision the guard rests on and there is no jsdom to press a button in.
+ */
+export function isDoubleTap(
+  prev: Tap | null,
+  cell: number,
+  t: number,
+  within = DOUBLE_TAP_MS
+): boolean {
+  if (prev === null || prev.cell !== cell) return false;
+  const dt = t - prev.t;
+  // A non-negative test as well as an upper one: event timestamps come from two
+  // listeners (a press here, a release on the window) and a clock that appeared
+  // to run backwards would otherwise read as an instant double-tap.
+  return dt >= 0 && dt <= within;
+}
+
+/**
+ * Is this press the COMMIT of a standing proposal?
+ *
+ * THE ONE ANSWER, asked twice by `down` and asked in that order for a reason.
+ * A tap inside the standing ghost is the documented commit gesture — see the
+ * header — and the cell it lands on is necessarily the cell the tap that
+ * gathered the proposal landed on, so it is also, unavoidably, the second of two
+ * quick taps on one cell. Whichever of the two gestures is tested first wins
+ * every time, and the drill-in used to be: it armed, the release fired
+ * `onFocusTap`, the page entered a sector and dropped the proposal, and the
+ * gathered work went with it. Propose mode is the default on touch, where Enter
+ * — the only other commit route — does not exist, so that was the whole feature
+ * on the whole platform it was built for.
+ *
+ * So the commit wins, and the argument is not merely "it was reported": a tap
+ * inside the ghost ALREADY HAS A MEANING, stated on screen by the marching
+ * outline and by the live region, and a gesture that takes a meaning away from
+ * a control the user is looking at is worse than one that is unreachable. The
+ * drill-in keeps every cell that is not under a standing ghost, which at the
+ * moment a proposal stands is nearly the whole plate, and keeps all of them when
+ * none does.
+ *
+ * ANY of the gathered applications counts, because the whole ghost is one tap
+ * target — the whole ghost is one gesture. The shape and drag conditions are
+ * named here rather than inherited from the caller's branch order: `candidate`
+ * is empty in the other modes today, and this must not become a fact about what
+ * the page happens to pass down.
+ *
+ * Pure and exported for the tests, for the same reason `isDoubleTap` is.
+ */
+export function commitsProposal(
+  shape: ShapeTool,
+  drag: DragBehaviour,
+  candidate: readonly PreviewSpec[],
+  i: number
+): boolean {
+  if (shape !== "free" || drag !== "propose") return false;
+  return candidate.some((c) => previewCovers(c, i));
+}
+
+/** What a release does to a live propose-mode press. See `proposeRelease`. */
+export type ProposeRelease = "commit" | "cancelled" | "nothing";
+
+/**
+ * A propose-mode press has ended. Does the plate change?
+ *
+ * `"commit"` only for a press that ARMED on the standing ghost, never travelled
+ * past `TAP_SLOP`, and was released by the HAND.
+ *
+ * `"cancelled"` is the third answer and the reason this is a function rather
+ * than a conjunction. A `pointercancel` is the browser taking the pointer away —
+ * palm rejection, an OS edge gesture, a second contact starting a pinch, an
+ * orientation change, a long-press context menu — and it can never complete a
+ * tap, exactly as it can never complete a double-tap one branch above. This is
+ * the branch where that matters most: it is the only one that writes to the
+ * plate, so the version of this test that omitted `cancelled` would paint every
+ * application of a standing proposal, with a rung in the journal, off a finger
+ * that never came up.
+ *
+ * It is told apart from `"nothing"` because the proposal SURVIVES a cancel and
+ * the user is left looking at a ghost that did not commit. A decline that says
+ * nothing at all is a control that reads as broken; declines here are counted
+ * preconditions, not silences. `"nothing"` is the ordinary case — a press that
+ * was never on the ghost, or that became a drag — and has nothing to report,
+ * because the drag itself was the report.
+ */
+export function proposeRelease(
+  armed: boolean,
+  moved: boolean,
+  cancelled: boolean
+): ProposeRelease {
+  if (!armed || moved) return "nothing";
+  return cancelled ? "cancelled" : "commit";
+}
+
+/**
  * The relief, as the board needs it: the plate's polygons already deformed.
  *
  * Everything here is a DISPLAY substitution — the same cells, in the same order,
@@ -172,8 +436,16 @@ interface Props {
   relief: ReliefView | null;
   paint: PaintMap;
   preview: PreviewSpec | null;
-  /** The standing proposal in `propose` mode. Committed by a tap on itself. */
-  candidate: PreviewSpec | null;
+  /**
+   * The standing proposal in `propose` mode, ONE ENTRY PER APPLICATION the drag
+   * gathered, in the order it gathered them. Empty when nothing stands.
+   *
+   * A list and not a single spec, because a propose drag accumulates: see
+   * `lib/propose.ts` for why the seeds are kept apart rather than merged, and
+   * `Ghost` below for what one entry looks like. A tap anywhere inside ANY of
+   * them commits the whole thing.
+   */
+  candidate: readonly PreviewSpec[];
   cursor: number | null;
   guides: Guides;
   showGuides: boolean;
@@ -194,16 +466,44 @@ interface Props {
   panning: boolean;
   /** `null` shows the whole figure, exactly as the board always did. */
   view: ViewWindow | null;
+  /**
+   * The cells the focus HOLDS, or `null` at the root.
+   *
+   * Everything NOT in this set is dulled — dimmed, not hidden, which is the
+   * whole of the owner's brief: "it doesn't disappear the canvas, just zooms in
+   * so the triangle fills the canvas and greatly dulls the other sides". The
+   * complement is what gets drawn over, so `null` is genuinely cheaper than a set
+   * holding every index and is also the honest statement: there is no focus, not
+   * a focus that admits everything. Same shape and same reasoning as `visible`.
+   *
+   * The board does not know what a focus IS. It is handed the answer, exactly as
+   * it is handed the relief's deformed points, which is what keeps `lib/focus.ts`
+   * out of the component that owns hit-testing.
+   */
+  focused: ReadonlySet<number> | null;
   label: string;
   /** Supplied by the page, which owns the CSS module the class lives in. */
   className: string;
   /** Ditto: the marching-ants animation on the candidate outline. */
   candidateClass: string;
+  /** Ditto: the dim layer's fade, which `prefers-reduced-motion` turns off. */
+  dimClass: string;
   onHover: (i: number | null) => void;
   onPaint: (i: number) => void;
   onStrokeEnd: () => void;
   onPropose: (i: number) => void;
   onCommit: () => void;
+  /**
+   * An armed commit tap was taken away by the browser rather than released.
+   *
+   * A SEPARATE CALLBACK and not a flag on `onCommit`, because the two are not
+   * two flavours of one event: one lays paint and one lays none. The page has to
+   * say something — the proposal is still standing and the tap it just received
+   * did nothing visible — and a decline that shares a door with a commit is a
+   * decline that will one day be routed through the committing half of it.
+   * See `proposeRelease` for the four ways a browser takes a pointer away.
+   */
+  onCommitCancelled: () => void;
   onArrow: (dir: Direction) => void;
   /**
    * The anchored drag moved. `anchor` never changes during one gesture, `at` is
@@ -216,6 +516,16 @@ interface Props {
   onShapeEnd: () => void;
   /** A pan, in CANVAS units — the board converts, the page only translates. */
   onPan: (dx: number, dy: number) => void;
+  /**
+   * A clean double-tap landed on this cell. What it MEANS is the page's to
+   * decide — `focus.gestureFor` answers enter, exit or nothing — because
+   * "inside" is a fact about the focus path and this component holds no path.
+   *
+   * Fired on the release of the second press and only when that press never
+   * became a drag. See the header for the two things that buys and the one thing
+   * it costs.
+   */
+  onFocusTap: (i: number) => void;
 }
 
 /**
@@ -354,6 +664,79 @@ const PaintLayer = memo(function PaintLayer({
       pointerEvents="none"
     >
       {out}
+    </g>
+  );
+});
+
+/**
+ * How much of the plate shows through outside the focus.
+ *
+ * A scrim in the PLATE's own colour rather than a global `opacity` on the layers
+ * underneath. Two reasons, and the second is the load-bearing one. An opacity on
+ * the paint layer would fade it toward whatever is behind it, which at the rim is
+ * the vignette's dark end and at the centre its light end, so the same colour
+ * would dull by different amounts depending on where it sat. And `opacity` on a
+ * group of 1500 polygons is a composited layer the browser has to allocate,
+ * where a flat fill is not.
+ *
+ * 0.78 was chosen against the brief's words — "greatly dulls the other sides",
+ * not "hides them". A fifth of the paint survives, which is enough to read a
+ * six-fold stroke's shape in the five sectors you are not inside and not nearly
+ * enough to mistake for the sector you are.
+ */
+const DIM = 0.78;
+
+/**
+ * Everything OUTSIDE the focus, dulled.
+ *
+ * Re-renders only when the focus changes, which is once per drill-in — the set
+ * arrives whole from the page and is memoised there, so a pointer move does not
+ * touch this at all.
+ *
+ * DRAWN AFTER THE GUIDES AND BEFORE THE GHOSTS, which is the whole of the layer
+ * choice. Under the ghosts and the cursor, because those are statements about
+ * what the brush is ABOUT to do and must stay legible over a dulled plate. Over
+ * the guides, so the symmetry axes fade out with the cells they cross — a spine
+ * mirror that stayed at full strength across five dimmed sectors would be the
+ * loudest thing on a screen whose point is that those sectors are not where you
+ * are working. And under the hit layer, which is untouched: the plate outside the
+ * focus is still clickable, because the gesture that LEAVES a focus is a tap on
+ * exactly that plate.
+ */
+const DimLayer = memo(function DimLayer({
+  pts,
+  order,
+  focused,
+  className,
+}: {
+  pts: readonly string[];
+  order: readonly number[];
+  focused: ReadonlySet<number>;
+  className: string;
+}) {
+  return (
+    <g
+      data-layer="dim"
+      className={className}
+      fill={PLATE}
+      // `fill-opacity` and NOT `opacity`, and this was a real bug before it was
+      // a comment. The fade in the stylesheet animates the CSS `opacity`
+      // property, and a CSS property beats an SVG PRESENTATION ATTRIBUTE of the
+      // same name — so `opacity={DIM}` here would have been overridden to 1 for
+      // the whole of the animation and left there by its `both` fill, making the
+      // scrim fully opaque and the plate outside the focus genuinely disappear.
+      // The two multiply, so on this axis they compose instead of fighting.
+      //
+      // It costs nothing else: the cells are a tiling and do not overlap, so
+      // per-fill alpha and group alpha are the same picture — and per-fill is
+      // the cheaper of the two, because group `opacity` needs an offscreen
+      // buffer and this does not.
+      fillOpacity={DIM}
+      pointerEvents="none"
+    >
+      {order.map((i) =>
+        focused.has(i) ? null : <polygon key={i} points={pts[i]} />
+      )}
     </g>
   );
 });
@@ -662,18 +1045,22 @@ export default function DrawBoard({
   shape,
   panning,
   view,
+  focused,
   label,
   className,
   candidateClass,
+  dimClass,
   onHover,
   onPaint,
   onStrokeEnd,
   onPropose,
   onCommit,
+  onCommitCancelled,
   onArrow,
   onShapeDrag,
   onShapeEnd,
   onPan,
+  onFocusTap,
 }: Props) {
   /**
    * The plate's polygons, from whichever source is in force.
@@ -717,6 +1104,39 @@ export default function DrawBoard({
   const panFrom = useRef<{ x: number; y: number } | null>(null);
   const svg = useRef<SVGSVGElement | null>(null);
 
+  /**
+   * The double-tap bookkeeping. Four refs, and each answers a different question.
+   *
+   * `lastTap`  the previous CLEAN tap — which cell, and when it was released.
+   *            Only a zero-drag press becomes one, so a drag never half-arms the
+   *            next press.
+   * `tapCell`  the cell the live press landed on, kept because the release
+   *            arrives on the WINDOW and its target may be anywhere at all —
+   *            off the plate, off the window, or the browser cancelling.
+   * `tapFrom`  where the live press landed in client pixels, for the slop test.
+   * `tapDrag`  whether the live press has already travelled past `TAP_SLOP`.
+   *
+   * Refs and not state for the reason every other gesture ref here is one: they
+   * change several times between two renders and nothing reads them from the
+   * render.
+   */
+  const lastTap = useRef<Tap | null>(null);
+  const tapCell = useRef<number | null>(null);
+  const tapFrom = useRef<{ x: number; y: number } | null>(null);
+  const tapDrag = useRef(false);
+  /**
+   * The cell an ARMED double-tap is on, or `null`.
+   *
+   * Non-null means this press laid nothing and is waiting for its release to say
+   * whether the hand held still. See the header.
+   *
+   * IT BELONGS TO ONE PRESS. `down` clears it on its first line and `end` clears
+   * it on every release, so it cannot outlive the gesture that set it — which
+   * matters because the release is the one event that is not guaranteed to
+   * arrive, and a flag left standing would steal the NEXT press's release.
+   */
+  const focusArmed = useRef<number | null>(null);
+
   const indexOf = (target: EventTarget | null): number | null => {
     const raw = (target as SVGElement | null)?.dataset?.i;
     if (raw === undefined) return null;
@@ -724,30 +1144,75 @@ export default function DrawBoard({
     return Number.isInteger(i) ? i : null;
   };
 
-  const end = useCallback(() => {
-    if (panFrom.current !== null) {
-      panFrom.current = null;
-      return;
-    }
-    if (anchor.current !== null) {
-      anchor.current = null;
-      onShapeEnd();
-      return;
-    }
-    if (proposing.current) {
-      const commitNow = armed.current && !moved.current;
-      proposing.current = false;
-      armed.current = false;
-      moved.current = false;
-      last.current = null;
-      if (commitNow) onCommit();
-      return;
-    }
-    if (!drawing.current) return;
-    drawing.current = false;
-    last.current = null;
-    onStrokeEnd();
-  }, [onStrokeEnd, onCommit, onShapeEnd]);
+  const end = useCallback(
+    (e?: PointerEvent) => {
+      // `performance.now()` only for the call that has no event — there is none
+      // today, and the fallback is here so a future caller cannot make the clock
+      // jump to zero and read as an instant double-tap.
+      const t = e?.timeStamp ?? performance.now();
+      // A CANCEL is the browser taking the pointer away, not the hand letting
+      // go, so it can never complete a tap. Treated as a drag rather than as a
+      // clean release, which is the conservative reading and the one that cannot
+      // fire a focus change nobody asked for.
+      const cancelled = e?.type === "pointercancel";
+
+      // An ARMED second press. It laid nothing on the way down, so this release
+      // is the whole of the gesture: fire it if the hand held still, drop it
+      // silently if it drifted. Either way the pair is spent — a third quick tap
+      // starts a new one rather than firing again on the same cell.
+      //
+      // READ AND CLEARED HERE, but FIRED at the bottom. This branch used to
+      // return before every other one, which was only safe while nothing could
+      // arm a focus tap with a gesture already live — and nothing enforced that,
+      // because `down` never cleared this ref. A press whose release never
+      // reached the window (the window blurred, the OS took the pointer) left the
+      // flag set, and the NEXT press painted normally on the way down and then
+      // had its release stolen: the focus fired on a cell from the gesture
+      // before, and `onStrokeEnd` never ran at all, so edits already written into
+      // the page's composition were never journalled and undo could not reach
+      // them. `down` now clears the flag on every press, which closes that door;
+      // this closes the other side of it, so that an armed press with a live
+      // gesture behind it still ENDS the gesture rather than abandoning it.
+      const focusCell = focusArmed.current;
+      const focusHeld = focusCell !== null && !tapDrag.current && !cancelled;
+      focusArmed.current = null;
+
+      // Every release: remember it as a tap if it never became a drag, and
+      // forget whatever was remembered if it did. An ARMED release is never
+      // remembered — the pair is spent. Done BEFORE the branches below, because
+      // every one of them used to return and the bookkeeping is common to all.
+      const cell = tapCell.current;
+      lastTap.current =
+        focusCell === null && cell !== null && !tapDrag.current && !cancelled
+          ? { cell, t }
+          : null;
+      tapCell.current = null;
+      tapFrom.current = null;
+      tapDrag.current = false;
+
+      if (panFrom.current !== null) {
+        panFrom.current = null;
+      } else if (anchor.current !== null) {
+        anchor.current = null;
+        onShapeEnd();
+      } else if (proposing.current) {
+        const release = proposeRelease(armed.current, moved.current, cancelled);
+        proposing.current = false;
+        armed.current = false;
+        moved.current = false;
+        last.current = null;
+        if (release === "commit") onCommit();
+        else if (release === "cancelled") onCommitCancelled();
+      } else if (drawing.current) {
+        drawing.current = false;
+        last.current = null;
+        onStrokeEnd();
+      }
+
+      if (focusHeld) onFocusTap(focusCell);
+    },
+    [onStrokeEnd, onCommit, onCommitCancelled, onShapeEnd, onFocusTap]
+  );
 
   // A gesture can finish anywhere — off the plate, off the window, or by the
   // browser cancelling the pointer. Every one of those has to close the stroke,
@@ -779,10 +1244,26 @@ export default function DrawBoard({
   };
 
   const down = (e: React.PointerEvent<SVGSVGElement>) => {
+    // A STALE ARM CANNOT SURVIVE INTO THE NEXT PRESS. `focusArmed` is set by the
+    // double-tap branch below and consumed by that press's release — but the
+    // release is the one event that is not guaranteed to arrive, so a flag set
+    // and abandoned would steal the release of whatever press came next: a focus
+    // change on a cell from the gesture before, and, worse, an `onStrokeEnd` that
+    // never fires, leaving edits already written into the page's composition with
+    // no rung to undo them by.
+    //
+    // FIRST LINE OF THE FUNCTION, above the pan branch and above the "not a cell"
+    // return, because both of those are presses too and neither of them wants an
+    // arm from an older one. This ref is about THIS press and nothing else.
+    focusArmed.current = null;
+
     // Space wins over everything. A pan that only worked when the press landed
     // on a cell would fail exactly at the rim, where a pan is most wanted.
     if (panning) {
       panFrom.current = { x: e.clientX, y: e.clientY };
+      // A pan is never a tap, and the tap before it is not half of anything.
+      lastTap.current = null;
+      tapCell.current = null;
       e.currentTarget.setPointerCapture?.(e.pointerId);
       return;
     }
@@ -791,6 +1272,38 @@ export default function DrawBoard({
     if (i === null) return;
     const el = e.target as Element;
     if (el.hasPointerCapture?.(e.pointerId)) el.releasePointerCapture(e.pointerId);
+
+    tapCell.current = i;
+    tapFrom.current = { x: e.clientX, y: e.clientY };
+    tapDrag.current = false;
+
+    // Asked ONCE, before the double-tap test and again as the arm below, because
+    // the two gestures land on the same cell and whichever is tested first wins.
+    // See `commitsProposal` for why the commit is the one that must.
+    const committing = commitsProposal(shape, dragBehaviour, candidate, i);
+
+    // THE SECOND OF A PAIR — two decisions, and they are not the same decision.
+    //
+    // WHETHER THE BROWSER GETS THIS CLICK is a question about the mouse, and the
+    // answer is no for every second press on one cell however this program then
+    // reads it. `DOUBLE_TAP_MS` is 400 and sits inside every UA's double-click
+    // window, `touch-action: none` on the canvas covers only touch, and there is
+    // no `user-select: none` anywhere — so an unguarded second click starts a
+    // text selection that drags across the whole page. That is true of the
+    // commit tap as well, which is the ordinary mouse gesture in propose mode:
+    // gather at X, click X again. The veto below moved the `preventDefault` with
+    // it for one commit and put the selection drag back on exactly that click.
+    //
+    // WHETHER IT ARMS A DRILL-IN is the question the veto answers. Decided here
+    // so this press lays nothing — see the header — but not FIRED here: the
+    // release decides, once the slop test has something to say.
+    const pair = isDoubleTap(lastTap.current, i, e.timeStamp);
+    if (pair) e.preventDefault();
+    if (pair && !committing) {
+      focusArmed.current = i;
+      lastTap.current = null;
+      return;
+    }
 
     if (shape !== "free") {
       anchor.current = i;
@@ -803,11 +1316,12 @@ export default function DrawBoard({
       moved.current = false;
       last.current = i;
       // Inside the standing proposal this press is a commit, and must NOT also
-      // move the candidate: the plate would jump under the finger and then be
-      // painted somewhere the user did not aim.
-      const onCandidate = candidate !== null && previewCovers(candidate, i);
-      armed.current = onCandidate;
-      if (!onCandidate) onPropose(i);
+      // add to it: the plate would gain an application under the finger and then
+      // be painted somewhere the user did not aim. The same answer the double-tap
+      // veto above was taken from, so the two cannot come to disagree about what
+      // a tap on the ghost is.
+      armed.current = committing;
+      if (!committing) onPropose(i);
       return;
     }
 
@@ -827,6 +1341,20 @@ export default function DrawBoard({
       onPan(dx, dy);
       return;
     }
+
+    // The slop test, run on EVERY move while a press is live — including the
+    // armed one, which is the whole point: a press that travels is a drag and
+    // must not fire a focus change on release. Client pixels, because this asks
+    // whether the hand held still and the hand does not know what zoom it is at.
+    if (tapFrom.current !== null && !tapDrag.current) {
+      const dx = e.clientX - tapFrom.current.x;
+      const dy = e.clientY - tapFrom.current.y;
+      if (dx * dx + dy * dy > TAP_SLOP * TAP_SLOP) tapDrag.current = true;
+    }
+    // An armed double-tap owns the pointer until it is released. No hover, no
+    // paint, no proposal — it laid nothing on the way down and must lay nothing
+    // on the way across either.
+    if (focusArmed.current !== null) return;
 
     const i = indexOf(e.target);
 
@@ -947,6 +1475,15 @@ export default function DrawBoard({
         bend={relief === null ? null : relief.bend}
       />
 
+      {focused !== null && (
+        <DimLayer
+          pts={pts}
+          order={order}
+          focused={focused}
+          className={dimClass}
+        />
+      )}
+
       {preview && (
         <Ghost
           geom={geom}
@@ -957,16 +1494,35 @@ export default function DrawBoard({
           dashClass={candidateClass}
         />
       )}
-      {candidate && (
+      {/* ONE GHOST PER APPLICATION, keyed by its seed — which is unique inside a
+          proposal, because `propose.proposeSeed` refuses a repeat. Drawn as a
+          run of `standing` ghosts rather than as one merged outline, for the
+          reason `lib/propose.ts` gives: an application's colours are indexed
+          over ITS OWN span, so merging them would show hues the commit is not
+          going to lay.
+
+          WHAT THIS COSTS, stated rather than optimised away. `Ghost` is
+          memoised, but the page rebuilds the whole spec list each time the drag
+          gathers one more application, so every standing ghost re-renders on
+          every new seed — O(seeds × orbit) polygons per pointer move. That is
+          inside a budget this component already spends: a PAINT drag re-renders
+          `PaintLayer` over the entire plate on every application, which at depth
+          4 is 1536 polygons, and a proposal a finger could plausibly gather is
+          well under that. If it is ever measured to matter, the fix is an
+          identity cache in the page keyed by seed, so an unchanged spec keeps
+          its object and this `memo` bails out. It has not been measured, so it
+          has not been written. */}
+      {candidate.map((spec) => (
         <Ghost
+          key={spec.seed}
           geom={geom}
           pts={pts}
           centroids={centroids}
-          spec={candidate}
+          spec={spec}
           standing
           dashClass={candidateClass}
         />
-      )}
+      ))}
 
       {cursorPoints !== undefined && (
         <polygon

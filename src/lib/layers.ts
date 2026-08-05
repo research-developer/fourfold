@@ -185,6 +185,82 @@
  * disturb them, so the paragraph above is now true by construction and not by a
  * restore step that four call sites have to remember.
  *
+ * ── WHY THE GESTURE *IS* ON THE LAYER, having read all that ─────────────
+ *
+ * `reveal`, `mode` and `orbit` are on `Layer`, next to `name`, and NOT beside
+ * the switches. That is the opposite placement to the one the section above
+ * argues for, so it needs its own argument rather than an appeal to symmetry.
+ *
+ * The switches had to leave because they are MUTABLE AND UNJOURNALLED. Two
+ * properties, and the bug needs both: a `place` move freezes a copy of whatever
+ * is on the `Layer`, so a fact that can change without a rung of its own is a
+ * fact undo can silently roll back to a value nobody asked for. That is the
+ * whole mechanism, and it gives the rule for what may live on a `Layer`:
+ *
+ *   A FIELD MAY SIT ON `Layer` IFF IT IS NEVER MUTATED, OR IS MUTATED ONLY BY A
+ *   JOURNALLED `Move`.
+ *
+ * Every existing field passes. `id` is never mutated. `name` is mutated only by
+ * `rename`, which is a `Move`, so a snapshot and the journal cannot disagree —
+ * you cannot get past the rung that would make them differ. `plate` is mutated
+ * only by `paint`. `children` only by `place`. And the switches FAILED it, which
+ * is exactly why they are the only thing that had to move.
+ *
+ * The gesture passes on the SECOND clause, and the first reading of it — "written
+ * when the layer is born and never afterwards" — was wrong in a way worth writing
+ * down, because it is the same shape of mistake the switches made.
+ *
+ * The argument was that the symmetry is a completed fact about a past event, "in
+ * the same class as which cells this stroke painted". That class is exactly
+ * right and it is not immutable: `applyMove`'s `paint` case rebuilds `plate` on
+ * every stroke. So the field is immutable and its REFERENT is not — `mode: 6,
+ * orbit: 3` describes the three cells the gesture produced, and painting into the
+ * layer produces different cells, at which point the two numbers describe nothing
+ * that is there. Measured: import a layer carrying them over three cells, clear
+ * it, and the export writes `data-orbit="3" data-mode="6"` around no shapes.
+ *
+ * So `paint` strips them and carries `MoveGesture` for undo to write back, which puts the
+ * gesture squarely in the second clause: mutated, and only by a journalled
+ * `Move`. There is still no `setMode` — no control re-records a stroke's symmetry
+ * — and a `place` move carrying `node: Layer` still carries whatever gesture that
+ * node had when it was frozen, which is correct because a placement cannot change
+ * a layer's cells. `reveal` is untouched by all of this: it is the step the layer
+ * comes up at in a playback, a fact about ORDER rather than about cells, and
+ * repainting a layer does not move it in the sequence.
+ *
+ * WHAT THE SIDE-MAP PLACEMENT WOULD HAVE COST, since it was the obvious move and
+ * was rejected rather than overlooked:
+ *
+ *   FOUR MORE PLACES TO FORGET. `Composition.switches` is re-keyed by `reid`,
+ *   collected by `switchesIn`, passed into `pasteInto` as `from`, and returned
+ *   alongside the stack by `composer.stackFromEmit` — because a map keyed by id
+ *   cannot survive a re-mint on its own. A field on the `Layer` is carried by
+ *   the object spreads those functions already do (`{ ...l, id, children }`),
+ *   so the gesture arrives through paste, graft, reorder and import with no code
+ *   at all. Fewer doors is fewer doors left open: losing provenance on paste is
+ *   the same class of silent loss this work exists to close.
+ *
+ *   A SECOND CLIPBOARD FACT. `copyLayer` returns a `Layer` and the switches have
+ *   to travel beside it as a second value. Putting the gesture there would make
+ *   a copy three values, and the third would be the one a new call site forgot.
+ *
+ *   AND IT BUYS NOTHING. The one thing the side map does that a field cannot —
+ *   OUTLIVE the layer's absence from the tree, which is what makes deleting a
+ *   locked layer and undoing give back a locked layer — is only needed for facts
+ *   that can be changed while the layer is out. The gesture cannot be changed at
+ *   all, and the `place` rung already holds the whole subtree verbatim.
+ *
+ * IF THAT EVER STOPS BEING TRUE — if some control is added that rewrites a
+ * layer's recorded symmetry after the fact — it must either be journalled as a
+ * `Move`, exactly like `rename`, or the three fields must move to the
+ * composition. The rule above is the test to apply, and `test/layers.test.ts`
+ * asserts the property it protects: move, undo and redo leave the gesture alone.
+ *
+ * ONE FURTHER CONSEQUENCE, stated because it reads as an inconsistency in
+ * `LayerSlice`: a serialiser reads the switches off `slice.own` and the gesture
+ * off `slice.node`. That is not sloppiness, it is the placement showing through
+ * — `own` exists precisely because the switches are NOT on the node.
+ *
  * ── Selection is an IDENTITY, and paths are how you locate ──────────────
  *
  * `selected` is a `LayerId | null`, not a `Path`. A `Path` — the child index at
@@ -256,12 +332,58 @@ export function idNumber(id: LayerId): number | null {
  * id, and the reason is the whole of the section above: a `Move` carries a
  * `Layer`, so a switch on a `Layer` is a switch the journal restores. See
  * `Switches`.
+ *
+ * THE GESTURE, ON THE OTHER HAND, IS HERE. `reveal`, `mode` and `orbit` are the
+ * layer's own and are written once, when it is born. See `LayerGesture` and the
+ * header section that argues the placement against the switches'.
  */
-export interface Layer {
+export interface Layer extends LayerGesture {
   readonly id: LayerId;
   readonly name: string;
   readonly plate: AddressPlate;
   readonly children: Stack;
+}
+
+/**
+ * WHAT MADE THIS LAYER — the symmetry the gesture was applied through, and the
+ * animation step it comes up at.
+ *
+ * THE FIELD NAMES AND MEANINGS ARE THE FILE'S, deliberately: `emit.EmitLayer`
+ * and `artfile.ArtLayer` carry `reveal`, `mode` and `orbit` with exactly these
+ * spellings, so `composer.emitLayersOf` and `composer.stackFromEmit` are a copy
+ * in each direction with nothing to translate and therefore nothing to get
+ * backwards. A prettier grouped shape here — `gesture?: { mode, orbit }` — was
+ * considered and rejected on that ground alone: the format states the three
+ * INDEPENDENTLY (a file may carry `reveal` with no brush record, and does, for
+ * an animated export of a drawing made before symmetry was recorded), so a
+ * grouping would have to represent "reveal but no gesture" anyway and would buy
+ * only an extra level of nesting for the round trip to lose things in.
+ *
+ * ALL THREE ABSENT IS THE ORDINARY CASE AND MUST STAY CHEAP. A layer nobody
+ * recorded a gesture for carries none of these keys, `emitLayersOf` writes none,
+ * `emit.ts` emits no `data-*` attribute, and the file is byte-for-byte the file
+ * this program wrote before any of this existed. That is asserted in
+ * `test/composer.test.ts` rather than left as an intention, because "optional"
+ * in TypeScript is a claim about the type and not about what the writers do.
+ *
+ * ── `orbit` IS NOT DERIVABLE FROM `mode`, and nothing here may try ───────
+ *
+ * A seed cell sitting on a mirror line of the group is STABILISED, so a 6-fold
+ * brush lays down three cells and not six. `mode` is what the person chose;
+ * `orbit` is what the figure gave back. `mode: 6, orbit: 3` is the ordinary
+ * case, not a contradiction, and it is the case a symmetry-minded reader is most
+ * interested in — so nothing in this file computes one from the other, defaults
+ * one to the other, or validates that they agree. `artfile.ts` says the same
+ * thing at its own reader and `emit.ts` says it at its own writer; three modules
+ * repeating one rule is cheaper than one module quietly breaking it.
+ */
+export interface LayerGesture {
+  /** The animation step this layer comes up at. See `emit.EmitAnimation`. */
+  readonly reveal?: number;
+  /** The brush symmetry the gesture was made under, when one was recorded. */
+  readonly mode?: number;
+  /** How many cells the orbit ACTUALLY held. Never derived from `mode`. */
+  readonly orbit?: number;
 }
 
 /**
@@ -363,6 +485,76 @@ export const pastedName = (name: string): string => `${name} copy`;
 /** An empty layer with the given id and name. Never a group; children come later. */
 function bare(id: LayerId, name: string): Layer {
   return { id, name, plate: new Map<Address, string>(), children: [] };
+}
+
+/**
+ * A layer with a gesture recorded on it. THE ONE MINT, so absent stays absent.
+ *
+ * Every field of `g` that is `undefined` is LEFT OFF the result rather than
+ * written as an own property holding `undefined`, and that distinction is the
+ * only reason this is a function and not a spread at each call site. `{ ...l,
+ * mode: g.mode }` with `g.mode` undefined gives an object that answers `"mode"
+ * in l` with true and `Object.keys(l)` with `mode` in it — so a layer nobody
+ * recorded a gesture for stops being shaped like one, and any writer that tests
+ * for the key rather than for the value starts emitting `data-mode=""`.
+ * `emitLayersOf` happens to test the value, which means the bug would not show
+ * up in the file today and would appear the first time somebody wrote the other
+ * check. Canonical here, once, instead.
+ *
+ * DOES NOT MERGE. Passing `{ mode: 6 }` to a layer that already carried
+ * `reveal: 2` clears the reveal, because this states the whole gesture and a
+ * half-stated one is how a `mode` from one stroke ends up beside an `orbit` from
+ * another. Pass `{}` to strip.
+ *
+ * ── IT MAY ONLY BE CALLED FROM INSIDE A `Move` ─────────────────────────
+ *
+ * This docstring used to say the function had no caller in this file and name a
+ * hypothetical one outside it: "the brush path, at the moment a stroke becomes a
+ * layer". No such caller existed and none could, because in this program a stroke
+ * does not become a layer — it paints into the selected one, through `paintInto`.
+ * What the function actually was, then, was a way to rewrite three fields of a
+ * tree node with no rung in the journal: `setMode`, which the note on
+ * `LayerGesture` says does not exist, and which reproduces the switches bug
+ * verbatim if it is ever used that way — a `place` rung freezes `node: Layer`
+ * with the old numbers on it, and undoing writes them back over the new ones.
+ *
+ * It has one caller now and it is the honest one: `applyMove`'s `paint` case,
+ * which strips the gesture a paint invalidated and puts it back on undo. That is
+ * a journalled `Move`, so the rule the placement of these fields rests on —
+ * "never mutated, or mutated only by a journalled `Move`" — is satisfied by
+ * construction rather than by hope. A caller outside a `Move` is the bug this
+ * paragraph exists to name; there is no legitimate one.
+ */
+export function withGesture(layer: Layer, g: LayerGesture): Layer {
+  // COPY FIRST, then remove the three, then write what was asked for. Written
+  // this way round rather than as a rest-destructure (`const { reveal, mode,
+  // orbit, ...rest }`) so that every other field of `Layer` — including any
+  // added after this was written — survives without being named here, and
+  // without three names the linter can see are never read.
+  const out: { -readonly [K in keyof Layer]: Layer[K] } = { ...layer };
+  delete out.reveal;
+  delete out.mode;
+  delete out.orbit;
+  if (g.reveal !== undefined) out.reveal = g.reveal;
+  if (g.mode !== undefined) out.mode = g.mode;
+  if (g.orbit !== undefined) out.orbit = g.orbit;
+  return out;
+}
+
+/**
+ * The gesture a layer carries, as a value a `Move` can hold.
+ *
+ * ABSENT STAYS ABSENT here too, and for the same reason `withGesture` is careful
+ * about it: `{ mode: undefined }` on a rung is an own key holding nothing, and
+ * the whole point of that key is to be missing. A layer nobody recorded a gesture
+ * for gives `{}`, which is what `Move.was` means by "there was nothing to lose".
+ */
+export function gestureOf(layer: Layer): LayerGesture {
+  const out: { -readonly [K in keyof LayerGesture]: LayerGesture[K] } = {};
+  if (layer.reveal !== undefined) out.reveal = layer.reveal;
+  if (layer.mode !== undefined) out.mode = layer.mode;
+  if (layer.orbit !== undefined) out.orbit = layer.orbit;
+  return out;
 }
 
 /**
@@ -776,6 +968,59 @@ export function soleLayer(comp: Composition): Layer | null {
 export type Place = "insert" | "remove";
 
 /**
+ * A layer's gesture either side of a paint. THE SAME SHAPE AS A `CellEdit`.
+ *
+ * `from` is what the layer's `mode`/`orbit` were before the move and `to` is
+ * what they are after, exactly as `CellEdit` names the colour before and the
+ * colour after. `applyMove` writes `to` going forwards and `from` going back,
+ * and that is the whole of it.
+ *
+ * ── Why a PAIR, and not the single value this started as ────────────────
+ *
+ * It started as one field — `was`, the gesture the paint destroyed — on the
+ * reasoning that a paint always strips, so only the way back needs remembering.
+ * That is true of a paint and false of the JOURNAL, because `composer.
+ * invertMove` builds a move whose forward application must RESTORE: `revertMoves`
+ * turns the acts between two states into their inverses and `doRevert` journals
+ * them as one ordinary forward act, so every one of them runs `"do"`. A `"do"`
+ * that could only strip made REVERT the one control in this program that
+ * destroyed provenance for good — and destroyed it while announcing "⌘Z brings
+ * them all back", because the undo of that rung found nothing to restore and
+ * stripped a second time. Measured in `test/composer.test.ts`.
+ *
+ * A pair fixes it in the way that cannot come apart again: `invertMove` SWAPS
+ * the two, which is character for character what it already does to every
+ * `CellEdit` in the same stroke. The cells and the claim about them are inverted
+ * by one gesture of the same hand, so there is no direction in which they can
+ * disagree about which way they are going.
+ *
+ * REQUIRED on the move rather than optional, and that is the second half of the
+ * fix. `was` was optional, three consumers existed, and the third — added in the
+ * same commit as the other two — simply did not mention it and nothing said so.
+ * Required, the compiler names every construction site the day a fourth appears.
+ * `NO_GESTURE` is the honest spelling for the ordinary case, and it is a claim
+ * ("no gesture on either side of this") rather than an omission.
+ *
+ * `reveal` is not read from here. It is a fact about ORDER rather than about
+ * cells, a paint cannot move a layer in the playback sequence, and `applyMove`
+ * therefore takes it from the live layer in both directions. It is still carried
+ * by `gestureOf`, because that function answers "what gesture does this layer
+ * hold" and the answer includes it.
+ */
+export interface MoveGesture {
+  /** Before the move. Written back by `undo`. Absent means "none". */
+  readonly from?: LayerGesture;
+  /**
+   * After the move. Written by `do`. Absent means "none", which is what an
+   * ordinary paint leaves — it invalidates the symmetry it found.
+   */
+  readonly to?: LayerGesture;
+}
+
+/** No gesture either side: the layer carried none and still carries none. */
+export const NO_GESTURE: MoveGesture = {};
+
+/**
  * The four things that can happen to the drawing, and nothing else.
  *
  * Every named operation below is built out of these, which is why undo is one
@@ -786,9 +1031,23 @@ export type Place = "insert" | "remove";
  * `paint` carries a whole `Stroke<Address>` — the same value `strokes.ts` has
  * always held — so the gesture's `mark` rides along untouched. Nothing here
  * reads it; `replay.ts` does.
+ *
+ * IT ALSO CARRIES `gesture`, WHICH IS THE SAME KIND OF THING `CellEdit` IS.
+ * Painting into a layer that already carried an imported `mode`/`orbit` makes
+ * those two numbers false — they describe the gesture that produced the cells
+ * that were there, and those are no longer the cells that are there — so a paint
+ * strips them. A strip is only reversible if the move remembers both sides of
+ * it, which is exactly what every cell edit in the stroke already does. See
+ * `MoveGesture`.
  */
 export type Move =
-  | { readonly kind: "paint"; readonly layer: LayerId; readonly stroke: Stroke<Address> }
+  | {
+      readonly kind: "paint";
+      readonly layer: LayerId;
+      readonly stroke: Stroke<Address>;
+      /** The layer's gesture either side of this move. `NO_GESTURE` for none. */
+      readonly gesture: MoveGesture;
+    }
   | { readonly kind: "rename"; readonly layer: LayerId; readonly from: string; readonly to: string }
   | { readonly kind: "place"; readonly op: Place; readonly at: Path; readonly node: Layer };
 
@@ -931,10 +1190,31 @@ export function applyMove(
       let hit = false;
       const layers = mapLayer(comp.layers, move.layer, (l) => {
         hit = true;
-        return {
-          ...l,
-          plate: applyPlateEdits(l.plate, move.stroke.edits, direction),
-        };
+        const plate = applyPlateEdits(l.plate, move.stroke.edits, direction);
+        // THE GESTURE DOES NOT SURVIVE A PAINT, and it used to. `mode` and
+        // `orbit` say what the brush did to produce THESE CELLS; painting into
+        // the layer produces different cells, so the two numbers stop describing
+        // anything that is there. Measured: import a layer carrying `mode: 6,
+        // orbit: 3` over three cells, clear it, and `emit.ts` writes
+        // `data-orbit="3" data-mode="6"` around no shapes at all.
+        //
+        // READ OFF THE MOVE, one side per direction, exactly as the plate above
+        // is. This does NOT hard-code the strip: an ordinary paint states no
+        // `to` and therefore strips, and the INVERSE of one states the gesture
+        // as its `to` and therefore restores — which is the only reason REVERT
+        // works, since it runs inverses forwards. See `MoveGesture`.
+        //
+        // Only the two SYMMETRY numbers are the move's to give. `reveal` comes
+        // from the live layer in both directions, because it is the step this
+        // layer comes up at in a playback — a fact about ORDER rather than about
+        // cells. Repainting a layer does not move it in the sequence, and
+        // dropping it would silently break an animated import the first time
+        // anyone touched it.
+        const g = direction === "do" ? move.gesture.to : move.gesture.from;
+        return withGesture(
+          { ...l, plate },
+          { reveal: l.reveal, mode: g?.mode, orbit: g?.orbit }
+        );
       });
       if (!hit) throw new Error(`layers: no layer ${move.layer} to paint into`);
       return { ...comp, layers };
@@ -1321,7 +1601,18 @@ export function paintInto(
   if (edits.length === 0) return comp;
   return applyMove(
     comp,
-    { kind: "paint", layer: into.layer.id, stroke: { edits: [...edits] } },
+    {
+      kind: "paint",
+      layer: into.layer.id,
+      stroke: { edits: [...edits] },
+      // `from` is read off the CHECKED target, which `Target` guarantees was
+      // resolved from the composition being painted — so this is the gesture as
+      // it stands now, which is the one this application is about to invalidate.
+      // No `to`: a paint leaves none. A caller that journals its own rung for
+      // the same stroke must capture `from` at the FIRST application, before any
+      // of them has stripped it; see `draw/page.tsx`.
+      gesture: { from: gestureOf(into.layer) },
+    },
     "do"
   );
 }
@@ -1430,7 +1721,15 @@ export function clearLayer(session: Session): Outcome<Session> {
     if (l.plate.size !== 0) {
       const stroke = clearStroke(l.plate);
       cells += stroke.edits.length;
-      moves.push({ kind: "paint", layer: l.id, stroke });
+      // Clearing a layer is the sharpest case of a paint invalidating a gesture:
+      // the cells the `mode`/`orbit` described are all gone. `from` is what undo
+      // writes back with them.
+      moves.push({
+        kind: "paint",
+        layer: l.id,
+        stroke,
+        gesture: { from: gestureOf(l) },
+      });
     }
     for (const c of l.children) go(c);
   };
@@ -1885,6 +2184,15 @@ export function pasteInto(
  *               `subtreeColours` for the union.
  *   addresses   how many addresses this layer's own plate holds, at every depth
  *               it was painted at. NOT the number of cells it draws.
+ *
+ * THE GESTURE IS ON `node`, not beside it: `node.reveal`, `node.mode` and
+ * `node.orbit`, each absent when nothing was recorded. There is no `gesture`
+ * field here for the same reason there IS an `own` field — the switches are not
+ * on the layer and the gesture is. See `LayerGesture` for why they were placed
+ * differently and `Switches` for the bug that forced the switches off.
+ *
+ * Absent means ABSENT. Do not default `mode` to 1, and never derive `orbit`
+ * from `mode`: `mode: 6, orbit: 3` is a stabilised seed and is ordinary.
  *
  * To turn a slice into polygons: `resolvePlate(slice.node.plate, book)` gives
  * cell index → colour at the render depth, which is the same map `artworkSvg`

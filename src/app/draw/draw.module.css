@@ -2645,6 +2645,75 @@
   }
 }
 
+/**
+ * THE FOCUS BREADCRUMB — where you are, and every way back out.
+ *
+ * A row of real buttons above the plate, in normal flow. Not floated on the
+ * artwork: the canvas HUD carries three layers of `pointer-events` defence to
+ * put two buttons on a drawing surface without swallowing a stroke, and this
+ * strip would additionally sit over the cells a person is about to double-tap to
+ * get back out of the focus it describes. Height it costs, and only while a
+ * focus stands.
+ *
+ * Left-aligned rather than centred, because it grows to the right as you drill
+ * in and a centred row would slide the crumb you just clicked out from under the
+ * pointer on the next press.
+ */
+.crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 2px;
+  margin: 0 0 6px;
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+.crumbRow {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.crumbSep {
+  color: var(--bone-faint);
+  padding: 0 1px;
+}
+
+.crumb {
+  border: 1px solid transparent;
+  border-radius: 2px;
+  background: none;
+  color: var(--bone-dim);
+  padding: 3px 6px;
+  /* A 24px target is under the 44px a thumb wants, and this row is deliberately
+     small — it is furniture, not a tool. The keyboard path (I and O) and the
+     canvas double-tap are the primary ways in and out; this is the one that
+     names the levels. */
+  min-height: 22px;
+  cursor: pointer;
+  font: inherit;
+  letter-spacing: inherit;
+}
+
+.crumb:hover {
+  color: var(--bone);
+  border-color: var(--rule-bright);
+}
+
+.crumb:focus-visible {
+  outline: 2px solid var(--lime);
+  outline-offset: 1px;
+}
+
+/* Where you are. Still a button — see the note at its `aria-current` — so it
+   reads as reachable rather than as a dead label at the end of a live row. */
+.crumb[aria-current="true"] {
+  color: var(--bone);
+  border-color: var(--rule);
+  background: var(--plate-2);
+}
+
 .canvasHold {
   position: relative;
   display: flex;
@@ -2789,6 +2858,26 @@
   color: #f0a3a3;
 }
 
+/**
+ * The MOMENTARY eraser — Option held with nothing pressed.
+ *
+ * Same chip, same hue, louder: the tool is the same tool and colouring it
+ * differently would say it was a fourth one. What has to read differently is
+ * that it is TEMPORARY, and that is carried by the word (`erase · held`) plus a
+ * filled ground, so the state is legible at a glance over any artwork and from
+ * the corner of the eye.
+ *
+ * No animation. A pulsing chip over a drawing is a thing that competes with the
+ * drawing, and this is up only while a key is physically down — there is no
+ * "did I leave that on" question for a blink to answer.
+ */
+.modeFlag[data-held="on"] {
+  background: rgba(96, 22, 22, 0.86);
+  border-color: currentColor;
+  box-shadow: 0 0 0 1px rgba(240, 163, 163, 0.35);
+  color: #ffd9d9;
+}
+
 .modeFlag[data-tool="adjust"] {
   color: #7dd3fc;
 }
@@ -2826,6 +2915,36 @@
 @keyframes march {
   to {
     stroke-dashoffset: -24;
+  }
+}
+
+/**
+ * The dulled plate outside the focus, fading IN.
+ *
+ * A fade and not a slide, so there is nothing to follow across the screen —
+ * which is why it is safe to keep it at all under reduced motion, and it is
+ * still switched off there, because "no animation" is what the setting asks for
+ * and this one has nothing to say that its end state does not.
+ *
+ * `opacity` here multiplies the `opacity` the layer already carries in the
+ * markup, so the animation runs 0 → 1 and the DIM constant stays the one place
+ * the strength is decided.
+ *
+ * NO EXIT ANIMATION, and it is not an oversight: the layer is unmounted the
+ * moment the focus is left, and keeping a leaving element on a drawing surface
+ * for a quarter of a second means a quarter of a second in which the plate looks
+ * dimmed and is not.
+ */
+.dimFade {
+  animation: dimIn 160ms ease-out both;
+}
+
+@keyframes dimIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
   }
 }
 
@@ -3175,7 +3294,13 @@
   /* The save menu was simply missed: it slides and fades in on open like the
      help panel beside it, and unlike the two exemptions below it displays
      nothing — it is decoration on an element that is already there. */
-  .menu {
+  .menu,
+  /* The drill-in dim. Its end state — the plate outside the focus dulled — is
+     the whole of what it has to say, so arriving there instantly loses nothing.
+     The ZOOM half of the same gesture cannot be reached from here: an SVG
+     `viewBox` is not an animatable CSS property, so that travel is a tween in
+     `page.tsx` and reads this same query through `useSyncExternalStore`. */
+  .dimFade {
     animation: none;
   }
   /* The fuse keeps its animation: it is not decoration, it is the only display
