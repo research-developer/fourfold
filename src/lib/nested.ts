@@ -8,6 +8,70 @@
  * are. Read that file for the verdict; read this one for the shape the verdict
  * is about.
  *
+ * ── THE SHAPE: NESTING IN THE MODEL, ONE FLAT CLOCK IN THE FILE ─────────
+ *
+ * `compile` is the whole design. It walks the tree and gathers every leaf's
+ * reveal onto ONE clock as an absolute time, so what leaves this module is the
+ * shape `emit.animationRules` already consumes: a flat list of reveal indices on
+ * a single cycle. The browser never sees a nested timeline, so the
+ * `animation-delay` constraint in `emit.EmitAnimation` never applies — not
+ * because it was worked around, but because nothing nested is ever emitted.
+ *
+ * TWO PROPERTIES MAKE IT SAFE, and `test/nested.test.ts` asserts both:
+ *
+ *   MIGRATION. An unnested composition compiles to `at = k · stepMs` and
+ *   `cycle = n · stepMs + holdMs`, which are `emit.animationRules`' own two
+ *   formulas. Asserted on BYTES, by running the real `serialise` over the same
+ *   document twice — once with today's numbering, once with the compiler's — and
+ *   comparing the strings, and by reading the cycle back out of the emitted CSS.
+ *
+ *   LOCALISATION. Inserting a hold inside a child leaves every parent-level
+ *   ORDINAL alone. That is the property the whole feature exists for, and it is
+ *   real. What it is NOT is a guarantee about absolute TIMES — see the
+ *   conservation law below, which is the sharpest thing this file found.
+ *
+ * ── THE CONSERVATION LAW ────────────────────────────────────────────────
+ *
+ * A brief for this work asked that inserting a hold inside a child change "no
+ * parent-level index and no other child's absolute times except those downstream
+ * within the same child". THE SECOND HALF CANNOT HOLD, and the reason is
+ * arithmetic rather than architectural: a hold ADDS `stepMs` of duration, and
+ * that duration has to be absorbed somewhere. There are exactly two places, and
+ * `CompileMode` is the choice between them:
+ *
+ *   `"extend"` — the child keeps its own tempo and its slot grows. Every time
+ *   inside the child is untouched except downstream of the insertion, exactly as
+ *   asked. THE PARENT'S DOWNSTREAM BEATS SHIFT LATER by one `stepMs`, because
+ *   the drawing genuinely got one beat longer.
+ *
+ *   `"within"` — the child's slot is pinned to one parent beat and its steps
+ *   COMPRESS to fit. Every parent time is untouched, as asked. THE CHILD'S OWN
+ *   UPSTREAM STEPS SPEED UP, including ones before the insertion point, so the
+ *   half of the property about "no other child's absolute times" fails instead.
+ *
+ * You may have one or the other and not both. Indices localise unconditionally;
+ * times do not localise at all.
+ *
+ * `"extend"` IS THE DEFAULT, and that is a DEVIATION from the brief, which asked
+ * for play-once-within-parent as the default. It was measured and the measurement
+ * decided it:
+ *
+ *   GROUPING MUST NOT CHANGE THE ANIMATION. Auto-grouping is a POLICY applied
+ *   automatically so that a hold can be inserted off the root — the person did
+ *   not ask for it and must not be able to see it. Under `"extend"`, grouping is
+ *   COMPILE-INVARIANT: `compile(group(T)) === compile(T)`, asserted on the
+ *   reveal list. Under `"within"`, wrapping n steps collapses them into one
+ *   parent beat and the drawing plays n times faster in that region — so the
+ *   invisible policy would be the most visible edit in the program.
+ *
+ *   `"within"` ALSO BREAKS THE INTEGER DISCIPLINE. Compression is
+ *   `slot / beats`, and `replay.animationTiming` is explicit that timings are
+ *   "integers throughout: the percentages downstream are the only floats". A
+ *   compressed child puts a non-integer millisecond into the model.
+ *
+ * `"within"` is implemented anyway, because it is the honest statement of the
+ * alternative and because the test that kills it has to be able to run it.
+ *
  * ── The problem, in one paragraph ───────────────────────────────────────
  *
  * `replay.animationSteps` DROPS a gesture that changed nothing visible, so the
@@ -538,6 +602,114 @@ export function rebaseTree(
 export const timelineOf = (past: readonly Act[]): Timeline =>
   past.map((_, k): Beat => ({ kind: "beat", id: stepId(k), act: k }));
 
+// ── the compiler: a nested model onto one flat clock ─────────────────────
+
+/**
+ * How the duration a hold adds is absorbed. See the conservation law in the
+ * header — this is the choice, and there is no third option.
+ */
+export type CompileMode = "extend" | "within";
+
+/** The one clock. The same three numbers `emit.EmitAnimation` carries. */
+export interface Tempo {
+  readonly stepMs: number;
+  readonly holdMs: number;
+  readonly fadeMs: number;
+}
+
+/** A composition's own `stepMs`, when it does not inherit its parent's. */
+export type Tempos = ReadonlyMap<StepId, number>;
+
+/** One leaf, placed on the flat clock. */
+export interface Reveal {
+  readonly id: StepId;
+  readonly act: number | null;
+  /** Absolute milliseconds from the start of the cycle. */
+  readonly at: number;
+  /** The flat index `emit.EmitLayer.reveal` would carry. DERIVED, and unstable. */
+  readonly index: number;
+}
+
+export interface Compiled {
+  readonly reveals: readonly Reveal[];
+  /** `emit.animationRules`' cycle: the drawing's length plus the hold. */
+  readonly cycle: number;
+  /** Where each ROOT-level step starts. The parent-level facts, isolated. */
+  readonly rootAt: ReadonlyMap<StepId, number>;
+}
+
+/**
+ * The nested model, compiled onto one clock. THE WHOLE DESIGN.
+ *
+ * The greatest ancestor walks to the furthest leaf and gathers every reveal into
+ * one ascending list of absolute times; the flat index is then just the position
+ * in that list. Nothing nested survives into the output, which is why the file
+ * this feeds is the file `emit.ts` already writes.
+ *
+ * PURE, and that matters more than it looks: the tree is the only input, so two
+ * documents with the same tree compile to the same timeline, and a compile can
+ * be run twice to compare — which is exactly what the group-invariance test does.
+ */
+export function compile(
+  tl: Timeline,
+  tempo: Tempo,
+  mode: CompileMode = "extend",
+  tempos: Tempos = new Map()
+): Compiled {
+  const placed: { id: StepId; act: number | null; at: number }[] = [];
+  const rootAt = new Map<StepId, number>();
+
+  /** How long a step occupies its parent's line. */
+  const durationOf = (s: Step, stepMs: number): number => {
+    if (s.kind === "beat") return stepMs;
+    // A child pinned to one parent beat occupies exactly that, whatever it holds.
+    if (mode === "within") return stepMs;
+    const own = tempos.get(s.id) ?? stepMs;
+    return s.steps.reduce((n, c) => n + durationOf(c, own), 0);
+  };
+
+  const lay = (steps: Timeline, start: number, stepMs: number, root: boolean): number => {
+    let at = start;
+    for (const s of steps) {
+      if (root) rootAt.set(s.id, at);
+      if (s.kind === "beat") {
+        placed.push({ id: s.id, act: s.act, at });
+        at += stepMs;
+        continue;
+      }
+      const slot = durationOf(s, stepMs);
+      let own = tempos.get(s.id) ?? stepMs;
+      if (mode === "within") {
+        const beats = beatCount(s.steps);
+        // COMPRESSION, and the one place this module produces a non-integer
+        // millisecond. See the header for why that is an argument against the
+        // mode rather than a detail of it.
+        if (beats > 0 && beats * own > slot) own = slot / beats;
+      }
+      lay(s.steps, at, own, false);
+      at += slot;
+    }
+    return at;
+  };
+
+  const drawn = lay(tl, 0, tempo.stepMs, true);
+  placed.sort((a, b) => a.at - b.at);
+  const reveals: Reveal[] = placed.map((p, k) => ({ ...p, index: k }));
+  // `emit.animationRules`' own formula, and for an unnested tree `drawn` is
+  // exactly `steps * stepMs`, which is what makes the migration byte-identical.
+  return { reveals, cycle: Math.max(1, drawn + tempo.holdMs), rootAt };
+}
+
+/**
+ * Which root-level step each parent-level ordinal names.
+ *
+ * THE THING THAT LOCALISES. A hold anywhere inside a child cannot change this
+ * list, because a composition occupies one entry of it whatever it contains —
+ * which is the precise sense in which nesting solves the renumbering problem,
+ * and the only sense in which it does.
+ */
+export const rootOrder = (tl: Timeline): readonly StepId[] => tl.map((s) => s.id);
+
 // ── what the two readings cost the stylesheet ────────────────────────────
 
 /**
@@ -556,6 +728,30 @@ export const timelineOf = (past: readonly Act[]): Timeline =>
  * steps give L = 1001 and an element of the 7-clip needs 143 pulses — 286 stops
  * in one keyframes block, against 4. `test/nested.test.ts` computes both on the
  * same tree so the ratio is measured rather than asserted.
+ *
+ * ── THE LCM IS AN ARTEFACT OF FLATTENING, NOT OF LOOPING ────────────────
+ *
+ * Worth stating because it changes what the number below means. An independent
+ * loop does NOT need the LCM if the nesting stays in the DOM: a `<g>` on its own
+ * cycle containing children on theirs was measured holding both periods to the
+ * millisecond with zero drift. The LCM appears only when the requirement is ONE
+ * element per reveal on ONE clock, which is what flattening is.
+ *
+ * THE ONE-ELEMENT ESCAPE WAS MEASURED AND DOES NOT EXIST. A comma-separated
+ * `animation` list — `animation: fast 800ms infinite, slow 3200ms infinite`,
+ * both on `opacity` — would express two independent cycles on a single element
+ * if the list composed multiplicatively. IT DOES NOT: the last animation in the
+ * list simply wins. Against a true nested product built from the same two
+ * keyframe sets in the same document, the single element agreed with its LAST
+ * ANIMATION ALONE on 100% of samples and with the product on 87.7%; dark
+ * fraction 0.340 for the list against 0.340 for the outer cycle by itself and
+ * 0.462 for the product. So there is no way to multiply two opacity cycles on
+ * one element short of `@property` and `calc()`, and `replay.ts` already
+ * rejected registered custom properties on measured grounds — 4.6× the style
+ * recalculation for a 9.4% byte saving.
+ *
+ * The choice is therefore between flat markup paying the LCM and nested markup
+ * paying a per-composition selector. There is no third form.
  *
  * `periods` is the beat length of each independent clip; the addressing reading
  * ignores it entirely, which is the point.

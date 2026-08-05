@@ -24,9 +24,13 @@
 import { describe, expect, it } from "vitest";
 import { layerId, type Act, type Move } from "../src/lib/layers";
 import { mergeActs } from "../src/lib/frames";
+import { serialise, type EmitDoc, type EmitLayer } from "../src/lib/emit";
+import type { ArtCell } from "../src/lib/strokes";
 import type { Address } from "../src/lib/plate";
 import {
   beatCount,
+  compile,
+  rootOrder,
   depth,
   flatten,
   group,
@@ -387,6 +391,160 @@ describe("merge and group are NOT inverses", () => {
     const { act } = mergeActs([paint(null, "#aa8800"), paint("#aa8800", null)], "merged");
     const move = act.moves[0] as Extract<Move, { kind: "paint" }>;
     expect(move.stroke.edits.length).toBe(0);
+  });
+});
+
+// ── the compiler: nested model, one flat clock ───────────────────────────
+
+const TEMPO = { stepMs: 250, holdMs: 1800, fadeMs: 90 };
+
+/** A minimal document the real emitter will serialise. Synthetic congruent cells. */
+function docWith(reveals: readonly number[]): EmitDoc {
+  const cells = new Map<number, ArtCell>();
+  for (let i = 0; i < 8; i++) {
+    const x = i * 10;
+    cells.set(i, { verts: [[x, 0], [x + 10, 0], [x + 5, 8]] });
+  }
+  const layers: EmitLayer[] = reveals.map((r, k) => ({
+    id: `s${k}`,
+    reveal: r,
+    paint: new Map([[k, "#aa8800"]]),
+  }));
+  return {
+    width: 80,
+    height: 8,
+    cells,
+    shown: [0, 1, 2, 3, 4, 5, 6, 7],
+    background: "#0a0908",
+    unpainted: "#141110",
+    tileSeam: null,
+    paintSeam: null,
+    seamWidth: 0.7,
+    weldPaint: false,
+    title: "compile probe",
+    layers,
+    overlay: [],
+    animation: { ...TEMPO, steps: reveals.length },
+    payload: {
+      version: 1,
+      canvas: "hexagon",
+      depth: 1,
+      convention: "apex",
+      cells: reveals.map((_, k): [number, string] => [k, "#aa8800"]),
+    },
+  };
+}
+
+describe("compiling a nested model onto one flat clock", () => {
+  it("MIGRATION: an unnested composition compiles to today's numbers", () => {
+    const flat = timelineOf(Array.from({ length: 6 }, () => ({ moves: [], note: "", events: 0 })));
+    const c = compile(flat, TEMPO);
+    // `emit.animationRules`: a keyframe sits at `k * stepMs`, and the cycle is
+    // `steps * stepMs + holdMs`. Both restated by the compiler, not reinvented.
+    expect(c.reveals.map((r) => r.at)).toEqual([0, 250, 500, 750, 1000, 1250]);
+    expect(c.reveals.map((r) => r.index)).toEqual([0, 1, 2, 3, 4, 5]);
+    expect(c.cycle).toBe(6 * 250 + 1800);
+  });
+
+  it("MIGRATION, ON BYTES: the real emitter writes the same file either way", () => {
+    const flat = timelineOf(Array.from({ length: 6 }, () => ({ moves: [], note: "", events: 0 })));
+    const c = compile(flat, TEMPO);
+    const today = serialise(docWith([0, 1, 2, 3, 4, 5]));
+    const compiled = serialise(docWith(c.reveals.map((r) => r.index)));
+    // The migration guarantee, asserted where it actually matters: not on a
+    // formula, on the bytes the program ships.
+    expect(compiled).toBe(today);
+    // And the cycle the compiler computed is the cycle the emitter wrote, read
+    // back out of the CSS rather than assumed.
+    const said = /animation-duration: (\d+)ms/.exec(today);
+    expect(said).not.toBeNull();
+    expect(Number((said as RegExpExecArray)[1])).toBe(c.cycle);
+  });
+
+  it("LOCALISATION: a hold inside a child leaves every parent-level ordinal alone", () => {
+    const before = tree();
+    const after = insertHold(before, C, 1, stepId(910));
+    // The parent-level ordinals are the root's own steps. A composition occupies
+    // ONE of them whatever it contains, so nothing inside can move this list.
+    expect(rootOrder(after)).toEqual(rootOrder(before));
+    // And the root-level start times before the edited composition are untouched.
+    const a = compile(before, TEMPO);
+    const b = compile(after, TEMPO);
+    expect(b.rootAt.get(stepId(0))).toBe(a.rootAt.get(stepId(0)));
+    expect(b.rootAt.get(D)).toBe(a.rootAt.get(D));
+    expect(b.rootAt.get(C)).toBe(a.rootAt.get(C));
+  });
+
+  it("THE CONSERVATION LAW: extend shifts the parent, within shifts the child", () => {
+    const before = tree();
+    // Insert at the END of C, so every existing child step is UPSTREAM of it.
+    const after = insertHold(before, C, 3, stepId(911));
+
+    // "extend": the child keeps its tempo, its slot grows, and the root step
+    // AFTER the edited composition moves later by exactly one stepMs.
+    const ea = compile(before, TEMPO, "extend");
+    const eb = compile(after, TEMPO, "extend");
+    const upstream = (c: typeof ea, id: StepId) =>
+      (c.reveals.find((r) => r.id === id) as { at: number }).at;
+    expect(upstream(eb, stepId(3))).toBe(upstream(ea, stepId(3)));
+    expect(upstream(eb, stepId(5))).toBe(upstream(ea, stepId(5)));
+    expect((eb.rootAt.get(stepId(6)) as number) - (ea.rootAt.get(stepId(6)) as number)).toBe(
+      TEMPO.stepMs
+    );
+    expect(eb.cycle - ea.cycle).toBe(TEMPO.stepMs);
+
+    // "within": every parent time is pinned, and the child's own UPSTREAM steps
+    // speed up to pay for the hold — the half of the brief's property that
+    // cannot hold.
+    const wa = compile(before, TEMPO, "within");
+    const wb = compile(after, TEMPO, "within");
+    expect(wb.rootAt.get(stepId(6))).toBe(wa.rootAt.get(stepId(6)));
+    expect(wb.cycle).toBe(wa.cycle);
+    expect(upstream(wb, stepId(5))).not.toBe(upstream(wa, stepId(5)));
+    // And it leaves the integer discipline the moment the beat count does not
+    // divide the slot. C holds three steps compressed into one 250 ms beat, so
+    // the tempo is 250/3 and the reveal times are not whole milliseconds —
+    // against `replay.animationTiming`'s "integers throughout".
+    expect(compile(before, TEMPO, "within").reveals.some((r) => !Number.isInteger(r.at))).toBe(
+      true
+    );
+    // THE MODE INTRODUCES THE FLOAT, not the tree: the same tree under
+    // "extend" is whole milliseconds throughout, because nothing is ever
+    // divided — every step is one `stepMs` and the slots are sums of them.
+    expect(compile(before, TEMPO, "extend").reveals.every((r) => Number.isInteger(r.at))).toBe(
+      true
+    );
+    expect(compile(after, TEMPO, "extend").reveals.every((r) => Number.isInteger(r.at))).toBe(
+      true
+    );
+  });
+
+  it("GROUPING IS COMPILE-INVARIANT under extend, and destructive under within", () => {
+    const before = tree();
+    const grouped = group(before, C, 0, 2, stepId(920)) as Timeline;
+
+    // THE ARGUMENT FOR THE DEFAULT. Auto-grouping is applied for the person
+    // rather than by them, so it must not be visible in the animation.
+    const a = compile(before, TEMPO, "extend");
+    const b = compile(grouped, TEMPO, "extend");
+    expect(b.reveals.map((r) => [r.id, r.at])).toEqual(a.reveals.map((r) => [r.id, r.at]));
+    expect(b.cycle).toBe(a.cycle);
+
+    // Under "within" the same wrapping collapses two beats into one parent slot
+    // and the region plays twice as fast — the invisible policy would be the
+    // most visible edit in the program.
+    const w = compile(grouped, TEMPO, "within");
+    expect(w.cycle).not.toBe(a.cycle);
+  });
+
+  it("group-then-ungroup compiles to the identical flat timeline", () => {
+    const before = tree();
+    const grouped = group(before, C, 1, 2, stepId(921)) as Timeline;
+    const back = ungroup(grouped, stepId(921)) as Timeline;
+    const a = compile(before, TEMPO);
+    const c = compile(back, TEMPO);
+    expect(c.reveals).toEqual(a.reveals);
+    expect(c.cycle).toBe(a.cycle);
   });
 });
 
