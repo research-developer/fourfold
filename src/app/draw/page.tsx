@@ -165,18 +165,63 @@ import {
   animationTiming,
   boundAnimation,
   type AnimationStep,
-  type InOut,
 } from "@/lib/replay";
 import {
+  actAfterMerge,
   actAtStep,
   beatsOf,
   GROUND,
+  lostSaid,
   markIn,
   markOut,
+  mergeSaid,
+  minter,
+  nameAtStep,
+  nameSpan,
+  rangeOfSpan,
+  rebaseSaid,
+  redoSaid,
+  refusedSaid,
+  resolveSpan,
+  sameCommitted,
+  sameJournal,
   spanSaid,
   stepAtAct,
+  syncSaid,
+  syncTree,
+  undoSaid,
   type Beats,
+  type NamedSpan,
 } from "@/lib/timeline";
+/**
+ * THE THREE MODEL FILES THIS PASS WIRED, and nothing here is new work.
+ *
+ * `frames.ts` and `nested.ts` were built, tested and called by nothing. Every
+ * decision they record — a rewrite is a REBASE and not a truncation, a merged
+ * frame whose modes disagree carries no mark at all, a frame edit is undone by
+ * REVISION because no `Act` can describe a change to the list of acts, a beat is
+ * addressed by a minted NAME because only a name survives an insertion — is
+ * theirs, argued at length in their headers, and this file's job is to make them
+ * reachable and to say what they report.
+ */
+import {
+  editFrame,
+  mergeFrames,
+  NO_REVISIONS,
+  recolourAct,
+  redoRevision,
+  remember,
+  undoRevision,
+  type Revisions,
+} from "@/lib/frames";
+/**
+ * `Timeline` is ALIASED because this file already has one: the strip under the
+ * plate, exported from `LayersPanel`. The two are a tree and a control, they sit
+ * fifty lines apart in the imports, and TypeScript would take the second and
+ * leave the first — so the model's is renamed at the door rather than the
+ * component's, which is the name the JSX below reads.
+ */
+import { groupFor, rebaseTree, type Timeline as TimelineTree } from "@/lib/nested";
 import { gifSteps } from "@/lib/gif";
 import {
   act as journalAct,
@@ -203,10 +248,12 @@ import {
   renameLayer,
   select as selectLayer,
   soleLayer,
+  strata,
   switchesOf,
   toggleLocked,
   toggleVisible,
   undo as undoSession,
+  type Act,
   type Composition,
   type Layer,
   type LayerGesture,
@@ -1230,24 +1277,123 @@ export default function DrawPage() {
    * as it did before this existed" — so the resting value here and the resting
    * value in the model are the same value, and nothing has to translate.
    *
-   * IN STEP SPACE, not act space: these are indices into `AnimationStep[]`, the
-   * same space `emit.EmitLayer.reveal` and `replay.InOut` are in. See
-   * `lib/timeline.ts` for the map to the journal's own index and why the two
-   * cannot be the same number.
+   * STORED AS NAMES, and this is the change this pass made to it. They used to
+   * be indices into `AnimationStep[]`; they are now a pair of `nested.StepId`s
+   * into `timeline` below, resolved back to that index space by
+   * `timeline.resolveSpan` wherever an index is what a consumer wants.
    *
-   * OUTLIVES THE PREVIEW, deliberately. A cut is a property of the drawing — it
-   * is what the two exports will write — and not of the panel that happens to be
-   * open, so closing the preview leaves it standing and the panel keeps
-   * reporting it. It can therefore be stale after an edit or a frame change, and
-   * that is handled the way the model says to handle it: every reader runs it
-   * through `clampSpan` first, which is exactly what `clampSpan` is for.
+   * WHY, measured rather than argued: `test/nested.test.ts` runs one probe
+   * against five insertion sites and tabulates which address survives each. The
+   * flat index survives three of them, a positional path survives a different
+   * three, and only the MINTED NAME survives all five. A mark is exactly a stored
+   * address into the beat list, so an index-valued mark names a different gesture
+   * the moment anything is inserted before it — and this program can already
+   * reach that without any holds at all, because the beat list is per-FRAME and
+   * step 5 of the hexagon's list and step 5 of a sector's are different gestures.
+   * `timeline.syncTree` carries a name across that change by act; nothing can
+   * carry an index across it.
+   *
+   * OUTLIVES THE PREVIEW, deliberately and still. A cut is a property of the
+   * drawing — it is what the two exports will write — and not of the panel that
+   * happens to be open. That is what forces `timeline` below to outlive the
+   * preview too: the names have to have something to resolve against.
+   *
+   * A NAME CAN DANGLE, which an index could not, and that is the price. The
+   * answer is `timeline.resolveSpan`, which falls back to the whole replay AND
+   * REPORTS having done so — see `playCut`, where the sentence is produced.
    *
    * NAMED `playSpan` and not `span`, because this file already has one: the
    * BAND span, how many orbit positions a striped brush lays. Two things called
    * `span` in a 7000-line component is how a colour rail comes to be indexed by
    * an out point.
    */
-  const [playSpan, setPlaySpan] = useState<InOut | null>(null);
+  const [playSpan, setPlaySpan] = useState<NamedSpan | null>(null);
+  /**
+   * THE NESTED TIMELINE — one named beat per animation step of the frame the
+   * playhead was last stood up in, plus any compositions grouping them.
+   *
+   * ── Why the page holds it, and why it is nullable ──────────────────────
+   *
+   * `nested.ts` keeps this tree BESIDE the journal rather than inside `Session`,
+   * on `frames.ts`'s own argument run one step further: a `Move` cannot reach the
+   * journal, and putting the tree inside a `Session` would put it somewhere a
+   * `Move` could reach, at which point undo becomes recursive. So it is a second
+   * value the page holds, and `frames.Revision` is the pair of the two — which is
+   * why every revision below remembers `{ session, timeline }` and not a session.
+   *
+   * `null` IS THE ORDINARY RESTING STATE, exactly as `rewind.beats` is absent
+   * until a playhead is stood up: building it means counting the beats, and
+   * counting the beats means flattening every state of the journal (~205 ms at
+   * depth 5 with 256 acts — see `frameBeats`). So it is minted at the same moment
+   * the beats are, by `standTree`, and then KEPT: it outlives the preview because
+   * the marks name into it and the marks outlive the preview.
+   */
+  const [timeline, setTimeline] = useState<TimelineTree | null>(null);
+  /**
+   * A source of fresh step names, monotone for the life of the page.
+   *
+   * A REF and not state, because minting a name is not a render: `timeline.minter`
+   * hands back a closure over a counter and the counter must not roll back, on
+   * exactly the rule `layers.act` keeps for `nextId` — "rolling the counter back
+   * would mean a layer added after an undo could mint an id a rung in the journal
+   * still names". A revision restores an old tree holding old names; a name
+   * minted after that must not collide with one of them.
+   */
+  const mintStep = useRef(minter());
+  /**
+   * THE SECOND UNDO STACK: whole revisions, remembered before a frame edit.
+   *
+   * `frames.ts` proves this cannot be a rung of the journal — `applyMove` has the
+   * type `(Composition, Move, direction) → Composition`, the journal is not in a
+   * `Composition`, so no `Act` can describe a change to the list of acts. It is
+   * therefore a second stack, and a second stack under ONE keystroke is how ⌘Z
+   * becomes ambiguous. `revisionMark` below is what stops it.
+   */
+  const [revisions, setRevisions] = useState<Revisions>(NO_REVISIONS);
+  /**
+   * WHAT THE LAST FRAME EDIT LEFT STANDING — the session it produced, and what
+   * to call it. `null` when no frame edit has happened, or when one has been
+   * undone all the way back.
+   *
+   * ── This is the whole of the ⌘Z disambiguation ─────────────────────────
+   *
+   * The routing question is "has the journal moved since the frame edit?" and
+   * `timeline.sameJournal` answers it against this mark:
+   *
+   *   NOT MOVED → the frame edit is the most recent thing that happened, so ⌘Z
+   *   takes back the frame edit.
+   *   MOVED → a stroke was drawn, undone or redone since, so ⌘Z takes that back.
+   *
+   * The two are mutually exclusive, the test is total, and it is exactly LIFO
+   * rather than an approximation: undoing the strokes made after a frame edit
+   * brings the journal back to the state the edit left it in — the same rungs,
+   * which are the same objects, because every `Act` is immutable and shared — at
+   * which point the next ⌘Z reaches the edit. See `timeline.sameJournal`.
+   *
+   * ── The two names, and why one of them is sometimes generic ────────────
+   *
+   * A `frames.Revision` deliberately carries no note: it is `{ session, timeline
+   * }`, the two things a rewrite moves, and a sentence is not one of them. But
+   * the strip has to be able to SAY what ⌘Z will take back before it is pressed —
+   * a routing rule nobody can see is a surprise the first time it fires — so the
+   * words live here, beside the mark that decides.
+   *
+   * `undo` and `redo` are the top of each branch. They are EXACT for the edit
+   * that just happened, because this file made it and knows what it was, and
+   * deliberately GENERIC for anything deeper: a parallel stack of notes shadowing
+   * `Revisions` would be two stacks maintained by remembering, which is precisely
+   * the arrangement `layers.Act.events` was moved into the journal to destroy —
+   * "an invariant maintained by four call sites remembering is not an invariant".
+   * A slightly vaguer sentence is a much better trade than a note stack that can
+   * come out of step with the revisions it names.
+   */
+  const [revisionMark, setRevisionMark] = useState<{
+    session: Session;
+    /** What ⌘Z takes back while the journal has not moved. `null` when nothing. */
+    undo: string | null;
+    /** What ⇧⌘Z puts back on the same terms. `null` when nothing. */
+    redo: string | null;
+  } | null>(null);
   const [stepMs, setStepMs] = useState(STEP_MS_DEFAULT);
   const [gifWidth, setGifWidth] = useState(GIF_WIDTH_DEFAULT);
   /**
@@ -1630,6 +1776,37 @@ export default function DrawPage() {
    */
   const paint = useMemo(
     () => flattenComposition(rewind === null ? comp : rewind.comp, book),
+    [comp, rewind, book]
+  );
+
+  /**
+   * The same stack, as a TREE, when — and only when — something is faded.
+   *
+   * `paint` above is the composite and it is what everything reads: the ghost,
+   * the readouts, the relief, the adjust brush. It cannot express a fade,
+   * because `flatten` OCCLUDES rather than mixes and must keep doing so — that
+   * closure is what guarantees the adjust brush is never handed a colour no
+   * scheme named (`layers.ts`, the amended NO BLENDING note).
+   *
+   * So a fade is a DISPLAY fact and travels beside the composite, never inside
+   * it. `strata` answers `null` when every layer is opaque, and on `null` the
+   * board renders through the one `PaintLayer` it always did — so an unfaded
+   * document takes the old code path rather than a new one that happens to
+   * agree with it.
+   *
+   * A TREE and not a flat list with the alphas multiplied out, which was
+   * measured in Chromium rather than assumed: a group's opacity applies to the
+   * group's COMPOSITED result, so gold under red inside one `opacity="0.5"`
+   * renders (255,128,128) — the gold gone entirely — where the multiplied-out
+   * list renders (255,115,64). Disjoint cells do multiply exactly; overlapping
+   * ones do not. `emit.ts` writes the same nesting, so the canvas and the file
+   * cannot drift.
+   *
+   * Mirrors `paint`'s preview substitution exactly, so a fade is visible while
+   * scrubbing for the same reason the drawing is.
+   */
+  const strataTree = useMemo(
+    () => strata(rewind === null ? comp : rewind.comp, book),
     [comp, rewind, book]
   );
 
@@ -2222,6 +2399,25 @@ export default function DrawPage() {
     // The event log is the journal, and `newSession` empties it — so there is
     // no second stack here to remember to clear.
     setSession(newSession(next));
+    /**
+     * THE TIMELINE GOES WITH THE JOURNAL, all four pieces of it.
+     *
+     * A `Beat` names an index into `Journal.past` and a revision holds a whole
+     * session, so a tree or a revision that outlived a wipe would name rungs of a
+     * journal that no longer exists — which is the same argument this function
+     * already makes about the undo stacks, one value further out.
+     *
+     * THE MARKS GO TOO, and that is a CHANGE. They used to survive a wipe, and
+     * the seam would then read "in 2 and out 4 are set" over an empty drawing —
+     * true of the state and false of the drawing, because `clampSpan` resolves
+     * them to nothing the moment anything reads them. Now that they are names
+     * into a tree that has just been emptied there is no honest reading left at
+     * all, so they are cleared where everything else they depended on is.
+     */
+    setTimeline(null);
+    setRevisions(NO_REVISIONS);
+    setRevisionMark(null);
+    setPlaySpan(null);
     setProgOrigin(0);
     setHover(null);
     setCursor(null);
@@ -2965,58 +3161,14 @@ export default function DrawPage() {
   );
 
   /**
-   * ONE undo, over paint and over the shape of the tree alike.
+   * ONE undo, over paint and over the shape of the tree alike — AND, since this
+   * pass, over the frame edits that are not in the journal at all.
    *
-   * `layers.undo` walks the journal that `endStroke`, the panel and the presets
-   * all push to, so ⌘Z takes back whatever was actually done last — a stroke, a
-   * new layer, a reorder, a paste — in the order it happened. The alternative,
-   * a paint stack beside a layer stack, would have made the same keystroke mean
-   * two things depending on which the person had in mind.
-   *
-   * The EVENT LOG only moves for an act that painted. It shadows the journal so
-   * the progression index is recoverable, and a reorder spends no colour, so
-   * popping it for a structural act would slide every future stroke's hue.
+   * The two halves are `doUndo` and `doRedo`, and they live further down the file
+   * now, next to the frame edits they had to learn about: they depend on
+   * `restage`, which depends on the beat count, so they cannot be declared above
+   * it. See "editing the past".
    */
-  const doUndo = useCallback(() => {
-    if (previewing) {
-      setAnnounce("a preview is standing — close it before undoing");
-      return;
-    }
-    const step = undoSession(session);
-    if (step.act === null) {
-      setAnnounce("nothing to undo");
-      return;
-    }
-    compRef.current = step.session.composition;
-    setSession(step.session);
-    // Nothing to do for the event log: it IS the journal, so it moved with it.
-    // This used to be a guarded `setEvents(undoEvents(events))`, and the guard
-    // was the bug — an act nobody counted popped somebody else's rung.
-    setAnnounce(
-      `undid ${step.act.note} — ${
-        flattenComposition(step.session.composition, book).size
-      } cells on the plate`
-    );
-  }, [previewing, session, book]);
-
-  const doRedo = useCallback(() => {
-    if (previewing) {
-      setAnnounce("a preview is standing — close it before redoing");
-      return;
-    }
-    const step = redoSession(session);
-    if (step.act === null) {
-      setAnnounce("nothing to redo");
-      return;
-    }
-    compRef.current = step.session.composition;
-    setSession(step.session);
-    setAnnounce(
-      `redid ${step.act.note} — ${
-        flattenComposition(step.session.composition, book).size
-      } cells on the plate`
-    );
-  }, [previewing, session, book]);
 
   // ── the past, previewed ─────────────────────────────────────────────────
 
@@ -3060,13 +3212,53 @@ export default function DrawPage() {
    * Nothing here is new: these are the first three lines of `animationModel`,
    * without the baked frame and the polygons, which the playhead does not need.
    */
-  const frameBeats = useCallback((): number[] => {
-    const shown = canvas.view.mode === "sector" ? canvas.shown : undefined;
-    return beatsOf(
-      everyComposition(comp, past).map((c) => flattenComposition(c, book)),
-      shown
-    );
-  }, [comp, past, canvas, book]);
+  const beatsFor = useCallback(
+    (at: Composition, journal: readonly Act[]): number[] => {
+      const shown = canvas.view.mode === "sector" ? canvas.shown : undefined;
+      return beatsOf(
+        everyComposition(at, journal).map((c) => flattenComposition(c, book)),
+        shown
+      );
+    },
+    [canvas, book]
+  );
+
+  /**
+   * The same walk over the LIVE session.
+   *
+   * Split from `beatsFor` above because a frame edit has to count the beats of a
+   * journal that `setSession` has been handed but React has not yet rendered —
+   * the state variables in this closure are still the old ones at that moment, so
+   * the rewrite passes its own composition and journal in explicitly. One walk,
+   * two ways of naming what to walk.
+   */
+  const frameBeats = useCallback(
+    (): number[] => beatsFor(comp, past),
+    [beatsFor, comp, past]
+  );
+
+  /**
+   * The named tree brought into step with a beat list, and kept.
+   *
+   * CALLED WHEREVER THE BEATS ARE COUNTED and nowhere else, because the tree is
+   * exactly a naming of that list and the two must not be able to disagree.
+   * `timeline.syncTree` does the work and returns the same object when nothing
+   * moved, which is what keeps this out of the render loop: the ordinary case —
+   * a playhead stood up twice on an unchanged drawing — sets no state at all.
+   *
+   * The sentence is the CALLER's to say. A rebuild drops the tree's groups and
+   * holds and `syncSaid` names that, but this is called from three places with
+   * three different things to announce, and a helper that announced on its own
+   * would talk over all of them.
+   */
+  const standTree = useCallback(
+    (beats: Beats) => {
+      const sync = syncTree(timeline, beats, mintStep.current);
+      if (sync.tree !== timeline) setTimeline(sync.tree);
+      return sync;
+    },
+    [timeline]
+  );
 
   /**
    * Open a preview, or move an open one to the other instrument.
@@ -3104,21 +3296,27 @@ export default function DrawPage() {
       setProposal(EMPTY_PROPOSAL);
       setHover(null);
       const index = kind === "replay" ? 0 : steps;
+      const beats = frameBeats();
       setRewind({
         kind,
         index,
         comp: stepComposition(compRef.current, past, steps, index),
         playing: kind === "replay",
-        beats: frameBeats(),
+        beats,
         frame: frameKey,
       });
-      setAnnounce(
+      // The tree is named for the SAME beat list the preview is about to read,
+      // in the same breath, so a mark set a moment later cannot name a beat the
+      // playhead does not have.
+      const sync = standTree(beats);
+      const said =
         kind === "replay"
           ? `replay — ${steps} gesture${steps === 1 ? "" : "s"} at ${stepMs} ms each; the plate is a preview and nothing is being changed`
-          : `history — ${steps} gesture${steps === 1 ? "" : "s"}; drag the scrub to preview an earlier state. Nothing is changed until REVERT`
-      );
+          : `history — ${steps} gesture${steps === 1 ? "" : "s"}; drag the scrub to preview an earlier state. Nothing is changed until REVERT`;
+      const note = syncSaid(sync);
+      setAnnounce(note === null ? said : `${said}. ${note}`);
     },
-    [steps, past, disarm, stepMs, frameBeats, frameKey]
+    [steps, past, disarm, stepMs, frameBeats, frameKey, standTree]
   );
 
   const closeRewind = useCallback((why: string) => {
@@ -3264,12 +3462,12 @@ export default function DrawPage() {
     }
     const beats = frameBeats();
     setRewind((r) => (r === null ? r : { ...r, beats, frame: frameKey }));
-    setAnnounce(
-      `playhead — ${beats.length} animation step${
-        beats.length === 1 ? "" : "s"
-      } in this frame, over ${steps} committed gesture${steps === 1 ? "" : "s"}`
-    );
-  }, [steps, rewind, openRewind, frameBeats, frameKey]);
+    const note = syncSaid(standTree(beats));
+    const said = `playhead — ${beats.length} animation step${
+      beats.length === 1 ? "" : "s"
+    } in this frame, over ${steps} committed gesture${steps === 1 ? "" : "s"}`;
+    setAnnounce(note === null ? said : `${said}. ${note}`);
+  }, [steps, rewind, openRewind, frameBeats, frameKey, standTree]);
 
   /**
    * Move the playhead to a rail position, and the one preview with it.
@@ -3296,6 +3494,24 @@ export default function DrawPage() {
   );
 
   /**
+   * THE CUT IN FORCE, in step space — the named marks resolved against the tree.
+   *
+   * ONE PLACE RESOLVES, and everything downstream reads the number. The strip
+   * draws from it, the seam names it, `boundAnimation` cuts both exports with it,
+   * and the merge takes its range from it. Two resolutions would be two chances
+   * to be off by one, which is the argument `replay.boundAnimation` already makes
+   * about there being one reader of the marks.
+   *
+   * `lost` IS NOT AN ERROR STATE. A name dangles when the beat it named has left
+   * this frame — merged away, undone, or dropped by a reframe — and
+   * `timeline.resolveSpan` answers with the whole replay plus a reason rather
+   * than refusing, because a save is not the moment to discover that a mark set
+   * an hour ago no longer names anything. The reason is drawn in the strip and
+   * announced when it is acted on; it is never swallowed.
+   */
+  const playCut = useMemo(() => resolveSpan(timeline, playSpan), [timeline, playSpan]);
+
+  /**
    * Set a mark where the playhead stands.
    *
    * `timeline.markIn`/`markOut` route every edit through `replay.clampSpan`, so
@@ -3304,18 +3520,35 @@ export default function DrawPage() {
    * span that RESULTED rather than the one that was asked for, which is the only
    * way a person learns that setting an out point before their own in point gave
    * them a one-step replay.
+   *
+   * THE ARITHMETIC STAYS IN INDEX SPACE and only the storage is named: resolve,
+   * clamp, then name the result. Doing the clamping over names would mean
+   * re-deriving `clampSpan`'s two rules — a mark off the end lands on the end, an
+   * inverted pair collapses by pulling OUT back — in a second vocabulary, which
+   * is exactly the second opinion about one number that `markIn`'s header refuses.
    */
   const setMark = useCallback(
     (end: "in" | "out") => {
       if (rewind === null || playAt === null || playSteps === 0) return;
       const next =
         end === "in"
-          ? markIn(playSpan, playAt, playSteps)
-          : markOut(playSpan, playAt, playSteps);
-      setPlaySpan(next);
+          ? markIn(playCut.span, playAt, playSteps)
+          : markOut(playCut.span, playAt, playSteps);
+      const named = nameSpan(timeline, next);
+      if (named === null && next !== null) {
+        // Unreachable while the tree is stood up with the beats — `standTree`
+        // runs in the same breath as the count — and said out loud rather than
+        // dropped, because a mark that silently did not take is the one failure
+        // this strip cannot report any other way.
+        setAnnounce(
+          `the ${end} point could not be set — the timeline does not name step ${playAt} in this frame`
+        );
+        return;
+      }
+      setPlaySpan(named);
       setAnnounce(`${end} point at step ${playAt} — ${spanSaid(next, playSteps)}`);
     },
-    [rewind, playAt, playSteps, playSpan]
+    [rewind, playAt, playSteps, playCut, timeline]
   );
 
   const clearMarks = useCallback(() => {
@@ -3324,6 +3557,429 @@ export default function DrawPage() {
       "in and out points cleared — the replay and both animated exports play the whole drawing"
     );
   }, []);
+
+  // ── editing the past ────────────────────────────────────────────────────
+
+  /**
+   * A rewritten journal put on screen, with the preview kept where it stands.
+   *
+   * THE ONE PLACE A FRAME EDIT LANDS, shared by the rewrite, the merge and both
+   * directions of the revision stack, because all four leave the same problem
+   * behind: the journal has changed under a preview that was reconstructed from
+   * the old one, and the beat list was counted from it.
+   *
+   * IT DOES NOT CLOSE THE PREVIEW, and that was the alternative. Closing would
+   * have been three lines and it throws away the person's place in the drawing at
+   * the exact moment they are working there — the whole point of editing a past
+   * frame is to see the change on the frame you were looking at. So the preview
+   * is REBUILT at the act it should now be standing on and the beats are counted
+   * again, which is the ~205 ms `frameBeats` documents, spent on a deliberate
+   * structural edit rather than on a stroke.
+   *
+   * `playing` GOES OFF. A replay running while the journal is spliced underneath
+   * it would step into states from two different drawings; there is no honest
+   * frame to continue from, and stopping is what every editor does when you cut
+   * the clip under the playhead.
+   *
+   * It does NOT touch the tree. Three of its four callers know something specific
+   * about what happened to the names — an edit preserves them, a merge rebases
+   * them, an undo restores an older tree wholesale — and a helper that guessed
+   * would be wrong for two of the three.
+   */
+  const restage = useCallback(
+    (next: Session, index: number): number[] => {
+      compRef.current = next.composition;
+      setSession(next);
+      const journal = next.journal.past;
+      const at = Math.min(Math.max(0, Math.round(index)), journal.length);
+      const beats = beatsFor(next.composition, journal);
+      setRewind((r) =>
+        r === null
+          ? r
+          : {
+              ...r,
+              index: at,
+              comp: stepComposition(next.composition, journal, journal.length, at),
+              playing: false,
+              beats,
+              frame: frameKey,
+            }
+      );
+      return beats;
+    },
+    [beatsFor, frameKey]
+  );
+
+  /**
+   * REWRITE THE FRAME THE PLAYHEAD STANDS ON: the same gesture, in the colour
+   * the brush is holding.
+   *
+   * ── Why recolour, out of everything a frame edit could be ──────────────
+   *
+   * `frames.editFrame` takes a FUNCTION from act to act rather than a value,
+   * deliberately — "there is no one edit a person wants to make to a past frame …
+   * a model that enumerated them would be a list to extend rather than a
+   * mechanism" — and `frames.recolourAct` is the one worked example it ships,
+   * because recolouring is the case the request actually names: the same gesture,
+   * a different colour, so the animation changes and the drawing may not.
+   *
+   * THAT LAST CLAUSE IS THE THING TO EXPECT AND IT IS MEASURED, not guessed: if a
+   * later act repaints the same cell, this changes the ANIMATION and NOT the
+   * finished drawing, because `applyEdits` writes `to` and never consults `from`.
+   * `test/frames.test.ts` asserts it. So the announcement names the frame and the
+   * colour rather than promising a visible change to the plate.
+   *
+   * ── What it costs, in the order the costs arrive ───────────────────────
+   *
+   *   A REVISION, remembered BEFORE the edit and only if the edit succeeded —
+   *   `frames.remember`'s own three-line pattern, in that order, because a
+   *   refused rewrite must not cost a revision and testing `ok` first is the only
+   *   arrangement in which it cannot.
+   *
+   *   THE REDO BRANCH, which `rewriteFrames` discards on the standard linear
+   *   history rule and reports as `discardedRedo`. `rebaseSaid` says the number.
+   *
+   *   A COMPOSITION AROUND THE STEP, on `nested.groupFor`'s policy: "any time we
+   *   try to edit something from the past, it becomes a group and we pass the
+   *   edits through". It is invisible — grouping is compile-invariant under
+   *   `"extend"`, measured in `test/nested.test.ts` — and it is what keeps a later
+   *   hold OFF the root, which is the whole mechanism by which a hold stops
+   *   renumbering the drawing. `groupFor` reuses a wrapper the step is already
+   *   alone in, so editing one frame five times gives depth 1 and not five.
+   */
+  const rewriteFrame = useCallback(() => {
+    if (rewind === null || playAt === null || timeline === null) {
+      setAnnounce(
+        "stand the playhead on a step first — a frame edit rewrites the gesture the playhead is showing"
+      );
+      return;
+    }
+    const k = rewind.beats[playAt];
+    if (k === undefined) {
+      setAnnounce("the playhead is not on a gesture this frame has");
+      return;
+    }
+    const colour = effectiveBase.hex;
+    const before = { session, timeline };
+    const done = editFrame(session, k, (a) => recolourAct(a, () => colour));
+    if (!done.ok) {
+      // LOUD, AND THE SESSION IS UNTOUCHED. `rewriteFrames` is atomic by
+      // construction — it rebuilds from the state before the splice or returns
+      // nothing at all — so the one thing this sentence has to add is that
+      // nothing happened, which the model cannot know it needs to say.
+      setAnnounce(refusedSaid("the frame edit", done.said));
+      return;
+    }
+    const note = `the recolour of frame ${k}`;
+    setRevisions(remember(revisions, before));
+    setRevisionMark({ session: done.value.session, undo: note, redo: null });
+    const beats = restage(done.value.session, rewind.index);
+    // `editFrame` replaces one act with one act, so `nested.rebaseTree` is the
+    // identity here and every name still resolves — which is why a frame edit is
+    // the cheap case and a merge is not. `syncTree` runs anyway, over the
+    // recounted beats, because a rewritten act CAN stop painting (`quiet` in the
+    // report) and a beat that has gone is a name that has to go with it.
+    const name = playAt >= 0 ? nameAtStep(timeline, playAt) : null;
+    const wrapped =
+      name === null ? null : groupFor(timeline, name, mintStep.current());
+    const sync = syncTree(wrapped?.tree ?? timeline, beats, mintStep.current);
+    setTimeline(sync.tree);
+    const grouped =
+      wrapped?.made === true
+        ? " Its step is now a composition of its own, so a hold can go beside it without renumbering the drawing."
+        : "";
+    // A rewrite CAN take a beat away — an act whose every edit became a no-op
+    // paints nothing and has no beat — and a beat that goes takes its name with
+    // it. `syncSaid` is only non-null when that happened, so this is silent in
+    // the ordinary case and loud in the one that cost something.
+    const resync = syncSaid(sync);
+    setAnnounce(
+      `frame ${k} recoloured to ${colour} — ${rebaseSaid(
+        done.value.report
+      )}.${grouped}${resync === null ? "" : ` ${resync}.`}`
+    );
+  }, [rewind, playAt, timeline, session, revisions, effectiveBase, restage]);
+
+  /**
+   * MERGE THE MARKED RANGE into one frame.
+   *
+   * ── The range is the IN AND OUT POINTS, and that is a decision ─────────
+   *
+   * DEVIATION, flagged. The brief says "select a range of frames on the
+   * timeline"; this program has exactly one range selection on the timeline
+   * already — the two marks — and it is the one a person can actually make at
+   * this density. Measured in `Timeline`'s own header: the rail is 692px over 257
+   * stops at 1512 and 250px at 390, so a second pair of draggable ends would be
+   * two more things nobody can put on a chosen beat. Adding a second selection
+   * would also mean two ranges on one strip that look identical and mean
+   * different things.
+   *
+   * The cost of reusing them is real and is stated where it happens: the marks
+   * are a PLAYBACK cut as well, so merging consumes the cut, and the cut is
+   * cleared afterwards because the range it named has become one frame. The
+   * button is disabled unless there IS a cut, so this can never fire on a drawing
+   * whose marks are merely resting at the whole replay.
+   *
+   * ── The range is WIDER than the two beats, on purpose ─────────────────
+   *
+   * `timeline.rangeOfSpan` converts two beats into a contiguous slice of the
+   * JOURNAL, which includes the acts between them that have no beat at all — a
+   * rename, a reorder, a stroke that landed outside this frame. A merge of
+   * beats-only would leave those stranded between the two halves of a coalesced
+   * gesture, and `frames.mergeActs` folds a contiguous slice because a
+   * non-contiguous one cannot be one rung. `MergeReport.frames` reports the real
+   * number and `mergeSaid` says it.
+   */
+  const mergeMarked = useCallback(() => {
+    if (rewind === null || timeline === null) return;
+    const range = rangeOfSpan(rewind.beats, playCut.span);
+    if (range === null) {
+      setAnnounce(
+        "mark an in point and an out point over two or more gestures first — a merge needs a range"
+      );
+      return;
+    }
+    const before = { session, timeline };
+    const done = mergeFrames(session, range.at, range.count);
+    if (!done.ok) {
+      setAnnounce(refusedSaid("the merge", done.said));
+      return;
+    }
+    const note = `the merge of ${range.count} frames`;
+    setRevisions(remember(revisions, before));
+    setRevisionMark({ session: done.value.session, undo: note, redo: null });
+    const beats = restage(
+      done.value.session,
+      actAfterMerge(rewind.index, range.at, range.count)
+    );
+    // `rebaseTree` FIRST and `syncTree` after, and the order is the whole reason
+    // both are called: only `rebaseTree` knows the splice's three numbers, so
+    // only it can collapse the range while keeping a HOLD the person put inside
+    // it — "a hold references no act, so it is not part of the work being
+    // coalesced". `syncTree` then checks the result against the recounted beats
+    // and repairs it if the merged act turned out to paint nothing.
+    const sync = syncTree(
+      rebaseTree(timeline, range.at, range.count, 1),
+      beats,
+      mintStep.current
+    );
+    setTimeline(sync.tree);
+    // The marks named the two ends of a range that is now ONE frame. The in
+    // point's beat survives as the merged act and the out point's does not, so
+    // half the cut would be left dangling — and half a cut has no spelling, in
+    // this program or in the file. Cleared, and said.
+    setPlaySpan(null);
+    const resync = syncSaid(sync);
+    setAnnounce(
+      `${mergeSaid(done.value.merge)} ${rebaseSaid(
+        done.value.report
+      )}. The in and out points named the range that is now one frame, so the cut is cleared.${
+        resync === null ? "" : ` ${resync}.`
+      }`
+    );
+  }, [rewind, timeline, session, revisions, playCut, restage]);
+
+  // ── ONE undo, over two stacks ───────────────────────────────────────────
+
+  /**
+   * IS THE LAST FRAME EDIT STILL THE MOST RECENT THING? — asked TWICE, because
+   * undo and redo are asking different questions.
+   *
+   * `frames.ts` proves a frame edit cannot be an `Act` — a `Move` acts on a
+   * `Composition`, the journal is not in a `Composition`, so no act can describe
+   * a change to the list of acts — so there are two stacks, and two stacks under
+   * one keystroke is how ⌘Z becomes ambiguous. These two booleans are the whole
+   * of what stops it, and each is total: the frame edit is on top, or it is not.
+   *
+   *   UNDO asks whether the edit is the most recent thing STANDING, which is
+   *   `sameCommitted`: nothing has been committed since that has not itself been
+   *   taken back. An act sitting in the redo branch is not standing on anything.
+   *
+   *   REDO asks whether the edit is the most recently UNDONE thing, which is
+   *   `sameJournal`: any journal undo since is more recent, so the redo branch
+   *   has to match too.
+   *
+   * THE DIFFERENCE IS NOT A REFINEMENT, it is a bug that was found and fixed —
+   * `timeline.sameCommitted` carries the two-keystroke sequence that shows it,
+   * where a both-halves test made ⌘Z SKIP the frame edit and undo the act
+   * beneath it. Both functions carry the reasoning and both are tested.
+   *
+   * ONE THING NEITHER SEES, stated because it is a real hole rather than a
+   * theoretical one: a layer's visible/locked SWITCHES are not journalled — they
+   * are a `Composition` field that no `Move` reaches — so toggling one does not
+   * move the journal, and a revision undone afterwards restores the switches as
+   * they stood before the edit. It is out of reach in practice (the panel is
+   * frozen while a preview stands, and a frame edit is only reachable from the
+   * playhead) and the announcement names the whole restore rather than only the
+   * frame, so nothing is claimed that is not done.
+   */
+  const undoRevisionNext =
+    revisionMark !== null &&
+    revisions.past.length > 0 &&
+    sameCommitted(session.journal, revisionMark.session.journal);
+  const redoRevisionNext =
+    revisionMark !== null &&
+    revisions.future.length > 0 &&
+    sameJournal(session.journal, revisionMark.session.journal);
+
+  /**
+   * ⌘Z. Whatever was done last, taken back — a stroke, a reorder, a paste, or a
+   * frame edit.
+   *
+   * `layers.undo` walks the journal that `endStroke`, the panel and the presets
+   * all push to. `frames.undoRevision` walks the stack the two frame edits push
+   * to. `journalStill` above says which of them is on top, and the announcement
+   * always names what was taken back, so the routing is legible after the fact as
+   * well as before it — the strip says what ⌘Z will do while it is still ⌘Z's to
+   * do (`timeline.undoSaid`).
+   *
+   * THE REVISION BRANCH IS ABOVE THE PREVIEW GUARD, deliberately. A frame edit is
+   * made FROM the playhead, so a preview is standing at the moment it happens and
+   * refusing to take it back until the preview is closed would be refusing at
+   * exactly the moment the person wants it. It is safe where the journal's own
+   * undo is not: `restage` rebuilds the preview from the restored journal rather
+   * than leaving it showing a state reconstructed from a journal that is gone.
+   *
+   * The EVENT LOG needs nothing here either way: it IS the journal, so it moves
+   * with whichever half moved.
+   */
+  const doUndo = useCallback(() => {
+    if (undoRevisionNext) {
+      const step = undoRevision(revisions, { session, timeline });
+      if (step !== null) {
+        const said = revisionMark?.undo ?? "the frame edit";
+        setRevisions(step.revisions);
+        setTimeline(step.timeline);
+        setRevisionMark({
+          session: step.session,
+          // The next one down is a frame edit this file no longer has the words
+          // for; see `revisionMark` for why a note stack was refused.
+          undo: step.revisions.past.length > 0 ? "the frame edit before it" : null,
+          redo: said,
+        });
+        restage(step.session, rewind?.index ?? step.session.journal.past.length);
+        setAnnounce(
+          `took back ${said} — the drawing and its timeline are back exactly as they stood before that edit, ${
+            step.session.journal.past.length
+          } gesture${step.session.journal.past.length === 1 ? "" : "s"} in the journal`
+        );
+        return;
+      }
+    }
+    if (previewing) {
+      setAnnounce("a preview is standing — close it before undoing");
+      return;
+    }
+    const step = undoSession(session);
+    if (step.act === null) {
+      setAnnounce("nothing to undo");
+      return;
+    }
+    compRef.current = step.session.composition;
+    setSession(step.session);
+    // Nothing to do for the event log: it IS the journal, so it moved with it.
+    // This used to be a guarded `setEvents(undoEvents(events))`, and the guard
+    // was the bug — an act nobody counted popped somebody else's rung.
+    setAnnounce(
+      `undid ${step.act.note} — ${
+        flattenComposition(step.session.composition, book).size
+      } cells on the plate`
+    );
+  }, [
+    undoRevisionNext,
+    revisions,
+    revisionMark,
+    session,
+    timeline,
+    rewind,
+    restage,
+    previewing,
+    book,
+  ]);
+
+  /** ⇧⌘Z, and the exact mirror of `doUndo` — including which stack it addresses. */
+  const doRedo = useCallback(() => {
+    if (redoRevisionNext) {
+      const step = redoRevision(revisions, { session, timeline });
+      if (step !== null) {
+        const said = revisionMark?.redo ?? "the frame edit";
+        setRevisions(step.revisions);
+        setTimeline(step.timeline);
+        setRevisionMark({
+          session: step.session,
+          undo: said,
+          redo:
+            step.revisions.future.length > 0 ? "the frame edit after it" : null,
+        });
+        restage(step.session, rewind?.index ?? step.session.journal.past.length);
+        setAnnounce(
+          `put ${said} back — ${step.session.journal.past.length} gesture${
+            step.session.journal.past.length === 1 ? "" : "s"
+          } in the journal`
+        );
+        return;
+      }
+    }
+    if (previewing) {
+      setAnnounce("a preview is standing — close it before redoing");
+      return;
+    }
+    const step = redoSession(session);
+    if (step.act === null) {
+      setAnnounce("nothing to redo");
+      return;
+    }
+    compRef.current = step.session.composition;
+    setSession(step.session);
+    setAnnounce(
+      `redid ${step.act.note} — ${
+        flattenComposition(step.session.composition, book).size
+      } cells on the plate`
+    );
+  }, [
+    redoRevisionNext,
+    revisions,
+    revisionMark,
+    session,
+    timeline,
+    rewind,
+    restage,
+    previewing,
+    book,
+  ]);
+
+  /**
+   * WHAT ⌘Z WILL TAKE BACK, for the strip to say before it is pressed.
+   *
+   * The routing above is exact; a rule nobody can see is still a surprise the
+   * first time it fires. `timeline.undoSaid` builds the sentence and
+   * `test/timeline.test.ts` holds it to the three cases, which is the only way a
+   * sentence in a component under `environment: "node"` can be tested at all.
+   */
+  const undoNext = undoSaid(
+    undoRevisionNext ? revisionMark?.undo ?? "the frame edit" : null,
+    past.length === 0 ? null : past[past.length - 1].note
+  );
+  /**
+   * And the same for ⇧⌘Z, which the HUD's two buttons need as well as the strip.
+   *
+   * ── The buttons and the keystroke MUST agree, and they did not ─────────
+   *
+   * The HUD's undo is `disabled={past.length === 0 || previewing}`, and a frame
+   * edit is made FROM the playhead — so a preview is standing at the moment a
+   * revision becomes the thing ⌘Z would take back, and the button beside the
+   * canvas was greyed out at exactly that moment. A keystroke that works while
+   * the button for it is disabled is worse than either alone: it is two controls
+   * for one action disagreeing about whether the action exists.
+   *
+   * So both buttons ask the same two booleans the keystroke does, and both carry
+   * the sentence rather than a fixed label — which is also what makes the routing
+   * legible to a pointer, where there is no strip to read.
+   */
+  const redoNext = redoSaid(
+    redoRevisionNext ? revisionMark?.redo ?? "the frame edit" : null,
+    session.journal.future.length === 0 ? null : session.journal.future[0].note
+  );
 
   /**
    * IS THE TIMELINE STRIP ON SCREEN — and this is the whole of what it means.
@@ -5543,7 +6199,7 @@ export default function DrawPage() {
      * left over from a longer drawing or a wider frame lands inside this one
      * rather than being refused — the UI-facing rule, see `clampSpan`.
      */
-    const cut = boundAnimation(states[0], frames, playSpan);
+    const cut = boundAnimation(states[0], frames, playCut.span);
     return {
       baked,
       cells,
@@ -5554,7 +6210,7 @@ export default function DrawPage() {
       frames,
       cut,
     };
-  }, [comp, past, bakedFrame, canvas, book, showTiling, playSpan]);
+  }, [comp, past, bakedFrame, canvas, book, showTiling, playCut]);
 
   const animationText = useCallback(
     (grouping: "orbit" | "cell") => {
@@ -7591,6 +8247,7 @@ export default function DrawPage() {
                 geom={canvas.geom}
                 relief={relief}
                 paint={paint}
+                strata={strataTree}
                 // The ghost, the standing proposal and the cursor are all
                 // promises about a plate that is not the one on screen, so a
                 // preview drops all three. The STATE is kept — the cursor comes
@@ -7705,9 +8362,13 @@ export default function DrawPage() {
                   type="button"
                   className={`${styles.iconBtn} ${styles.hudBtn}`}
                   onClick={doUndo}
-                  disabled={past.length === 0 || previewing}
-                  title="undo the last gesture (⌘Z)"
-                  aria-label="undo the last gesture"
+                  // THE SAME TWO BOOLEANS THE KEYSTROKE ASKS. A frame edit is
+                  // made while a preview stands, so a button greyed on
+                  // `previewing` would be dark at exactly the moment ⌘Z became
+                  // able to take one back. See `redoNext`.
+                  disabled={!undoRevisionNext && (past.length === 0 || previewing)}
+                  title={`${undoNext} (⌘Z)`}
+                  aria-label={undoNext}
                 >
                   <ActionGlyph name="undo" />
                 </button>
@@ -7715,9 +8376,12 @@ export default function DrawPage() {
                   type="button"
                   className={`${styles.iconBtn} ${styles.hudBtn}`}
                   onClick={doRedo}
-                  disabled={session.journal.future.length === 0 || previewing}
-                  title="redo the last undone gesture (⌘⇧Z)"
-                  aria-label="redo the last undone gesture"
+                  disabled={
+                    !redoRevisionNext &&
+                    (session.journal.future.length === 0 || previewing)
+                  }
+                  title={`${redoNext} (⌘⇧Z)`}
+                  aria-label={redoNext}
                 >
                   <ActionGlyph name="redo" />
                 </button>
@@ -7909,13 +8573,27 @@ export default function DrawPage() {
                 view={{
                   steps: playFresh ? playSteps : null,
                   at: playAt,
-                  span: playSpan,
+                  // THE RESOLVED span, not the stored one. The strip draws
+                  // positions on a rail and `spanSaid` counts steps, so both want
+                  // the index space; the NAMES are the page's storage and never
+                  // leave it. `playCut` is the one place they are resolved.
+                  span: playCut.span,
+                  lost: lostSaid(playCut.lost),
                   acts: steps,
+                  frame: playFresh && playAt !== null ? rewind?.beats[playAt] ?? null : null,
+                  colour: effectiveBase.hex,
+                  mergeFrames:
+                    rewind === null
+                      ? null
+                      : rangeOfSpan(rewind.beats, playCut.span)?.count ?? null,
+                  undoNext,
                   onOpen: standPlayhead,
                   onSeek: seekPlayhead,
                   onMarkIn: () => setMark("in"),
                   onMarkOut: () => setMark("out"),
                   onClearMarks: clearMarks,
+                  onRewrite: rewriteFrame,
+                  onMerge: mergeMarked,
                 }}
                 open={timelineOpen}
                 onToggle={toggleTimeline}

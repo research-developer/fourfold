@@ -159,6 +159,25 @@ const STEP_BACK = "M14 5l-7 7 7 7";
 const STEP_ON = "M10 5l7 7-7 7";
 
 /**
+ * The two frame edits, and why neither is a letter or a word.
+ *
+ * REWRITE is a NIB, not a brush: the brush glyph would be the third picture of a
+ * brush in this program (the tool deck and the dial both carry one) and it would
+ * read as "paint here". A nib reads as "change what this says", which is what
+ * rewriting a past frame does — the gesture is not repainted, its colour is
+ * restated and everything after it is replayed on top.
+ *
+ * MERGE is two arrows meeting at a line, which is the only picture that says
+ * "several become one" without a number in it. The alternative — two rectangles
+ * collapsing into one — was drawn and rejected at 14px: it is the FILMSTRIP's
+ * vocabulary, and this program has no filmstrip, so it would promise a control
+ * that is not there.
+ */
+const REWRITE =
+  "M5 19l3.6-.9 9.3-9.3-2.7-2.7-9.3 9.3zM15.6 5.4l1.4-1.4 2.7 2.7-1.4 1.4";
+const MERGE = "M3 12h6M9.5 8l3.5 4-3.5 4M21 12h-6M14.5 8L11 12l3.5 4";
+
+/**
  * The seam's two arrows, and the ONE rule that says which is drawn.
  *
  * THE CHEVRON POINTS THE WAY THE PANEL WILL TRAVEL, not the way it currently
@@ -212,16 +231,52 @@ export interface TimelineView {
    * is a picture rather than a beat. See `timeline.stepAtAct`.
    */
   at: number | null;
-  /** The in and out marks, in step space. `null` is "the whole replay". */
+  /**
+   * The in and out marks, IN STEP SPACE. `null` is "the whole replay".
+   *
+   * RESOLVED BY THE PAGE, which stores them as `nested.StepId` names — see
+   * `page.tsx`'s `playSpan` for why a name and not an index. This strip draws
+   * positions on a rail and counts steps, so it wants the numbers; it never sees
+   * the names and must not, or it would be a second place a name is resolved.
+   */
   span: InOut | null;
+  /**
+   * A mark whose name no longer resolves, in words, or `null`.
+   *
+   * THE ONE THING THE SPAN ABOVE CANNOT SAY. A dangling name resolves to "no
+   * marks", which is indistinguishable from an uncut drawing — so the cut would
+   * come off silently, which is the exact class of loss this branch exists to
+   * close. `timeline.lostSaid` builds it and this strip prints it in place of the
+   * span's own sentence.
+   */
+  lost: string | null;
   /** Committed acts in the journal — what OPEN would have to walk. */
   acts: number;
+  /**
+   * The JOURNAL index of the frame the playhead stands on, or `null`.
+   *
+   * A number a person can act on, which is why it is here rather than being left
+   * implicit: the rewrite button names the frame it is about to change, and "the
+   * frame under the playhead" is not something anybody can check against a rail
+   * that is 2.7px a beat.
+   */
+  frame: number | null;
+  /** The colour a rewrite would lay into it — the brush's own, named in full. */
+  colour: string;
+  /** How many frames the marked range would merge, or `null` when there is none. */
+  mergeFrames: number | null;
+  /** What ⌘Z will take back, in words. See `timeline.undoSaid`. */
+  undoNext: string;
   /** Count the beats and stand the playhead up. Opens the one preview. */
   onOpen: () => void;
   onSeek: (step: number) => void;
   onMarkIn: () => void;
   onMarkOut: () => void;
   onClearMarks: () => void;
+  /** Rewrite the frame under the playhead — the same gesture, this colour. */
+  onRewrite: () => void;
+  /** Coalesce the marked range into one frame. */
+  onMerge: () => void;
 }
 
 export interface LayersPanelProps {
@@ -568,6 +623,36 @@ const PANEL_ID = "timeline-panel";
  * needs none of the `pointer-events` defences `.canvasZoom` carries: it is in
  * normal flow under the canvas and cannot reach it. `.timelineSeam` measures it.
  *
+ * ── EDITING THE PAST, added under the marks ─────────────────────────────
+ *
+ * Two more controls and one sentence, on a third row behind a hairline. The row
+ * is the boundary: everything above it changes what is LOOKED AT and everything
+ * on it changes the DRAWING, and at this size a rule and 4px is the cheapest
+ * honest way to say so.
+ *
+ *   REWRITE acts on the frame the playhead is already standing on. `frames.ts`
+ *   rebases every later frame onto the result — the later work survives, which is
+ *   the whole reason "edit a past frame" was worth building — and the counters it
+ *   returns for what that cost reach the live region through
+ *   `timeline.rebaseSaid`. The button NAMES THE FRAME AND THE COLOUR, because "the
+ *   frame under the playhead" is not something anybody can check against a rail
+ *   that is 2.7px a beat.
+ *
+ *   MERGE acts on the marked range, and is dark unless there is one. It is the
+ *   in and out points doing double duty, which is a decision and is argued at the
+ *   call site in `page.tsx`: a second pair of draggable ends would be two more
+ *   things nobody can put on a chosen beat at this density, and two ranges on one
+ *   strip that look identical and mean different things is worse than one range
+ *   that is honest about being both.
+ *
+ *   THE SENTENCE says what ⌘Z will take back. There are two undo stacks in this
+ *   program and one keystroke, and the strip is where the routing becomes legible
+ *   BEFORE the key is pressed rather than after.
+ *
+ * NEITHER CONTROL NEEDS A FRAME CELL TO BE PRESSED ON, deliberately: both act on
+ * a selection that already exists. That is what let them arrive without a
+ * filmstrip.
+ *
  * ── THE FILMSTRIP IS STILL DEFERRED ─────────────────────────────────────
  *
  * And the move made it cheaper rather than more expensive: a filmstrip is this
@@ -575,6 +660,17 @@ const PANEL_ID = "timeline-panel";
  * properties, and a band under the plate has three times the width to repeat it
  * across. Nothing here draws a frame cell, and nothing should until it is asked
  * for.
+ *
+ * ── AND SO IS THE HOLD ──────────────────────────────────────────────────
+ *
+ * `nested.insertHold` exists, works, and is not exposed. It did NOT fall out of
+ * this strip cheaply, and the reason is a question this row cannot answer: a hold
+ * goes at a POSITION BETWEEN two beats, and every control here addresses a beat
+ * or a range of them. "Insert a hold" would need a between-the-beats target — an
+ * insertion caret on the rail, or a filmstrip's gaps — which is its own
+ * interaction design and not a button. The grouping half of the mechanism is
+ * wired (a rewrite auto-groups its step, which is what keeps a future hold off
+ * the root); the insertion half waits for somewhere to put it.
  */
 export function Timeline({
   view,
@@ -586,7 +682,7 @@ export function Timeline({
   open: boolean;
   onToggle: () => void;
 }) {
-  const { steps, at, span, acts } = view;
+  const { steps, at, span, acts, lost, frame, mergeFrames } = view;
   const live = steps !== null && steps > 0;
   // `at` is a beat; the rail also has the GROUND at its left end, which is the
   // plate the animation opens on and the position REPLAY opens at. See
@@ -816,9 +912,82 @@ export function Timeline({
             >
               <Glyph d={CUT_OFF} />
             </button>
-            <span className={styles.timelineSaid} data-cut={cut ? "on" : undefined}>
-              {said ?? (span === null ? "whole" : `in ${span.in}, out ${span.out}`)}
+            {/* A LOST MARK OUTRANKS THE SPAN'S OWN SENTENCE. Once a name no
+                longer resolves the span reads as "no marks", which is exactly
+                what an uncut drawing reads as — so printing `said` here would
+                take a cut off the screen at the moment it came off the drawing.
+                It carries the accent too: this is a state to notice, not a
+                resting one. */}
+            <span
+              className={styles.timelineSaid}
+              data-cut={cut || lost !== null ? "on" : undefined}
+            >
+              {lost ??
+                said ??
+                (span === null ? "whole" : `in ${span.in}, out ${span.out}`)}
             </span>
+          </div>
+
+          {/* EDITING THE PAST. A third row rather than two more buttons beside
+              the marks, because these two CHANGE THE DRAWING and everything
+              above them only changes what is looked at — and a row is the
+              cheapest boundary there is between "this is safe to press" and
+              "this rewrites your journal". `.timelineEdit` carries the numbers.
+
+              NO FILMSTRIP, still. Both controls act on what is already selected
+              — the playhead for one, the marks for the other — precisely so that
+              neither needs a per-frame row to be pressed on. */}
+          <div
+            className={styles.timelineEdit}
+            role="group"
+            aria-label="editing the past"
+          >
+            <button
+              type="button"
+              className={styles.timelineBtn}
+              onClick={view.onRewrite}
+              disabled={!live || at === null || frame === null}
+              title={
+                frame === null
+                  ? "stand the playhead on a step to rewrite that frame"
+                  : `rewrite frame ${frame} in ${view.colour} — later frames are replayed on top`
+              }
+              aria-label={
+                frame === null
+                  ? "rewrite a past frame — stand the playhead on a step first"
+                  : `rewrite frame ${frame}: the same gesture in ${view.colour}, with every later frame replayed on top of the result`
+              }
+            >
+              <Glyph d={REWRITE} />
+            </button>
+            <button
+              type="button"
+              className={styles.timelineBtn}
+              onClick={view.onMerge}
+              disabled={mergeFrames === null}
+              title={
+                mergeFrames === null
+                  ? "mark an in and an out point over two or more gestures to merge them"
+                  : `merge ${mergeFrames} frames into one`
+              }
+              aria-label={
+                mergeFrames === null
+                  ? "merge a range of frames — set the in and out points over two or more gestures first"
+                  : `merge the ${mergeFrames} frames from the in point to the out point into one frame; the drawing is unchanged and the animation loses ${
+                      mergeFrames - 1
+                    } step${mergeFrames - 1 === 1 ? "" : "s"}`
+              }
+            >
+              <Glyph d={MERGE} />
+            </button>
+            {/* WHAT ⌘Z WILL TAKE BACK, said before it is pressed.
+                There are two undo stacks in this program — the journal's and
+                `frames.Revisions` — and one keystroke over two stacks is how a
+                keystroke becomes ambiguous. The routing is exact (see
+                `timeline.sameJournal`) and this is the half that makes it
+                LEGIBLE: the sentence changes the moment a frame edit lands and
+                changes back the moment anything is drawn after it. */}
+            <span className={styles.timelineSaid}>{view.undoNext}</span>
           </div>
         </div>
       </div>

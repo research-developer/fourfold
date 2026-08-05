@@ -193,6 +193,54 @@ export interface ArtLayer {
    * stating `mode: 6, orbit: 3` is the ordinary case and not a contradiction.
    */
   orbit?: number;
+  /**
+   * THE COMPOSITION BOUNDARY: which nested timeline compositions this layer's
+   * reveal step sits INSIDE, outermost first, space separated — `"t9"`, or
+   * `"t9 t14"` for a step two deep. Absent means the step is at the root, which
+   * is every step of every drawing nobody has grouped.
+   *
+   * ── What it is for, and why ONE field is enough ─────────────────────────
+   *
+   * `nested.ts` builds a timeline as a TREE — a `Comp` is a run of consecutive
+   * steps under a minted name — and the whole reason it exists is that a name
+   * survives an insertion where an index does not: `test/nested.test.ts` runs one
+   * probe against five insertion sites and only the minted name survives all
+   * five. `reveal` above is the DERIVED flat index, computed by flattening that
+   * tree, so a file carrying only `reveal` states the answer and throws away the
+   * question — load it and the tree is gone, every group with it, and the next
+   * hold inserted anywhere renumbers the lot.
+   *
+   * This states the nesting and nothing else. The ORDER of the steps is already
+   * in `reveal`, and the CONTENTS of a composition are exactly the maximal run of
+   * layers whose trail begins the same way, so a run needs no start marker and no
+   * length. `timeline.compTrails` writes these and `timeline.treeFromTrails`
+   * rebuilds the tree from them; the round trip is asserted in
+   * `test/timeline.test.ts`.
+   *
+   * A TRAIL AND NOT A BRACKET PAIR, on this module's own standards: an unmatched
+   * bracket is a file that cannot be read at all, while a trail is true of each
+   * layer BY ITSELF and so survives a file whose layers were filtered — which is
+   * exactly what a per-layer copy and a scoped `emit.serialise` already produce.
+   * `timeline.ts` carries the full argument and the two rejected alternatives.
+   *
+   * ── Optional, and NOT versioned ─────────────────────────────────────────
+   *
+   * On exactly the argument `relief`, `plate`, `view`, `comp` and the in/out
+   * marks already make: a reader that predates this treats its absence as "the
+   * timeline is flat", which is what every file written before it existed meant
+   * and what `reveal` alone still says. Bumping would have made every one of
+   * those files unreadable to gain nothing.
+   *
+   * OMITTED whenever a layer's step is at the root, so a drawing that has never
+   * been grouped exports byte for byte the file it always did —
+   * `test/artfile.test.ts` asserts that on the bytes rather than describing it.
+   *
+   * WRITTEN AFTER `orbit` AND BEFORE `cells`. The validator rebuilds the object
+   * in that position and the round trip here is on BYTES, so an emitter that
+   * wrote it anywhere else would re-encode to a different file. That is the same
+   * constraint `validateComposition` already records for `anim`'s key order.
+   */
+  nest?: string;
 }
 
 export interface ArtAnimation {
@@ -764,6 +812,17 @@ function validateLayers(
       }
       layer.orbit = v;
     }
+    if (l.nest !== undefined) {
+      const trail = nestTrail(l.nest);
+      if (trail === null) return REJECT;
+      // RE-JOINED FROM WHAT WAS CHECKED, which on accepted input is the string
+      // that arrived: the split is the check and not a normalisation, because
+      // any spacing other than one space between two names produces an empty
+      // part and an empty part is not a name. Written this way so that the value
+      // stored is provably the value validated, rather than a second reading of
+      // the same field.
+      layer.nest = trail.join(" ");
+    }
 
     if (l.cells !== undefined) {
       if (!Array.isArray(l.cells)) return REJECT;
@@ -808,6 +867,48 @@ function validateLayers(
     out.push(layer);
   }
   return out;
+}
+
+/**
+ * A stated composition trail → its names, or `null` for one this program will
+ * not walk.
+ *
+ * ── What is checked, and what each bound is a bound OF ──────────────────
+ *
+ * The same discipline the three animation fields above were given when they were
+ * found sharing one meaningless bound: each limit here is a limit of the thing it
+ * is a limit ON, rather than whatever constant was nearest.
+ *
+ *   THE NAME'S SHAPE is `LAYER_ID`'s, reused rather than restated. A composition
+ *   name and a layer id are the same kind of token — an XML-safe name minted from
+ *   a counter — and `nested.stepId` mints `t0`, `t1`, … which that pattern already
+ *   admits. A second pattern here would be a second thing to keep in step, and it
+ *   would fall behind silently.
+ *
+ *   THE DEPTH is `MAX_LAYER_DEPTH`, because a trail IS a nesting depth and the
+ *   walker that rebuilds the tree recurses exactly as `validateLayers` does. The
+ *   same argument, the same number.
+ *
+ *   NO DUPLICATE NAME, because a composition inside itself is not a tree. A file
+ *   claiming it is a file whose timeline cannot be built, and this module refuses
+ *   a payload that disagrees with itself rather than guessing which half was
+ *   meant — the rule it already applies to a sector on a triangle.
+ *
+ * AN EMPTY STRING IS REFUSED and not read as "no nesting". Absent is the spelling
+ * for that, and a second spelling of one thing is two ways for a round trip to
+ * pick the other one — `ArtAnimation`'s in/out pair makes the identical argument.
+ */
+function nestTrail(raw: unknown): string[] | null {
+  if (typeof raw !== "string") return null;
+  const parts = raw.split(" ");
+  if (parts.length === 0 || parts.length > MAX_LAYER_DEPTH) return null;
+  const seen = new Set<string>();
+  for (const p of parts) {
+    if (!LAYER_ID.test(p)) return null;
+    if (seen.has(p)) return null;
+    seen.add(p);
+  }
+  return parts;
 }
 
 /**

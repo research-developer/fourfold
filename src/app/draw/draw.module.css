@@ -3608,6 +3608,28 @@
 /* The sentence the marks produced. It is the LAST thing in the strip and it is
    allowed to shrink, because the buttons beside it must not: a readout that
    pushes a control off the rail is a readout that broke the control. */
+/**
+ * THE FRAME EDITS, on their own row under the marks.
+ *
+ * Identical geometry to `.timelineMarks` — the same 4px gutter and the same 22px
+ * controls — so the strip stays one piece of furniture; what separates them is a
+ * HAIRLINE and 4px of space, which is the least this file can spend to say "the
+ * two controls below this line change the drawing and the ones above it do not".
+ *
+ * The rule is the panel's own `--rule` rather than the brighter `--rule-bright`
+ * the buttons carry: it is a division inside one control, not the edge of one,
+ * and at this size a bright line would read as a second seam. `.timelineSeam`
+ * already owns the only bright horizontal in this band.
+ */
+.timelineEdit {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  padding-top: 4px;
+  border-top: 1px solid var(--rule);
+}
+
 .timelineSaid {
   flex: 1 1 auto;
   min-width: 0;

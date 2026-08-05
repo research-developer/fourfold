@@ -32,13 +32,19 @@ import {
   type ArtPayload,
 } from "../src/lib/artfile";
 import { HISTORY_LIMIT } from "../src/lib/strokes";
+import type { PaintNode } from "../src/components/DrawBoard";
+import { ADJUSTMENTS } from "../src/lib/adjust";
+import { brushColours } from "../src/lib/brush";
+import { SCHEMES, swatch } from "../src/lib/schemes";
 import {
   act,
   addLayer,
+  alphaOf,
   applyMove,
   arrange,
   at,
   canArrange,
+  canonicalAlpha,
   census,
   clearLayer,
   copyComposition,
@@ -68,12 +74,15 @@ import {
   redo,
   removeLayer,
   renameLayer,
+  opacityOf,
   select,
   selectedLayer,
   setLocked,
+  setOpacity,
   setVisible,
   slices,
   soleLayer,
+  strata,
   subtreeColours,
   switchesIn,
   switchesOf,
@@ -114,7 +123,13 @@ const L = (
   entries: [Address, string][] = [],
   extra: Partial<Omit<Layer, "id">> & Partial<Switches> = {}
 ): Layer => {
-  const { visible = true, locked = false, ...rest } = extra;
+  // `opacity` is DESTRUCTURED OUT and not left to the rest spread, and the
+  // difference is a silent one: `Switches` gained an alpha, `Layer` did not, so
+  // an `opacity` swept up by `...rest` would land on the layer object — where
+  // nothing reads it — and the composition would go on saying the layer is
+  // fully opaque. It would pass `tsc` and every assertion about it would test
+  // the helper rather than the model.
+  const { visible = true, locked = false, opacity, ...rest } = extra;
   const layer: Layer = {
     id: layerId(n),
     name: `L${n}`,
@@ -122,7 +137,10 @@ const L = (
     children: [],
     ...rest,
   };
-  if (!visible || locked) SW.set(layer, { visible, locked });
+  const faded = opacity !== undefined && opacity !== 1;
+  if (!visible || locked || faded) {
+    SW.set(layer, { visible, locked, ...(faded ? { opacity } : {}) });
+  }
   return layer;
 };
 
@@ -155,6 +173,8 @@ interface Shape {
   name: string;
   visible: boolean;
   locked: boolean;
+  /** Folded in for the same reason the two switches are: undo may not move it. */
+  opacity: number;
   plate: [string, string][];
   children: Shape[];
 }
@@ -165,6 +185,7 @@ const shape = (c: Composition, l: Layer): Shape => {
     name: l.name,
     visible: own.visible,
     locked: own.locked,
+    opacity: alphaOf(own),
     plate: [...l.plate.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)),
     children: l.children.map((k) => shape(c, k)),
   };
@@ -326,6 +347,318 @@ describe("visibility", () => {
     const flipped = toggleVisible(s.composition, layerId(1));
     expect(switchesOf(flipped, layerId(1)).visible).toBe(false);
     expect(s.journal.past).toHaveLength(0);
+  });
+});
+
+// ── alpha ────────────────────────────────────────────────────────────────
+
+/**
+ * THE BOARD DOES NOT KNOW ABOUT ALPHA, and these are the cases that pin it.
+ *
+ * The header used to refuse per-layer opacity outright, on the ground that an
+ * alpha would make the flattened board hold colours no scheme ever named — so
+ * the adjustment brush, which transforms the colour it finds, would start
+ * inventing hues. That argument is exactly right about `flatten` and says
+ * nothing about the RENDER, which had been compositing group opacity in the
+ * exported file the whole time. The split it forces is the design: alpha is a
+ * display property, `flatten` never reads it, and the brush is untouched.
+ *
+ * The claim that keeps the brush honest is a CLOSURE and it is asserted as one
+ * below: every colour the board hands back is a colour some layer's plate holds
+ * verbatim, whatever the alphas are. Nothing is averaged anywhere.
+ */
+describe("alpha fades the picture and never the board", () => {
+  it("does not reach flatten — a faded stack composites identically", () => {
+    const opaque = C([L(1, [["s0:AA", GOLD]]), L(2, [["s0:AB", RED]])]);
+    const faded = C([
+      L(1, [["s0:AA", GOLD]], { opacity: 0.25 }),
+      L(2, [["s0:AB", RED]], { opacity: 0.5 }),
+    ]);
+    expect(board(flatten(faded, book2))).toEqual(board(flatten(opaque, book2)));
+  });
+
+  it("keeps the topmost SHOWN layer's own colour under a fade", () => {
+    // The occlusion is unchanged: a half-faded top layer still WINS the cell in
+    // the model, and hands the brush the colour it holds rather than a mix of
+    // the two. A blend here is the whole of what the old refusal forbade.
+    const comp = C([
+      L(1, [["s0:AA", GOLD]]),
+      L(2, [["s0:AA", RED]], { opacity: 0.5 }),
+    ]);
+    expect(flatten(comp, book2).get(cell(book2, "s0:AA"))).toBe(RED);
+  });
+
+  it("stays CLOSED over the colours the layers hold, at every alpha", () => {
+    // THE PROPERTY THE ADJUST BRUSH DEPENDS ON, stated as a set inclusion
+    // rather than as three examples: the board's range is a subset of the
+    // plates' range. `swatchFromHex` can therefore never be handed a colour
+    // that no scheme named, which is the failure the refusal was written to
+    // prevent, and it holds for any alphas because none of them is read.
+    const comp = C([
+      L(1, [["s0:AA", GOLD], ["s0:AB", BLUE]], { opacity: 0.13 }),
+      L(2, [["s0:AA", RED]], {
+        opacity: 0.5,
+        children: [L(3, [["s0:AB", GREEN]], { opacity: 0.75 })],
+      }),
+    ]);
+    const held = new Set([...paletteOf(comp)]);
+    expect(held).toEqual(new Set([GOLD, BLUE, RED, GREEN]));
+    for (const [, hex] of flatten(comp, book2)) expect(held.has(hex)).toBe(true);
+  });
+
+  it("leaves the ADJUSTMENT BRUSH bit-for-bit unmoved", () => {
+    // THE SHARP EDGE OF THE WHOLE DESIGN, run through the real brush rather
+    // than argued. The old refusal's case was that an alpha would have the
+    // adjust tool "inventing hues"; the tool reads `flatten` (see `paintAt` in
+    // `draw/page.tsx`, which decides its colours against the composite and
+    // PLANS them against the target layer's own plate), and `flatten` does not
+    // read an alpha — so the brush is handed the same board either way and
+    // hands back the same colours.
+    const layers: [Address, string][] = [["s0:AA", GOLD], ["s0:AB", BLUE]];
+    const opaque = C([L(1, layers), L(2, [["s0:AC", RED]])]);
+    const faded = C([
+      L(1, layers, { opacity: 0.15 }),
+      L(2, [["s0:AC", RED]], { opacity: 0.5 }),
+    ]);
+    const cells = (["s0:AA", "s0:AB", "s0:AC"] as Address[]).map((a) =>
+      cell(book2, a)
+    );
+    for (const name of ["hue+", "lighten", "complement"] as const) {
+      const plan = {
+        tool: "adjust" as const,
+        scheme: SCHEMES.triad,
+        base: swatch(0, 0.5, 0.5),
+        adjust: ADJUSTMENTS[name],
+      };
+      const was = brushColours(plan, flatten(opaque, book2), cells);
+      const now = brushColours(plan, flatten(faded, book2), cells);
+      expect([name, now]).toEqual([name, was]);
+      // And nothing it produced carries a fourth channel, at any alpha.
+      for (const hex of now) expect(hex).toMatch(/^#[0-9a-f]{6}$/);
+    }
+  });
+
+  it("treats opacity 0 as a fade and NOT as a second spelling of hidden", () => {
+    // Two representations of one state is the bug this file spends four
+    // sections avoiding, so the dial at its end does not become the switch. A
+    // fully transparent layer still holds its paint and still wins the cell in
+    // the model; it is `strata` that stops drawing it.
+    const invisible = C([
+      L(1, [["s0:AA", GOLD]]),
+      L(2, [["s0:AA", RED]], { opacity: 0 }),
+    ]);
+    const hidden = C([
+      L(1, [["s0:AA", GOLD]]),
+      L(2, [["s0:AA", RED]], { visible: false }),
+    ]);
+    expect(flatten(invisible, book2).get(cell(book2, "s0:AA"))).toBe(RED);
+    expect(flatten(hidden, book2).get(cell(book2, "s0:AA"))).toBe(GOLD);
+    expect(switchesOf(invisible, layerId(2)).visible).toBe(true);
+  });
+
+  it("keeps a fade across the undo of an unrelated reorder", () => {
+    // THE TEST THAT DECIDES WHERE THE FIELD LIVES. The brief asked for
+    // `Layer.opacity`; a `place` rung carries `node: Layer`, so on the layer
+    // this sequence ends with the fade silently rolled back to whatever the
+    // snapshot froze — the switches bug, verbatim, in four keystrokes. In
+    // `Composition.switches` there is nothing for a rung to carry.
+    const s0 = newSession(C([L(1), L(2, [["s0:AA", GOLD]])], layerId(2)));
+    const moved = arrange(s0, "down");
+    expect(moved.ok).toBe(true);
+    if (!moved.ok) return;
+    const faded = {
+      ...moved.value,
+      composition: setOpacity(moved.value.composition, layerId(2), 0.4),
+    };
+    const back = undo(faded);
+    expect(opacityOf(back.session.composition, layerId(2))).toBe(0.4);
+    // and the reorder really was taken back
+    expect(back.session.composition.layers.map((l) => l.id)).toEqual([
+      layerId(1),
+      layerId(2),
+    ]);
+  });
+
+  it("is not journalled — dragging the dial changes no address", () => {
+    const s = newSession(C([L(1, [["s0:AA", GOLD]])], layerId(1)));
+    const faded = setOpacity(s.composition, layerId(1), 0.3);
+    expect(opacityOf(faded, layerId(1))).toBe(0.3);
+    expect(s.journal.past).toHaveLength(0);
+  });
+
+  it("canonicalises: 1 clears the entry and a no-op returns the SAME document", () => {
+    const comp = C([L(1, [["s0:AA", GOLD]])]);
+    const faded = setOpacity(comp, layerId(1), 0.5);
+    expect(faded.switches.get(layerId(1))).toEqual({
+      visible: true,
+      locked: false,
+      opacity: 0.5,
+    });
+    // Back to 1 and the entry is gone rather than stored as `opacity: 1`, so a
+    // document that was faded and un-faded is the document that never was.
+    const clear = setOpacity(faded, layerId(1), 1);
+    expect(clear.switches.size).toBe(0);
+    expect(switchesOf(clear, layerId(1))).toEqual(OPEN);
+    // Identity, not just equality: the same object keeps the flatten cache warm.
+    expect(setOpacity(clear, layerId(1), 1)).toBe(clear);
+    expect(setOpacity(faded, layerId(1), 0.5)).toBe(faded);
+    // And a re-ask that only differs below the file's quantum is the same ask.
+    expect(setOpacity(faded, layerId(1), 0.4999996)).toBe(faded);
+  });
+
+  it("survives the two switches being toggled around it", () => {
+    // One map, three facts. `setVisible` and `setLocked` spread the entry they
+    // found, so a dial set before a hide is still set after it — the failure
+    // this guards is a writer that rebuilds the entry from its own two fields.
+    let comp = setOpacity(C([L(1, [["s0:AA", GOLD]])]), layerId(1), 0.6);
+    comp = toggleVisible(comp, layerId(1));
+    comp = setLocked(comp, layerId(1), true);
+    expect(switchesOf(comp, layerId(1))).toEqual({
+      visible: false,
+      locked: true,
+      opacity: 0.6,
+    });
+    comp = toggleVisible(comp, layerId(1));
+    expect(opacityOf(comp, layerId(1))).toBe(0.6);
+    // It reaches the panel through the same slice the switches do.
+    expect(slices(comp)[0].own.opacity).toBe(0.6);
+  });
+
+  it("clamps to 0…1 and quantises to the file's own three decimals", () => {
+    // `artfile.ts` refuses anything outside 0…1 and `emit.fmtAlpha` rounds to
+    // three places, so a model that held more than that would state one number
+    // in the payload and another in the markup of the same file.
+    expect(canonicalAlpha(1 / 3)).toBe(0.333);
+    expect(canonicalAlpha(0.1 + 0.2)).toBe(0.3);
+    expect(canonicalAlpha(-2)).toBe(0);
+    expect(canonicalAlpha(42)).toBe(1);
+    expect(canonicalAlpha(Number.NaN)).toBe(1);
+    const comp = setOpacity(C([L(1)]), layerId(1), 0.12345);
+    expect(opacityOf(comp, layerId(1))).toBe(0.123);
+  });
+
+  it("refuses an id the document does not hold", () => {
+    const comp = C([L(1)]);
+    expect(setOpacity(comp, layerId(9), 0.5)).toBe(comp);
+    expect(alphaOf(switchesOf(comp, layerId(9)))).toBe(1);
+  });
+
+  it("rides through a paste on the switches map, like the two switches", () => {
+    // The reason the alpha is in that map and not in a second one beside it:
+    // `reid` re-keys it, `switchesIn` collects it and `pasteInto` takes it, so
+    // it arrives through four doors that were already open.
+    const source = C([L(1, [["s0:AA", GOLD]], { opacity: 0.2, locked: true })]);
+    const node = find(source, layerId(1));
+    expect(node).not.toBeNull();
+    if (node === null) return;
+    const carried = switchesIn(source, node);
+    const into = newSession(C([L(5)], layerId(5)));
+    const pasted = pasteInto(into, node, carried);
+    expect(pasted.ok).toBe(true);
+    if (!pasted.ok) return;
+    const arrived = pasted.value.composition.layers[0].children[0];
+    expect(opacityOf(pasted.value.composition, arrived.id)).toBe(0.2);
+    expect(switchesOf(pasted.value.composition, arrived.id).locked).toBe(true);
+    // A fresh id, so the entry travelled rather than the id colliding.
+    expect(arrived.id).not.toBe(layerId(1));
+  });
+});
+
+/**
+ * WHAT A FADED DOCUMENT IS DRAWN AS, and why it cannot be a flat list.
+ *
+ * Measured in Chromium, because the flat form is cheaper, obvious and wrong: a
+ * group's opacity applies to what the group COMPOSITES TO, not to each element
+ * in it. Parent gold and child red on one cell inside a single `opacity="0.5"`
+ * sample (255,128,128) — red at a half over white, the gold entirely hidden —
+ * while the same two layers written flat with their alphas multiplied out
+ * sample (255,115,64). Disjoint cells multiply exactly. So `strata` is a TREE,
+ * and `emit.ts` writes the same tree into the file.
+ */
+describe("strata: the nested groups a faded stack is drawn as", () => {
+  const faded = (): Composition =>
+    C([
+      L(1, [["s0:AA", GOLD]]),
+      L(2, [["s0:AB", RED]], {
+        opacity: 0.5,
+        children: [L(3, [["s0:AB", GREEN], ["s0:AC", BLUE]])],
+      }),
+    ]);
+
+  it("is null when nothing is faded, so the board keeps the flat path", () => {
+    // The whole of "an opaque document renders exactly as it always did": there
+    // is one code path for it and it is the old one.
+    const opaque = C([L(1, [["s0:AA", GOLD]]), L(2, [["s0:AB", RED]])]);
+    expect(strata(opaque, book2)).toBeNull();
+    // Including when the only fade is on something that draws nothing — a fade
+    // the picture cannot show must not send the board down the costly path.
+    expect(strata(C([L(1, [["s0:AA", GOLD]]), L(2, [], { opacity: 0.5 })]), book2)).toBeNull();
+  });
+
+  it("states each layer's OWN alpha and never the product", () => {
+    const tree = strata(
+      C([L(1, [["s0:AA", GOLD]], { opacity: 0.5, children: [L(2, [["s0:AB", RED]], { opacity: 0.5 })] })]),
+      book2
+    );
+    expect(tree).not.toBeNull();
+    if (tree === null) return;
+    expect(tree[0].opacity).toBe(0.5);
+    expect(tree[0].children[0].opacity).toBe(0.5);
+    // 0.25 anywhere here would be this module doing SVG's arithmetic for it,
+    // and doing it in the one place — overlapping paint — where it is wrong.
+    expect(tree[0].children[0].opacity).not.toBe(0.25);
+  });
+
+  it("carries each layer's OWN paint, so what is underneath still shows", () => {
+    const tree = strata(faded(), book2);
+    expect(tree).not.toBeNull();
+    if (tree === null) return;
+    expect(tree.map((n) => [...n.paint.values()])).toEqual([[GOLD], [RED]]);
+    // s0:AB is painted by L2 AND by its child. The board keeps only the child's
+    // colour; a faded stack must keep both, or the fade has nothing to fade to.
+    expect([...tree[1].children[0].paint.values()].sort()).toEqual([BLUE, GREEN].sort());
+    expect(flatten(faded(), book2).get(cell(book2, "s0:AB"))).toBe(GREEN);
+  });
+
+  it("is bottom-first, which is SVG document order", () => {
+    const tree = strata(faded(), book2);
+    expect(tree?.map((n) => n.id)).toEqual([layerId(1), layerId(2)]);
+  });
+
+  it("prunes a hidden subtree and an empty layer", () => {
+    const comp = C([
+      L(1, [["s0:AA", GOLD]], { opacity: 0.5 }),
+      L(2, [["s0:AB", RED]], { visible: false }),
+      L(3),
+      L(4, [], { children: [L(5, [["s0:AC", BLUE]])] }),
+    ]);
+    const tree = strata(comp, book2);
+    expect(tree?.map((n) => n.id)).toEqual([layerId(1), layerId(4)]);
+    // The empty group survives ONLY because it has a child that draws.
+    expect(tree?.[1].paint.size).toBe(0);
+    expect(tree?.[1].children.map((n) => n.id)).toEqual([layerId(5)]);
+  });
+
+  it("is cached on the stack, the switches and the book", () => {
+    // Identity and not equality: the board memoises on this reference, so a
+    // fresh array per render rebuilds every polygon on every pointer move.
+    const comp = faded();
+    expect(strata(comp, book2)).toBe(strata(comp, book2));
+    expect(strata(comp, book1)).not.toBe(strata(comp, book2));
+    // A new switches map is a new answer, which is what makes dragging the dial
+    // show on screen at all.
+    const dimmer = setOpacity(comp, layerId(2), 0.25);
+    expect(strata(dimmer, book2)).not.toBe(strata(comp, book2));
+    expect(strata(dimmer, book2)?.[1].opacity).toBe(0.25);
+  });
+
+  it("fits the board's PaintNode without the board importing the model", () => {
+    // A COMPILE-TIME claim, spent here rather than left to a comment:
+    // `DrawBoard` states its own `PaintNode` so that it knows nothing about
+    // `layers.ts`, and this assignment is what keeps the two in step.
+    const tree = strata(faded(), book2);
+    const nodes: readonly PaintNode[] | null = tree;
+    expect(nodes).not.toBeNull();
   });
 });
 
@@ -1821,6 +2154,60 @@ describe("flatten cost at depth 5, reported", () => {
     );
     expect(flatten(capped, book).size).toBe(6144);
     for (const [, hex6] of flatten(capped, book)) expect(hex6).toBe(GOLD);
+  });
+
+  it("reports what a FADED document costs beside an opaque one", () => {
+    // The honest price of the feature, reported rather than asserted. A fade
+    // says the layers underneath still show, so the occlusion short-circuit
+    // the test above measures at a factor of 15 is unavailable BY DEFINITION —
+    // `strata` resolves every shown layer and the board draws one element per
+    // painted cell per layer instead of one per decided cell.
+    //
+    // It is paid only by documents that asked for it: `strata` answers `null`
+    // when nothing is faded and the board keeps the flat path.
+    //
+    // THE TWO SIDES SHARE THEIR PLATES, deliberately, because that is what the
+    // app does: moving a dial builds a new switches map and touches no plate,
+    // so `resolvePlate` is already warm and the figure below is the compositing
+    // work alone. `first` is therefore not a cold resolution and is not
+    // comparable to the cold column in the test above — it is the cost of the
+    // very gesture this feature adds.
+    const hex = buildHexagon(5);
+    const book = addressBook(hex);
+    const ms = (f: () => void): number => {
+      const t0 = performance.now();
+      f();
+      return performance.now() - t0;
+    };
+    const sparse = (seed: number): AddressPlate => {
+      const out = new Map<Address, string>();
+      for (let i = seed % 7; i < book.addr.length; i += 7) out.set(book.addr[i], RED);
+      return out;
+    };
+    for (const n of [4, 16]) {
+      const layers = Array.from({ length: n }, (_, k) =>
+        L(k + 1, [], { plate: sparse(k) })
+      );
+      const opaque = C(layers);
+      // One layer faded is enough to put the whole document on the other path.
+      const dimmed = setOpacity(C(layers.map((l) => ({ ...l }))), layerId(1), 0.5);
+      const flat = ms(() => {
+        flatten(opaque, book);
+      });
+      const tree = ms(() => {
+        strata(dimmed, book);
+      });
+      const warm = ms(() => {
+        strata(dimmed, book);
+      });
+      const drawn = (strata(dimmed, book) ?? []).reduce((a, s) => a + s.paint.size, 0);
+      console.log(
+        `d5 N=${String(n).padStart(2)}  flatten ${flat.toFixed(2)}ms → ` +
+          `${flatten(opaque, book).size} elements   ` +
+          `strata ${tree.toFixed(2)}ms first / ${warm.toFixed(2)}ms cached → ${drawn} elements`
+      );
+    }
+    expect(strata(C([L(1, [], { plate: sparse(0) })]), book)).toBeNull();
   });
 });
 

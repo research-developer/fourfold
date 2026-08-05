@@ -318,6 +318,27 @@ export interface EmitLayer {
    * brush. See the header.
    */
   orbit?: number;
+  /**
+   * The nested-timeline compositions this layer's beat sits inside, outermost
+   * first, space separated — `timeline.compMark` of its trail.
+   *
+   * ABSENT AT THE ROOT, which is every drawing that has never been grouped, so
+   * a file with no groups writes no field and its bytes are the bytes it wrote
+   * before this existed. `test/artfile.test.ts` pins that on the exact payload
+   * rather than on a re-encode, which would agree if both sides gained a key.
+   *
+   * A TRAIL RATHER THAN A PARENT POINTER, because the file is read without a
+   * journal: `timeline.treeFromTrails` rebuilds the whole tree from the trails
+   * alone, where a parent id would need a second pass to discover which layer
+   * each id belonged to and would have no answer for a composition whose own
+   * beats were all merged away.
+   *
+   * NOT POPULATED YET — no producer sets it, so it is absent from every file
+   * this program currently writes. The reader half is complete and tested; the
+   * writer needs `EmitLayer.reveal` to be set from the drawing path, which is
+   * still the open gap it has been since gesture provenance landed.
+   */
+  nest?: string;
 }
 
 /**
@@ -1369,6 +1390,9 @@ function toArtLayer(l: EmitLayer): ArtLayer {
   if (l.reveal !== undefined) out.reveal = l.reveal;
   if (l.mode !== undefined) out.mode = l.mode;
   if (l.orbit !== undefined) out.orbit = l.orbit;
+  // After `orbit` and before `cells`, because `encodeArt` writes keys in
+  // insertion order and `test/artfile.test.ts` pins the payload byte for byte.
+  if (l.nest !== undefined && l.nest.length > 0) out.nest = l.nest;
   if (l.paint !== undefined && l.paint.size > 0) {
     out.cells = sortedKeys(l.paint).map(
       (i) => [i, l.paint?.get(i) as string] as [number, string]
@@ -1886,6 +1910,7 @@ function fromArtLayers(list: readonly ArtLayer[]): EmitLayer[] {
     if (l.reveal !== undefined) out.reveal = l.reveal;
     if (l.mode !== undefined) out.mode = l.mode;
     if (l.orbit !== undefined) out.orbit = l.orbit;
+    if (l.nest !== undefined) out.nest = l.nest;
     if (l.cells !== undefined) out.paint = new Map(l.cells);
     if (l.children !== undefined) out.children = fromArtLayers(l.children);
     return out;

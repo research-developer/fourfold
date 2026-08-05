@@ -8,6 +8,7 @@ import {
   GEOMETRY_PRECISION,
   importByGeometry,
   MAX_DEPTH,
+  MAX_LAYER_DEPTH,
   MAX_LAYERS,
   normalizeHex,
   paintFromPayload,
@@ -603,6 +604,144 @@ describe("a layer's gesture fields", () => {
     }
     // And absent is fine: a still export says nothing about timing.
     expect(extractArt(withComp({ layers: [] }))?.comp?.anim).toBeUndefined();
+  });
+});
+
+/**
+ * THE COMPOSITION BOUNDARY — `ArtLayer.nest`, and the one thing it must not cost.
+ *
+ * `nested.ts` builds a timeline as a tree because a MINTED NAME is the only
+ * address that survives an insertion — `test/nested.test.ts` runs one probe
+ * against five insertion sites and tabulates exactly that. `reveal` is the
+ * derived flat index, so a file carrying only `reveal` states the answer and
+ * throws away the question. This field states the nesting, and nothing else.
+ *
+ * THE FIRST TEST IS THE IMPORTANT ONE. Every optional field this format has
+ * gained was gained on the same promise — that a file which does not use it is
+ * byte for byte the file it always was — and `test/inout.test.ts` asserts that
+ * promise for the in and out points three separate ways. Here it is asserted on
+ * the exact bytes of the comment, because a payload that gained a key would make
+ * every drawing anyone has already made a different document the next time it is
+ * saved.
+ */
+describe("the composition boundary a grouped timeline saves", () => {
+  /** A composition of two gesture layers, as `emit.ts` writes one. */
+  const twoSteps = (extra: Record<string, unknown>[]): ArtPayload => ({
+    version: ART_VERSION,
+    canvas: "hexagon",
+    depth: 1,
+    convention: "apex",
+    cells: [[0, "#d4a017"]],
+    comp: {
+      layers: [
+        { id: "g", reveal: 0, ...extra[0] },
+        { id: "h", reveal: 1, ...extra[1] },
+      ],
+    } as ArtPayload["comp"],
+  });
+
+  it("writes exactly the bytes it wrote before this field existed", () => {
+    const bytes = encodeArt(twoSteps([{}, {}]));
+    // PINNED IN FULL rather than compared against a re-encode, which would pass
+    // just as happily if both sides had gained the same key. This is the file as
+    // it stood before the field was added, character for character.
+    expect(bytes).toBe(
+      `<!-- fourfold:art:1 {"canvas":"hexagon","depth":1,"convention":"apex",` +
+        `"cells":[[0,"#d4a017"]],"comp":{"layers":[{"id":"g","reveal":0},` +
+        `{"id":"h","reveal":1}]}} -->`
+    );
+    expect(bytes).not.toContain("nest");
+    // And the round trip through the reader adds nothing either: an ungrouped
+    // file comes back saying nothing about grouping, which is what a reader that
+    // predates the field assumes and what every such file meant.
+    const back = extractArt(bytes) as ArtPayload;
+    expect(encodeArt(back)).toBe(bytes);
+    const layer = back.comp?.layers[0] as object;
+    expect("nest" in layer).toBe(false);
+  });
+
+  it("carries a trail back, and re-encodes to the same bytes", () => {
+    const text = encodeArt(twoSteps([{ nest: "t9" }, { nest: "t9 t14" }]));
+    const back = extractArt(text) as ArtPayload;
+    expect(back.comp?.layers[0].nest).toBe("t9");
+    expect(back.comp?.layers[1].nest).toBe("t9 t14");
+    // The key order is pinned the same way the gesture fields' is: the validator
+    // rebuilds the object and the round trip is on BYTES, so an emitter writing
+    // this anywhere but after `orbit` would re-encode to a different file.
+    expect(encodeArt(back)).toBe(text);
+    expect(text).toContain(`"reveal":0,"nest":"t9"`);
+  });
+
+  it("keeps it on a nested layer, which is where a pasted gesture lands", () => {
+    const back = extractArt(
+      encodeArt({
+        version: ART_VERSION,
+        canvas: "hexagon",
+        depth: 1,
+        convention: "apex",
+        cells: [[0, "#d4a017"]],
+        comp: {
+          layers: [
+            { id: "outer", children: [{ id: "inner", reveal: 4, nest: "t2" }] },
+          ],
+        } as ArtPayload["comp"],
+      })
+    );
+    expect(back?.comp?.layers[0].children?.[0].nest).toBe("t2");
+  });
+
+  it("refuses a trail that is not a list of names", () => {
+    const bad: unknown[] = [
+      // Absent is the ONE spelling of "no nesting"; a second spelling is a second
+      // way for a round trip to pick the other one.
+      "",
+      // Spacing other than one space produces an empty part, and an empty part
+      // is not a name.
+      "t9  t14",
+      " t9",
+      "t9 ",
+      // A name is a name: `LAYER_ID`'s own rule, so no leading digit and nothing
+      // that could not be an XML name.
+      "9t",
+      "t9,t14",
+      "t 9",
+      "t9\tt14",
+      // A composition inside itself is not a tree.
+      "t9 t9",
+      "t9 t14 t9",
+      // And a field that is present and is not a string at all.
+      3,
+      null,
+      true,
+      ["t9"],
+      { id: "t9" },
+    ];
+    for (const nest of bad) {
+      expect(
+        extractArt(encodeArt(twoSteps([{ nest }, {}]))),
+        JSON.stringify(nest)
+      ).toBeNull();
+    }
+  });
+
+  it("bounds the trail by the DEPTH it is a depth of", () => {
+    const trail = (n: number) =>
+      Array.from({ length: n }, (_, k) => `t${k}`).join(" ");
+    expect(
+      extractArt(encodeArt(twoSteps([{ nest: trail(MAX_LAYER_DEPTH) }, {}])))
+    ).not.toBeNull();
+    // Not `MAX_LAYERS`, which is a count of NODES and would be no bound on a
+    // nesting at all — the mistake the three gesture fields were found sharing.
+    expect(
+      extractArt(encodeArt(twoSteps([{ nest: trail(MAX_LAYER_DEPTH + 1) }, {}])))
+    ).toBeNull();
+  });
+
+  it("refuses the whole payload for a bad trail, like every other field here", () => {
+    // A writer that disagrees with us about the shape of this payload is not a
+    // writer whose cell indices we should trust either.
+    const back = extractArt(encodeArt(twoSteps([{}, { nest: "t9 t9" }])));
+    expect(back).toBeNull();
   });
 });
 
