@@ -90,6 +90,41 @@
  * the only thing that compiles. It is O(strokes) and not O(cells), which is the
  * whole of the requirement; `grouping: "cell"` writes the per-cell form for
  * real so the saving is measured rather than asserted.
+ *
+ * ── The in point and the out point ──────────────────────────────────────
+ *
+ * A replay may be CUT: an in point, before which the drawing is already there,
+ * and an out point, after which it is not shown at all. Both are indices into
+ * `AnimationStep[]` — the animation's own beats — and the pair is CLOSED, so
+ * `{in: 3, out: 7}` is five steps and both ends play. `boundAnimation` is the
+ * one place that reads them and `InOut` is the one spelling; everything else in
+ * this module and in `gif.ts` sees a step list that has already been cut.
+ *
+ * WHY STEPS AND NOT GESTURES. `animationSteps` DROPS a gesture that changed
+ * nothing in the current frame — in a sector view a stroke may land entirely
+ * outside the picture — so the k-th step is not in general the k-th gesture.
+ * Marks on gestures would therefore name beats the replay does not have, and
+ * would name different ones as soon as the view changed. Marks on steps are
+ * marks on what the viewer is actually watching, and they are the same index
+ * `emit.EmitLayer.reveal` carries and the same index `k · stepMs` is computed
+ * from, so there is one index space for the whole feature rather than two that
+ * have to be kept in step.
+ *
+ * WHY CLOSED AND NOT HALF-OPEN. Half-open would match `slice` and would make
+ * the count a subtraction, which is the argument for it. It also makes `in ==
+ * out` mean an EMPTY replay, and an empty replay is a thing every consumer then
+ * has to answer for — a GIF with no image descriptor is not a file. Closed
+ * cannot express the empty span at all: `0 ≤ in ≤ out < steps` always names at
+ * least one beat. The degenerate case is removed by the representation rather
+ * than handled in six places, and `out` means what a person setting an out
+ * point means by it — the last thing you see.
+ *
+ * WHY THE IN POINT NEEDS NO NEW MECHANISM. `AnimationSpec.ground` is already
+ * "the plate before the first recorded gesture, visible from the first frame",
+ * so cutting the front is composing the dropped steps INTO it. The steps are
+ * additive by construction — see `animationSteps` — so replaying the prefix in
+ * order onto the ground map is exactly what the document would have drawn by
+ * the time the in point came round.
  */
 
 import { encodeArt, type ArtPayload } from "./artfile";
@@ -370,6 +405,166 @@ export function animationSteps(
   return out;
 }
 
+// ── the in point and the out point ───────────────────────────────────────
+
+/**
+ * Which part of the drawing a replay plays.
+ *
+ * CLOSED, and indices into `AnimationStep[]` rather than into the gesture
+ * journal. Both ends play: `{in: 3, out: 7}` is FIVE steps, not four. The
+ * argument for both of those choices is in the module header, and the one thing
+ * worth repeating here is that the count is `out - in + 1` — `spanSteps` exists
+ * so nothing has to write that subtraction twice.
+ *
+ * A valid span satisfies `0 ≤ in ≤ out < steps`, so a replay with no steps has
+ * no valid span at all and `clampSpan` says so by returning `null` rather than
+ * by inventing an empty one.
+ */
+export interface InOut {
+  /** The first step that plays. Everything before it is already on the plate. */
+  readonly in: number;
+  /** The last step that plays. Everything after it is not shown at all. */
+  readonly out: number;
+}
+
+/** How many steps a span names. `null` — nothing to play — is zero of them. */
+export const spanSteps = (span: InOut | null): number =>
+  span === null ? 0 : span.out - span.in + 1;
+
+/**
+ * One mark brought inside `0 … steps-1`, with the same rule `clampIndex` uses
+ * for a number that is not one: fall back rather than throw.
+ */
+const clampMark = (n: number, fallback: number, steps: number): number => {
+  if (!Number.isFinite(n)) return fallback;
+  const k = Math.round(n);
+  return k < 0 ? 0 : k > steps - 1 ? steps - 1 : k;
+};
+
+/**
+ * A span brought inside a replay of `steps` beats, or `null` when there are
+ * none.
+ *
+ * THE UI-FACING END OF THE FEATURE, and it CLAMPS rather than refuses, which is
+ * the opposite of what `artfile` does with the same two numbers. That is
+ * deliberate and the split is the codebase's own: a payload is a promise from a
+ * writer we do not control, so a malformed one is refused whole; a slider is a
+ * live control being dragged, and a drag that runs off the end of the track is
+ * an ordinary event rather than a broken statement.
+ *
+ * The rules, all of them:
+ *
+ *   ABSENT — the whole replay, `{in: 0, out: steps-1}`. So a drawing with no
+ *   marks set behaves exactly as it did before this existed, which is what
+ *   makes the field safe to leave off everywhere.
+ *
+ *   OUT OF RANGE — clamped to the ends. A mark that is not a finite number at
+ *   all falls back to its own end of the track, so a lost `in` is 0 and a lost
+ *   `out` is the last step; that is `clampIndex`'s rule for the same problem.
+ *
+ *   INVERTED (`in > out`) — the OUT point is pulled back to the in point, so
+ *   the span collapses to the single step at `in`. Moving `in` instead would
+ *   have been equally short, and it is the worse answer: `in` is what the
+ *   ground is folded to, so moving it changes the PICTURE the replay starts on,
+ *   while moving `out` only changes how much of it plays. Between two clamps,
+ *   take the one that does not repaint the first frame.
+ */
+export function clampSpan(
+  span: InOut | null | undefined,
+  steps: number
+): InOut | null {
+  const n = Math.floor(steps);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  if (span === undefined || span === null) return { in: 0, out: n - 1 };
+  const from = clampMark(span.in, 0, n);
+  const to = clampMark(span.out, n - 1, n);
+  return { in: from, out: to < from ? from : to };
+}
+
+/** A replay cut to its in and out points: what both encoders are handed. */
+export interface BoundedAnimation {
+  /** The plate the first frame shows: `ground` with the prefix folded in. */
+  ground: PaintMap;
+  /** The steps that play — `steps[in … out]`, both ends included. */
+  steps: readonly AnimationStep[];
+  /** The span actually used, after clamping. `null` when there is nothing. */
+  span: InOut | null;
+  /** Steps folded into the ground: everything before the in point. */
+  folded: number;
+  /** Steps not shown at all: everything after the out point. */
+  dropped: number;
+}
+
+/**
+ * The replay, cut.
+ *
+ * THE ONE PLACE THE MARKS ARE READ, and that is the whole answer to "how do the
+ * SVG and the GIF avoid disagreeing". Neither `animatedSvg` nor `gif.gifSteps`
+ * knows what an in point is: each is handed a `ground` and a `steps` that have
+ * already been cut, and a caller that wants both files computes this ONCE and
+ * spreads the same two fields into both specs. Two encoders reading two marks
+ * would be two chances to be off by one; two encoders reading one value is
+ * none. It is the same discipline the page already applies to `animationSteps`
+ * itself, which is walked once and handed to both.
+ *
+ * ── The prefix folds; it does not need a mechanism ──────────────────────
+ *
+ * Every step is additive in the document — its cells are drawn OVER whatever
+ * was there — so replaying steps `0 … in-1` onto the ground map, in order, with
+ * later writes winning, produces exactly the plate the uncut animation shows at
+ * `in · stepMs`. `AnimationSpec.ground` already means "there from the first
+ * frame", so there is nothing to add: the fold is a `Map` and a loop.
+ *
+ * The one thing to say out loud is what an ERASE folds to. `animationSteps`
+ * records an erase as the UNPAINTED FILL rather than as an absence, because the
+ * animation draws it that way — nothing is ever removed from the document. So a
+ * cell erased before the in point lands in the folded ground wearing the tile
+ * colour, and is drawn in the ground group rather than in the tiling group. The
+ * pixels are the same either way, because the uncut animation had covered that
+ * cell's tiling polygon with an identically shaped one in the same colour by
+ * the time it reached `in`. What the folded ground is NOT is the model's own
+ * state at that point, where the cell would be genuinely unpainted. It is the
+ * FRAME, and the frame is what an animation's first frame has to be.
+ *
+ * ── The suffix truncates, and the final-frame invariant survives ────────
+ *
+ * `animationSteps` promises that "the last group to name a cell is the last
+ * gesture that touched it, so the final frame is the final state". Dropping a
+ * SUFFIX cannot break that: the property is local to the list, so after the cut
+ * the last group to name a cell is the last INCLUDED step that touched it, and
+ * the final frame is the state at the out point. That is the retarget the
+ * feature asks for, and it holds without a repair pass because nothing before
+ * the cut ever depended on what came after it.
+ *
+ * Nothing here mutates: `ground` is copied even when nothing is folded into it,
+ * on the rule this whole module keeps.
+ */
+export function boundAnimation(
+  ground: PaintMap,
+  steps: readonly AnimationStep[],
+  span?: InOut | null
+): BoundedAnimation {
+  const at = clampSpan(span, steps.length);
+  if (at === null) {
+    return { ground: new Map(ground), steps: [], span: null, folded: 0, dropped: 0 };
+  }
+  const start = new Map(ground);
+  for (let k = 0; k < at.in; k++) {
+    for (const g of steps[k].groups) {
+      // Later writes win, which is what makes a repaint before the in point
+      // fold to the colour it ended on rather than to the one it started at.
+      g.cells.forEach((i, n) => start.set(i, g.fills[n]));
+    }
+  }
+  return {
+    ground: start,
+    steps: steps.slice(at.in, at.out + 1),
+    span: at,
+    folded: at.in,
+    dropped: steps.length - 1 - at.out,
+  };
+}
+
 // ── the animation, as a file ─────────────────────────────────────────────
 
 /** How the per-step markup is written. `cell` exists to be measured against. */
@@ -397,8 +592,16 @@ export interface AnimationSpec {
    * frame and the strokes come up underneath it.
    */
   overlay?: readonly ArtOverlayGroup[];
-  /** The plate before the first recorded gesture. Visible from the first frame. */
+  /**
+   * The plate before the first step below. Visible from the first frame.
+   *
+   * "Before the first recorded gesture" when the whole drawing plays, and the
+   * plate at the IN POINT when it does not. There is no second field for the
+   * cut: `boundAnimation` returns this pair already cut, and a caller passes
+   * what it returns. See its header for why the fold needs no mechanism.
+   */
   ground: PaintMap;
+  /** The steps that play. Already cut to the in and out points, if there are any. */
   steps: readonly AnimationStep[];
   /** Milliseconds between steps. An integer; the percentages are derived. */
   stepMs: number;
@@ -476,6 +679,11 @@ export interface AnimationTiming {
  *  100          @ 250    → draw 25 s,   hold 1.8 s  — unchanged
  *
  * Integers throughout: the percentages downstream are the only floats.
+ *
+ * `steps` IS THE BOUNDED COUNT when a replay has an in and an out point — a
+ * hundred-gesture drawing cut to five plays a five-step cycle, and a hold
+ * scaled to the hundred would be four fifths of a loop spent on a still frame.
+ * Spell it `boundAnimation(...).steps.length` and it cannot be the other one.
  */
 export function animationTiming(stepMs: number, steps: number): AnimationTiming {
   const fadeMs = Math.max(1, Math.min(FADE_MS, Math.floor(stepMs / 3)));

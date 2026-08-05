@@ -216,11 +216,13 @@
  *   data-orbit    how many cells the orbit actually held
  *
  * Only `data-reveal` is load bearing for the picture; the stylesheet selects on
- * it. The other two are for a reader that is not this program. A `<g>` in
- * Illustrator or Inkscape is a compound path with no indication of what produced
- * it, and these two words make one addressable — every six-fold stroke, every
- * orbit that came out short — which is the whole reason this format writes
- * layers rather than a flattened plate.
+ * it — and it is what an in point and an out point are stated against, so a
+ * replay cut to part of the drawing is a change to the STYLESHEET and never to
+ * these three words. See `EmitAnimation`. The other two are for a reader that
+ * is not this program. A `<g>` in Illustrator or Inkscape is a compound path
+ * with no indication of what produced it, and these two words make one
+ * addressable — every six-fold stroke, every orbit that came out short — which
+ * is the whole reason this format writes layers rather than a flattened plate.
  *
  * They are therefore written for a STILL export too. A gesture's symmetry is a
  * fact about the gesture and not about whether anything is being played back,
@@ -342,8 +344,32 @@ export interface EmitAnimation {
   holdMs: number;
   /** How long a layer takes to come up. Short — it reads as a stroke landing. */
   fadeMs: number;
-  /** How many reveal steps the cycle has. */
+  /** How many reveal steps the DRAWING has. The cycle's is `out - in + 1`. */
   steps: number;
+  /**
+   * The in point and the out point: which reveal steps actually play.
+   *
+   * CLOSED and inclusive, indices into the same reveal space `EmitLayer.reveal`
+   * uses, so `{in: 3, out: 7}` plays five steps and both ends are seen.
+   * `replay.InOut` is the same pair in the model and its header carries the
+   * argument for closed over half-open; `artfile.ArtAnimation` is where the
+   * file states them.
+   *
+   * HONOURED IN THE STYLESHEET, not by dropping markup. A layer whose reveal
+   * falls before the in point is written exactly as it always was and is simply
+   * given `opacity: 1` from the first frame — it is the ground, and the ground
+   * needs no new mechanism. A layer past the out point keeps its `opacity: 0`
+   * and is never named by a keyframe, so it is in the file and not in the
+   * picture. Both matter: `data-reveal`, `data-mode` and `data-orbit` are
+   * PROVENANCE and are written even for a still export, so a cut must not be
+   * allowed to delete the record of what made the gesture — see the header.
+   *
+   * Absent means the whole drawing plays, and `animationRules` reduces to
+   * exactly the bytes it wrote before this existed when they are.
+   */
+  in?: number;
+  /** The last reveal step that plays. Closed with `in`; both or neither. */
+  out?: number;
 }
 
 // ── the document ─────────────────────────────────────────────────────────
@@ -1030,9 +1056,44 @@ function styleRules(
 /** How much wider than a hairline a weld stroke is. `strokes.WELD_WIDTH`. */
 const WELD = 3;
 
+/**
+ * The reveal rules, cut to the in and out points when the document states them.
+ *
+ * ── Why the uncut file is byte for byte the file it always was ──────────
+ *
+ * `lo` and `hi` default to the ends, so every formula below reduces to the one
+ * it replaced: the cycle is `(steps-1 - 0 + 1) · stepMs + holdMs`, which is
+ * `steps · stepMs + holdMs`, and a keyframe sits at `(k - 0) · stepMs`, which is
+ * `k · stepMs`. Nothing is written that was not written before.
+ *
+ * The two EXTRA rules are gated on the marks being present rather than on `k`
+ * falling outside `lo … hi`, and that is not belt and braces. A document may
+ * carry a reveal index past its own `steps` — nothing validates one against the
+ * other, deliberately, because `steps` is the drawing's length and a reveal is a
+ * layer's own statement — and such a layer animates today. Gating on the marks
+ * keeps it animating, so this change cannot alter a file that never asked to be
+ * cut.
+ *
+ * ── Why a cut layer keeps its markup ────────────────────────────────────
+ *
+ * Neither branch removes a `<g>` or a `data-*`. `data-reveal`, `data-mode` and
+ * `data-orbit` are the record of what MADE the gesture and are written even for
+ * a still export — see the header — so a file whose out point dropped the last
+ * three strokes must still say that those three strokes were six-fold. The cut
+ * is what the file DRAWS; the markup is what it MEANS.
+ */
 function animationRules(doc: EmitDoc, root: string): string[] {
   const a = doc.animation as EmitAnimation;
-  const cycle = Math.max(1, a.steps * a.stepMs + a.holdMs);
+  // BOTH gated on the pair being whole, and not one defaulted per mark. A
+  // half-stated pair — `in` with no `out`, which the payload refuses but an
+  // in-memory document can still hold — took `lo = 2, hi = steps - 1` and
+  // silently played a four-step cycle out of a six-step drawing that had asked
+  // for no cut at all. `test/inout.test.ts` measured that; the pair is whole or
+  // it does not exist.
+  const bounded = a.in !== undefined && a.out !== undefined;
+  const lo = bounded ? (a.in as number) : 0;
+  const hi = bounded ? (a.out as number) : a.steps - 1;
+  const cycle = Math.max(1, (hi - lo + 1) * a.stepMs + a.holdMs);
   const reveals = new Set<number>();
   walkLayers(doc.layers, (l) => {
     if (l.reveal !== undefined) reveals.add(l.reveal);
@@ -1047,11 +1108,28 @@ function animationRules(doc: EmitDoc, root: string): string[] {
       `animation-fill-mode: both }`,
   ];
   const order = [...reveals].sort((x, y) => x - y);
+  const before = (k: number) => bounded && k < lo;
+  const after = (k: number) => bounded && k > hi;
   for (const k of order) {
+    // BEFORE THE IN POINT is the ground: up from the first frame, no animation
+    // to run. AFTER THE OUT POINT is not shown at all; the base rule above
+    // already left it at zero and this says so where a reader will look for it.
+    // Same specificity as that rule and written after it, so both win.
+    if (before(k)) {
+      rules.push(`${at}[data-reveal="${k}"] { animation: none; opacity: 1 }`);
+      continue;
+    }
+    if (after(k)) {
+      rules.push(`${at}[data-reveal="${k}"] { animation: none; opacity: 0 }`);
+      continue;
+    }
     rules.push(`${at}[data-reveal="${k}"] { animation-name: ${root}-r${k} }`);
   }
   for (const k of order) {
-    const on0 = k * a.stepMs;
+    if (before(k) || after(k)) continue;
+    // Rebased on the in point, so a drawing of a hundred gestures cut to five
+    // plays a five-step cycle with the first of them lit at zero.
+    const on0 = (k - lo) * a.stepMs;
     const on = (100 * on0) / cycle;
     const lit = (100 * Math.min(on0 + Math.max(1, a.fadeMs), cycle)) / cycle;
     // The first step reveals at 0, where `0%, 0%` would be a duplicate selector.
@@ -1065,9 +1143,19 @@ function animationRules(doc: EmitDoc, root: string): string[] {
   // way to stop it — did not. An infinite loop is exactly what the preference
   // is about, so the finished plate is what a reader who asked for less motion
   // gets: every layer up, nothing moving.
+  //
+  // "The finished plate" is the plate AT THE OUT POINT when there is one, so
+  // the layers the cut drops are held down inside this block too. Without that
+  // line the preference would quietly restore three strokes the author had cut
+  // — a reduced-motion reader would be the only one seeing a different drawing,
+  // which is the one thing an accessibility rule must not do. Same specificity,
+  // written after, so it wins.
+  const cut = order.filter(after);
   rules.push(
     `@media (prefers-reduced-motion: reduce) { ${at}[data-reveal] ` +
-      `{ animation: none; opacity: 1 } }`
+      `{ animation: none; opacity: 1 }` +
+      cut.map((k) => ` ${at}[data-reveal="${k}"] { opacity: 0 }`).join("") +
+      ` }`
   );
   return rules;
 }
@@ -1128,6 +1216,13 @@ function compositionOf(doc: EmitDoc): ArtComposition {
           holdMs: doc.animation.holdMs,
           fadeMs: doc.animation.fadeMs,
           steps: doc.animation.steps,
+          // BOTH OR NEITHER, and last, so a document with no in and out points
+          // writes the same four keys in the same order it always wrote them
+          // and the bytes are unchanged. `artfile`'s validator builds the same
+          // object in the same order, which is what keeps the re-encode exact.
+          ...(doc.animation.in === undefined || doc.animation.out === undefined
+            ? {}
+            : { in: doc.animation.in, out: doc.animation.out }),
         };
   return {
     shown: formatRanges(doc.shown),
@@ -1354,6 +1449,11 @@ function read(text: string): EmitDoc | null {
           holdMs: comp.anim.holdMs,
           fadeMs: comp.anim.fadeMs,
           steps: comp.anim.steps,
+          // The validator has already refused a half-stated pair, so these are
+          // both present or both absent by the time they get here.
+          ...(comp.anim.in === undefined || comp.anim.out === undefined
+            ? {}
+            : { in: comp.anim.in, out: comp.anim.out }),
         };
 
   return {

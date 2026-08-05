@@ -202,8 +202,38 @@ export interface ArtAnimation {
   holdMs: number;
   /** How long a layer takes to come up. */
   fadeMs: number;
-  /** How many reveal steps the cycle has. */
+  /**
+   * How many reveal steps the DRAWING has.
+   *
+   * The cycle's length only when there are no in and out points below; with
+   * them it is `out - in + 1` steps that play and this is still the whole
+   * drawing, because the marks have to be stated against something that does
+   * not move when they do.
+   */
   steps: number;
+  /**
+   * The in point: the first reveal step that plays. Everything before it is
+   * already on the plate when the loop starts — the ground, not something that
+   * gets revealed.
+   *
+   * This and `out` are a CLOSED pair, so `{in: 3, out: 7}` is five steps and
+   * both ends play; `replay.InOut` is the same pair in the model, and its
+   * header carries the argument for closed over half-open.
+   *
+   * Optional and NOT versioned, on exactly the argument `relief`, `plate`,
+   * `view` and `comp` already make: a reader that predates them treats their
+   * absence as "the whole drawing plays", which is what every file written
+   * before they existed meant and what `steps` alone still says. Omitted
+   * entirely when unset, so a drawing with no marks exports byte for byte the
+   * file it always did — `test/inout.test.ts` asserts that on the bytes.
+   *
+   * BOTH OR NEITHER, enforced below. One without the other would need a second
+   * spelling of "to the end", and two ways to write one thing is two ways for a
+   * round trip to pick the other one.
+   */
+  in?: number;
+  /** The out point: the last reveal step that plays. Closed with `in`. */
+  out?: number;
 }
 
 export interface ArtComposition {
@@ -600,7 +630,31 @@ function validateComposition(
       return REJECT;
     }
     if (steps > MAX_LAYERS) return REJECT;
-    anim = { stepMs, holdMs, fadeMs, steps };
+
+    // The in and out points. REFUSED rather than clamped, which is the
+    // opposite of what `replay.clampSpan` does with the same two numbers, and
+    // the split is on purpose: a slider being dragged off the end of its track
+    // is an ordinary event, a FILE that names a step its own `steps` says does
+    // not exist is a declaration disagreeing with itself. This module's rule
+    // for that has never been to guess which half was meant.
+    //
+    // Both or neither, and `0 ≤ in ≤ out < steps`. Note that `steps: 0` admits
+    // no span at all — `out < 0` is unsatisfiable — which is right: a drawing
+    // with nothing to play cannot have marked where to stop playing it.
+    const from: unknown = a.in;
+    const to: unknown = a.out;
+    if ((from === undefined) !== (to === undefined)) return REJECT;
+    let span: { in: number; out: number } | undefined;
+    if (from !== undefined) {
+      if (typeof from !== "number" || !Number.isInteger(from)) return REJECT;
+      if (typeof to !== "number" || !Number.isInteger(to)) return REJECT;
+      if (from < 0 || to < from || to >= steps) return REJECT;
+      span = { in: from, out: to };
+    }
+
+    // Key order matches `emit.compositionOf`, because a payload is re-encoded
+    // from what this returns and the round trip is on BYTES.
+    anim = { stepMs, holdMs, fadeMs, steps, ...(span ?? {}) };
   }
 
   if (!Array.isArray(c.layers)) return REJECT;

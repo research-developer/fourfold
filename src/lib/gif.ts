@@ -69,8 +69,10 @@
  * spending frames on it, and every intermediate opacity is a NEW COLOUR — a
  * six-frame fade over a twenty-colour drawing is 120 colours of ramp for
  * something the eye reads as an appearance either way. So a gesture is one
- * frame, the frame count is the gesture count, and the fade is dropped rather
- * than faked.
+ * frame, the frame count is the STEP count, and the fade is dropped rather than
+ * faked. The step count and the gesture count are the same number until a
+ * replay is cut to an in and an out point, and the cut happens in
+ * `replay.boundAnimation` before this file ever sees the list — see `GifSpec`.
  *
  * The delays are the same numbers the SVG uses. GIF counts in CENTISECONDS,
  * which would normally be a rounding problem; it is not one here, because every
@@ -317,8 +319,18 @@ export interface GifSpec {
   weldPaint?: boolean;
   /** Flat translucent shapes over the finished drawing — the relief wash. */
   overlay?: readonly ArtOverlayGroup[];
-  /** The plate before the first recorded gesture. Present in the first frame. */
+  /**
+   * The plate the first frame starts from. Present in the first frame.
+   *
+   * "Before the first recorded gesture" for an uncut replay, and the plate at
+   * the IN POINT for a cut one. THIS FILE DOES NOT KNOW ABOUT IN AND OUT
+   * POINTS, and that is how it is kept from disagreeing with the SVG about
+   * them: `replay.boundAnimation` cuts once, and the caller spreads the same
+   * `ground` and `steps` into this spec and into `AnimationSpec`. A second
+   * reading of the marks here would be a second chance to be off by one.
+   */
   ground: PaintMap;
+  /** The steps that play. Already cut, if the replay has an in and an out point. */
   steps: readonly AnimationStep[];
   stepMs: number;
   holdMs: number;
@@ -333,7 +345,7 @@ export interface GifResult {
   bytes: Uint8Array<ArrayBuffer>;
   width: number;
   height: number;
-  /** How many frames the file holds. One per gesture. */
+  /** How many frames the file holds. One per step that plays. */
   frames: number;
   /** How many palette entries it uses, transparency aside. */
   palette: number;
@@ -360,6 +372,16 @@ const MIN_DELAY_CS = 2;
  * `steps · stepMs + holdMs` — the number `replay.animatedSvg` writes into
  * `animation-duration`. Exported so a test can weigh the two against each other
  * rather than trust this paragraph.
+ *
+ * NO STEPS IS NO FRAMES, and it is left that way. A drawing with nothing to
+ * animate produces a header and a trailer with no image descriptor, which is a
+ * well formed GIF data stream carrying no picture — `test/gif.test.ts` holds
+ * that shape deliberately, and every caller refuses the export before it gets
+ * here. It is worth naming because it is the reason `replay.InOut` is a CLOSED
+ * pair: a half-open span would make `in == out` mean an empty replay, so an
+ * ordinary drag of two markers onto each other would reach this state through
+ * the front door. Closed cannot express it, so nothing here has to answer for
+ * it. See `replay.clampSpan`.
  */
 export function frameDelays(steps: number, stepMs: number, holdMs: number): number[] {
   const out: number[] = [];
