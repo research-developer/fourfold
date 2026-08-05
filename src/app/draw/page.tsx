@@ -5065,9 +5065,35 @@ export default function DrawPage() {
    * `emit.serialise`, which states the layers and carries the flattened picture
    * beside them for a reader that predates them.
    */
+  /**
+   * `serialise` REFUSES a document that lies about its own timing — a child
+   * revealing before the group that gates it (`emit.revealBreak`) — by
+   * throwing, and its message names the two layers that disagree. The refusal
+   * has to reach the announce channel rather than crash the export button: the
+   * one reachable violator is an imported low-reveal layer pasted inside a
+   * high-reveal one, and the person who built that needs the sentence, not a
+   * dead click. CAUGHT rather than pre-checked, because `serialise` scopes
+   * BEFORE it checks — a pre-check over the whole document would wrongly
+   * refuse a scoped copy whose offending layer is outside the scope. Returns
+   * `null` on refusal; every consumer aborts its action on `null`, and the
+   * announcement has already been made by then.
+   */
+  const refuseEmit = useCallback((err: unknown): null => {
+    setAnnounce(
+      err instanceof Error ? err.message : "export refused — the document is inconsistent"
+    );
+    return null;
+  }, []);
+
   const svgText = useCallback(() => {
     const sole = soleLayer(comp);
-    if (sole === null) return serialiseEmit(emitDoc());
+    if (sole === null) {
+      try {
+        return serialiseEmit(emitDoc());
+      } catch (err) {
+        return refuseEmit(err);
+      }
+    }
     const { baked, cells, overlay } = bakedFrame();
     return artworkSvg({
       width: canvas.geom.width,
@@ -5110,6 +5136,7 @@ export default function DrawPage() {
   }, [
     comp,
     emitDoc,
+    refuseEmit,
     bakedFrame,
     canvas,
     book,
@@ -5134,9 +5161,16 @@ export default function DrawPage() {
    * which makes the argument this code is the other half of.
    */
   const svgOfScope = useCallback(
-    (layer?: LayerId) =>
-      serialiseEmit(emitDoc(), layer === undefined ? undefined : { layer }),
-    [emitDoc]
+    // The try mirrors `svgText`'s and the argument lives there: the refusal is
+    // announced, never thrown at a button.
+    (layer?: LayerId) => {
+      try {
+        return serialiseEmit(emitDoc(), layer === undefined ? undefined : { layer });
+      } catch (err) {
+        return refuseEmit(err);
+      }
+    },
+    [emitDoc, refuseEmit]
   );
 
   /**
@@ -5341,8 +5375,10 @@ export default function DrawPage() {
     (layer?: LayerId) => {
       const name =
         layer === undefined ? null : (findLayer(comp, layer)?.name ?? null);
+      const text = svgOfScope(layer);
+      if (text === null) return; // refused, and already announced
       void toClipboard(
-        svgOfScope(layer),
+        text,
         layer === undefined
           ? `copied the whole composition — ${docCensus.total} layer${
               docCensus.total === 1 ? "" : "s"
@@ -5397,8 +5433,10 @@ export default function DrawPage() {
   /** EXPORT is COPY with a file for a destination. Same text, same call. */
   const exportComposition = useCallback(() => {
     const name = nameFor("svg", "-layers");
+    const text = svgOfScope();
+    if (text === null) return; // refused, and already announced
     download(
-      new Blob([svgOfScope()], { type: "image/svg+xml;charset=utf-8" }),
+      new Blob([text], { type: "image/svg+xml;charset=utf-8" }),
       name
     );
     setAnnounce(
@@ -5441,7 +5479,9 @@ export default function DrawPage() {
 
   const exportSvg = () => {
     const name = nameFor("svg");
-    download(new Blob([svgText()], { type: "image/svg+xml;charset=utf-8" }), name);
+    const text = svgText();
+    if (text === null) return; // refused, and already announced
+    download(new Blob([text], { type: "image/svg+xml;charset=utf-8" }), name);
     setAnnounce(`exported ${name}`);
   };
 
@@ -5718,8 +5758,10 @@ export default function DrawPage() {
   ]);
 
   const exportPng = () => {
+    const text = svgText();
+    if (text === null) return; // refused, and already announced
     const url = URL.createObjectURL(
-      new Blob([svgText()], { type: "image/svg+xml;charset=utf-8" })
+      new Blob([text], { type: "image/svg+xml;charset=utf-8" })
     );
     const img = new Image();
     img.onload = () => {

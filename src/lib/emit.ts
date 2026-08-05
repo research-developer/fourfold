@@ -372,6 +372,90 @@ export interface EmitAnimation {
   out?: number;
 }
 
+/**
+ * A layer that reveals BEFORE something it sits inside. See `revealBreak`.
+ *
+ * Both ends are named because the message a caller writes has to say which two
+ * layers disagree — "layer g7 reveals at 4 but the group g2 it sits in reveals
+ * at 9" is actionable and "invalid reveal order" is not.
+ */
+export interface RevealBreak {
+  /** The id of the layer whose reveal is too early. */
+  readonly layer: string;
+  /** The step that layer asks to come up at. */
+  readonly reveal: number;
+  /** The nearest enclosing layer that comes up later, and the step it does. */
+  readonly ancestor: string;
+  readonly at: number;
+}
+
+/**
+ * The first layer that reveals before an ancestor of it does, or `null`.
+ *
+ * ── MEASURED IN A BROWSER, and it is a silent failure without this ──────
+ *
+ * SVG composites group opacity MULTIPLICATIVELY, so a nested element is visible
+ * only when every ancestor is: the threshold of a product is the product's LATEST
+ * threshold, at the MAX. Sampled on a flat 3200 ms cycle with a nested DOM, the
+ * half-opacity crossing relative to the cycle:
+ *
+ *   parent 800 × child 1200        →  1200 ms     (max)
+ *   parent 800 × child 1600        →  1601 ms     (max)
+ *   three levels, 400/1200/1600    →  1601 ms     (max composes down a chain)
+ *   parent 800 × child  400        →   801 ms     (max — NOT 400)
+ *
+ * THE LAST ROW IS THE DEFECT. A child asking for 400 came up at 801 and nothing
+ * anywhere said so: the file animated differently from the model that wrote it,
+ * the number was still in the markup as `data-reveal`, and the only way to find
+ * out was to sample opacity in a browser. `nested.wellOrdered` predicts exactly
+ * this and its header carries the same numbers; this is the emitter's half of
+ * it, because the invariant is ultimately about what gets WRITTEN.
+ *
+ * ── The floor is the running MAX, not the nearest ancestor ──────────────
+ *
+ * A grandchild at 6 inside a child at 7 inside a parent at 5 satisfies its
+ * grandparent and is still clamped, to 7. So the walk carries the greatest
+ * reveal seen on the way down. It is monotone by construction — a layer is only
+ * allowed past the check when its own reveal is at least the floor, at which
+ * point its reveal IS the new floor — so one number suffices and no maximum has
+ * to be recomputed.
+ *
+ * A layer with NO `reveal` neither raises the floor nor breaks it. Both halves
+ * are deliberate: an ungated ancestor runs no opacity animation at all, so it
+ * clamps nothing; and a child with no reveal is gated entirely by its ancestors
+ * and states no time of its own to disagree with them. That is precisely the
+ * shape `provenance.gestureLayers` writes — the gesture carries the reveal, the
+ * orbits under it carry `mode` and `orbit` and no time — which is why no file
+ * this program has ever produced can trip this.
+ *
+ * EXPORTED, so a UI-facing caller can ASK before it writes. `serialise` and
+ * `parse` both refuse a document that fails this, and a panel that would rather
+ * clamp a reveal visibly — moving the number where the person can see it move —
+ * needs a way to find the pair to clamp without provoking the refusal.
+ */
+export function revealBreak(layers: readonly EmitLayer[]): RevealBreak | null {
+  const walk = (
+    list: readonly EmitLayer[],
+    floor: { id: string; at: number } | null
+  ): RevealBreak | null => {
+    for (const l of list) {
+      let under = floor;
+      if (l.reveal !== undefined) {
+        if (floor !== null && l.reveal < floor.at) {
+          return { layer: l.id, reveal: l.reveal, ancestor: floor.id, at: floor.at };
+        }
+        under = { id: l.id, at: l.reveal };
+      }
+      if (l.children !== undefined) {
+        const hit = walk(l.children, under);
+        if (hit !== null) return hit;
+      }
+    }
+    return null;
+  };
+  return walk(layers, null);
+}
+
 // ── the document ─────────────────────────────────────────────────────────
 
 /**
@@ -774,11 +858,52 @@ export function flatten(layers: readonly EmitLayer[]): Map<number, string> {
  * The composition, or one layer of it, as an SVG document.
  *
  * Throws only for a caller error the program itself can make — an unknown layer
- * id, or a cell that has to be drawn and has no geometry. Untrusted input goes
- * the other way, through `parse`, which never throws.
+ * id, a cell that has to be drawn and has no geometry, or a child that reveals
+ * before something it sits inside. Untrusted input goes the other way, through
+ * `parse`, which never throws.
+ *
+ * ── WHY THE THIRD ONE IS A REFUSAL AND NOT A CLAMP ──────────────────────
+ *
+ * Because the clamp is the bug. A child revealing before its ancestor is held
+ * back to the ancestor's time by the renderer — measured, 400 ms asked for and
+ * 801 ms delivered, see `revealBreak` — so the file animates differently from
+ * the document that wrote it and the number it disagrees with is sitting in its
+ * own markup. Writing it and clamping it silently is the only available way to
+ * lose that quietly, and this codebase's rule is that a decline is a counted
+ * precondition and never a fallback.
+ *
+ * CHECKED ON THE SCOPED DOCUMENT, so a layer exported alone is checked as the
+ * standalone composition it becomes — which is also the escape hatch: scoping to
+ * the offending child drops the ancestor that gated it, and the export succeeds
+ * because the thing it was lying about is no longer in the file.
+ *
+ * NOT GATED ON `doc.animation`, and that is the module's own argument rather
+ * than a new one. `data-reveal` is written for a STILL export too, because "a
+ * gesture's symmetry is a fact about the gesture and not about whether anything
+ * is being played back" — see the header. A still export therefore states the
+ * same reveal order, and a document that states an impossible one is not one to
+ * write down whether or not this particular export animates it.
+ *
+ * NO EXISTING FILE BECOMES UNWRITABLE. The two producers in this repo are
+ * `provenance.gestureLayers`, which puts the reveal on the GESTURE and leaves
+ * the orbits under it with no time of their own, and `composer.emitLayersOf`,
+ * which copies `Layer.reveal` one for one — and a `Layer` only ever acquires one
+ * by IMPORT, because nothing in the editor mints reveals. `test/emit.test.ts`
+ * measures the first of those directly. The one way to build a violating
+ * document is to paste an imported low-reveal layer inside an imported
+ * high-reveal one, which is exactly the case that used to animate wrongly.
  */
 export function serialise(doc: EmitDoc, scope?: EmitScope): string {
   const scoped = scopeOf(doc, scope);
+
+  const broken = revealBreak(scoped.layers);
+  if (broken !== null) {
+    throw new Error(
+      `emit: layer ${broken.layer} reveals at step ${broken.reveal} but ` +
+        `${broken.ancestor}, which contains it, reveals at ${broken.at} — a child ` +
+        `cannot come up before the group that gates it`
+    );
+  }
 
   const shownSet = new Set(scoped.shown);
   const composite = flatten(scoped.layers);
@@ -1298,7 +1423,8 @@ const withoutComments = (text: string): string =>
  * document with no layer composition in that payload, markup that nests past
  * `MAX_LAYER_DEPTH`, a `<use>` naming a prototype the file does not define, a
  * layer whose drawn cells do not line up with what the payload says it paints,
- * and anything that makes the reader throw. It throws for nothing.
+ * a layer that reveals before something it sits inside (`revealBreak`), and
+ * anything that makes the reader throw. It throws for nothing.
  *
  * The payload is the AUTHORITY for which cells and which layers. The markup
  * supplies the picture: the shapes, the colours, the seams and the frame. So a
@@ -1401,6 +1527,15 @@ function read(text: string): EmitDoc | null {
   const shownSet = new Set(shown);
 
   const layers = fromArtLayers(comp.layers);
+  // THE WHOLE FILE, REFUSED, on the same rule as every other disagreement here:
+  // the payload is the authority, and a payload that states a reveal order the
+  // renderer cannot honour is a file that would draw something other than what
+  // it says. `artfile.ts` validates each `reveal` as a whole non-negative step
+  // in ISOLATION and cannot see this, because it is a relation BETWEEN two
+  // layers and the validator walks one at a time. So it is checked here, where
+  // the tree exists. `serialise` refuses the same document; see `revealBreak`
+  // for the browser measurement that makes it a refusal rather than a clamp.
+  if (revealBreak(layers) !== null) return null;
   const composite = flatten(layers);
 
   const cells = new Map<number, ArtCell>();

@@ -2,11 +2,19 @@
  * NESTED TIMELINES: a composition that contains its own timeline, and what
  * that buys.
  *
- * PROTOTYPE. Nothing here is wired to the UI, nothing here changes the file
- * format, and nothing here is imported by the program. It exists to answer four
- * questions with running code, and `test/nested.test.ts` is where the answers
- * are. Read that file for the verdict; read this one for the shape the verdict
- * is about.
+ * PROTOTYPE. Nothing here is wired to the UI and nothing here changes the file
+ * format. It exists to answer four questions with running code, and
+ * `test/nested.test.ts` is where the answers are. Read that file for the
+ * verdict; read this one for the shape the verdict is about.
+ *
+ * ONE THING IN THE PROGRAM NOW NAMES IT, and the sentence that said nothing did
+ * has been corrected rather than left standing. `frames.Revision` imports
+ * `Timeline` — TYPE ONLY, erased at build — because a revision has to remember
+ * everything a rewrite moves and this tree is one of those things. Measured: a
+ * revision that remembered only the `Session` restored a six-rung journal beside
+ * a four-beat tree and dropped two gestures from the animation with nothing
+ * reporting it. That is the whole of the coupling; no function here is called by
+ * the program.
  *
  * ── THE SHAPE: NESTING IN THE MODEL, ONE FLAT CLOCK IN THE FILE ─────────
  *
@@ -145,10 +153,12 @@
  *     parent 800 × child  400  →   801 ms      (max — NOT 400)
  *
  *   THE LAST ROW IS A PRECONDITION, NOT A CURIOSITY. A child that reveals BEFORE
- *   its ancestor is silently held back to the ancestor's time. Nothing in
- *   `emit.ts` enforces `reveal(child) >= reveal(ancestor)` today, and under
- *   nesting that becomes a rule the emitter has to keep or files will animate
- *   differently from the model. `wellOrdered` below is that check.
+ *   its ancestor is silently held back to the ancestor's time, so a file
+ *   violating it animates differently from the model that wrote it. `emit.ts`
+ *   NOW ENFORCES IT — `emit.revealBreak` is the check, `serialise` throws on a
+ *   document that fails it and `parse` refuses such a file whole — and
+ *   `wellOrdered` below is the same statement about this module's own tree,
+ *   where the flat compiler makes it true by construction.
  *
  *   CO-TIMED FADES COMPOUND. A group and its child revealing at the SAME step
  *   crossed half opacity 34 ms late against a 60 ms fade, because each is at
@@ -330,6 +340,13 @@ export function resolve(tl: Timeline, id: StepId): number | null {
  * its first beat's index. It is checked anyway: the invariant is about what the
  * EMITTER writes, an emitter may one day assign reveals some other way, and a
  * silent failure is exactly the kind this codebase pins with a test.
+ *
+ * THE EMITTER'S OWN HALF IS `emit.revealBreak`, and the two are deliberately not
+ * one function. This one walks a `Timeline` of `Step`s and answers about the
+ * MODEL; that one walks a tree of `EmitLayer`s and answers about the DOCUMENT,
+ * and names the two layers that disagree so a refusal can say which. Sharing an
+ * implementation would mean one of the two modules importing the other's tree
+ * type for a four-line walk.
  */
 export function wellOrdered(tl: Timeline): boolean {
   const { indexOf } = flatten(tl);

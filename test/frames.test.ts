@@ -56,6 +56,14 @@ import {
   type Move,
   type Session,
 } from "../src/lib/layers";
+import {
+  beatCount,
+  insertHold,
+  rebaseTree,
+  stepId,
+  timelineOf,
+  type Timeline,
+} from "../src/lib/nested";
 import { actStrokes, everyComposition, stepComposition } from "../src/lib/composer";
 import { animationSteps } from "../src/lib/replay";
 import { beatsOf } from "../src/lib/timeline";
@@ -660,38 +668,166 @@ describe("a frame edit is taken back by revision", () => {
     const done = editFrame(s, 0, (a) => recolourAct(a, () => BLUE));
     expect(done.ok).toBe(true);
     if (!done.ok) return;
-    const revisions = remember(NO_REVISIONS, s);
-    const edited = done.value.session;
-    expect(shows(edited, "s0:AA")).toBe(BLUE);
+    // A FRAME EDIT IS THE IDENTITY ON THE TREE — `rewriteFrames` with count 1
+    // replaced by one act keeps every act index — so both sides of this
+    // revision carry the same timeline, and it is stated rather than left off.
+    const tree = timelineOf(s.journal.past);
+    const revisions = remember(NO_REVISIONS, { session: s, timeline: tree });
+    const edited = { session: done.value.session, timeline: tree };
+    expect(shows(edited.session, "s0:AA")).toBe(BLUE);
 
     const back = undoRevision(revisions, edited);
     expect(back).not.toBeNull();
     if (back === null) return;
     // The exact session, not an inverse of it.
     expect(back.session).toBe(s);
+    expect(back.timeline).toBe(tree);
     expect(shows(back.session, "s0:AA")).toBe(GOLD);
 
-    const forward = redoRevision(back.revisions, back.session);
+    // `RevisionStep` extends `Revision`, so the value an undo produced is the
+    // live value the redo takes — the pair is never reassembled by hand.
+    const forward = redoRevision(back.revisions, back);
     expect(forward).not.toBeNull();
     if (forward === null) return;
-    expect(forward.session).toBe(edited);
+    expect(forward.session).toBe(edited.session);
+    expect(forward.timeline).toBe(tree);
     expect(forward.revisions.past).toHaveLength(1);
   });
 
   it("nothing to take back answers null rather than the same session", () => {
-    const s = fresh();
-    expect(undoRevision(NO_REVISIONS, s)).toBeNull();
-    expect(redoRevision(NO_REVISIONS, s)).toBeNull();
+    const live = { session: fresh(), timeline: null };
+    expect(undoRevision(NO_REVISIONS, live)).toBeNull();
+    expect(redoRevision(NO_REVISIONS, live)).toBeNull();
   });
 
   it("remembering discards the redo branch", () => {
-    const a = fresh();
-    const b = drew(a, ["s0:AA"], [GOLD], "one");
+    const a = { session: fresh(), timeline: null };
+    const b = { session: drew(a.session, ["s0:AA"], [GOLD], "one"), timeline: null };
     const stepped = undoRevision(remember(NO_REVISIONS, a), b);
     expect(stepped).not.toBeNull();
     if (stepped === null) return;
     expect(stepped.revisions.future).toHaveLength(1);
     expect(remember(stepped.revisions, b).future).toHaveLength(0);
+  });
+
+  it("a step handed straight back does not pin a stack inside a stack", () => {
+    // `remember` and the two swaps take the pair BY NAME rather than storing the
+    // value given. Without that, handing a `RevisionStep` back — which is the
+    // arrangement the two tests above rely on — would put a whole `Revisions`
+    // inside every rung, and thirty-two of those would each hold a copy of the
+    // stack below them.
+    const a = { session: fresh(), timeline: null };
+    const b = { session: drew(a.session, ["s0:AA"], [GOLD], "one"), timeline: null };
+    const stepped = undoRevision(remember(NO_REVISIONS, a), b);
+    expect(stepped).not.toBeNull();
+    if (stepped === null) return;
+    // The step itself handed back to `remember`: two keys stored, not three.
+    const again = remember(stepped.revisions, stepped);
+    expect(Object.keys(again.past[0]).sort()).toEqual(["session", "timeline"]);
+    // And the same on the redo branch the undo just wrote.
+    expect(Object.keys(stepped.revisions.future[0]).sort()).toEqual([
+      "session",
+      "timeline",
+    ]);
+  });
+
+  /**
+   * A DRAWING WITH A TIMELINE BESIDE IT: six gestures, one beat each.
+   *
+   * `nested.ts` keeps the timeline tree BESIDE `Journal.past` rather than inside
+   * `Session`, on the argument this module's own header makes about revisions —
+   * a journal rewrite cannot be a `Move` because a `Move` cannot reach the
+   * journal, and putting the tree inside `Session` would put it somewhere a
+   * `Move` could reach. That decision is what makes the tree a SECOND thing a
+   * revision has to remember.
+   */
+  const sixGestures = (): Session => {
+    let s = fresh();
+    const cells: Address[] = ["s0:AA", "s0:AB", "s0:AC", "s0:AX", "s0:BA", "s0:BB"];
+    cells.forEach((c, k) => {
+      s = drew(s, [c], [k % 2 === 0 ? GOLD : RED], `gesture ${k}`);
+    });
+    return s;
+  };
+
+  it("carries the timeline tree beside the session, so a merge can be taken back whole", () => {
+    const s = sixGestures();
+    const tree = timelineOf(s.journal.past);
+    expect(s.journal.past).toHaveLength(6);
+    expect(beatCount(tree)).toBe(6);
+
+    // Frames 3, 4 and 5 — the last three gestures — coalesced into one rung.
+    const done = mergeFrames(s, 3, 3, "merged");
+    expect(done.ok).toBe(true);
+    if (!done.ok) return;
+
+    // The two halves of the document move TOGETHER, and are remembered
+    // together. `remember` takes the pair, so there is no arrangement of these
+    // three lines in which one of them is saved and the other is not.
+    const revisions = remember(NO_REVISIONS, { session: s, timeline: tree });
+    const edited = { session: done.value.session, timeline: rebaseTree(tree, 3, 3, 1) };
+    expect(edited.session.journal.past).toHaveLength(4);
+    expect(beatCount(edited.timeline)).toBe(4);
+
+    const back = undoRevision(revisions, edited);
+    expect(back).not.toBeNull();
+    if (back === null) return;
+
+    // THE MEASURED FAILURE THIS TEST EXISTS FOR. Before the tree joined the
+    // remembered value, `undoRevision` restored a six-rung journal and handed
+    // back nothing to restore the tree with, so the caller kept the REBASED
+    // four-beat tree: gestures 4 and 5 had no beat, and two gestures the person
+    // had drawn silently stopped appearing in the animation with nothing
+    // anywhere reporting a problem.
+    expect(back.session.journal.past).toHaveLength(6);
+    expect(beatCount(back.timeline as Timeline)).toBe(6);
+    expect(back.session).toBe(s);
+    expect(back.timeline).toBe(tree);
+    // Stated as the property rather than as two numbers that happen to agree:
+    // every rung of the restored journal is named by exactly one beat.
+    const named = (back.timeline as Timeline).length;
+    expect(named).toBe(back.session.journal.past.length);
+
+    // And forward again is the exact inverse, on BOTH halves.
+    const forward = redoRevision(back.revisions, back);
+    expect(forward).not.toBeNull();
+    if (forward === null) return;
+    expect(forward.session).toBe(edited.session);
+    expect(forward.timeline).toBe(edited.timeline);
+    expect(beatCount(forward.timeline as Timeline)).toBe(4);
+  });
+
+  it("a tree-only edit is a revision too, with the session unmoved", () => {
+    // `group`, `ungroup` and `insertHold` change the TREE and never the journal.
+    // The paired value spells that directly — the same `Session` on both sides,
+    // a different tree — which is what makes those three undoable on the same
+    // stack as a merge rather than needing a third one.
+    const s = sixGestures();
+    const tree = timelineOf(s.journal.past);
+    const held = insertHold(tree, null, 3, stepId(900));
+    expect(beatCount(held)).toBe(7);
+
+    const revisions = remember(NO_REVISIONS, { session: s, timeline: tree });
+    const back = undoRevision(revisions, { session: s, timeline: held });
+    expect(back).not.toBeNull();
+    if (back === null) return;
+    expect(back.session).toBe(s);
+    expect(beatCount(back.timeline as Timeline)).toBe(6);
+  });
+
+  it("a document with no nested timeline says so, rather than leaving it out", () => {
+    // `null` is a CLAIM — "this document has no tree" — and not an omission, on
+    // `layers.NO_GESTURE`'s rule. The key is required, so the compiler names
+    // every site the day a fourth one appears; see `Revision`.
+    const s = sixGestures();
+    const back = undoRevision(
+      remember(NO_REVISIONS, { session: s, timeline: null }),
+      { session: fresh(), timeline: null }
+    );
+    expect(back).not.toBeNull();
+    if (back === null) return;
+    expect(back.session).toBe(s);
+    expect(back.timeline).toBeNull();
   });
 });
 

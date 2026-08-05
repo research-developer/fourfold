@@ -156,13 +156,22 @@
  * Making it one would mean giving `applyMove` the session, at which point undo
  * becomes recursive and a rung can contain the stack it lives in.
  *
- * So a frame edit is undone by REVISION: the whole `Session` before the rewrite
- * is remembered, and `undoRevision` puts it back. That is not a weaker promise
- * than an act — it is the strongest one available, because it restores the exact
+ * So a frame edit is undone by REVISION: the whole state before the rewrite is
+ * remembered, and `undoRevision` puts it back. That is not a weaker promise than
+ * an act — it is the strongest one available, because it restores the exact
  * journal rather than an inverse of it — and it is cheap: a `Session` is two
  * pointers into immutable structure, so a revision costs one array of at most
  * `HISTORY_LIMIT` pointers, not a copy of the drawing. `REVISION_LIMIT` says why
  * there are 32 of them.
+ *
+ * WHAT IS REMEMBERED IS A `Revision` AND NOT A `Session`, and the distinction is
+ * a measured data loss rather than a nicety. `nested.ts` keeps the timeline tree
+ * BESIDE the journal — for the reason above, run one step further: putting it
+ * inside `Session` would put it where a `Move` could reach it — so a `Session`
+ * is not the whole of what a rewrite moves. A revision that remembered only the
+ * session restored a six-rung journal beside a four-beat tree and silently
+ * dropped two gestures from the animation. `Revision` carries both halves, and
+ * the key is required so the compiler names every site. See `Revision`.
  *
  * ── THE FLASH MAPPING: what a hold would cost, what a tween could mean ──
  *
@@ -285,6 +294,12 @@ import {
   type Session,
 } from "./layers";
 import { stepComposition } from "./composer";
+// TYPE ONLY, and one type. `nested.ts` imports `type Act` from `layers.ts` and
+// nothing else, so this direction cannot close a cycle — and `import type` is
+// erased entirely, so it adds no edge to the module graph at runtime either.
+// What it buys is that `Revision` can name the thing a revision has to carry
+// rather than describing it; see `Revision`.
+import type { Timeline } from "./nested";
 import { covers, type Address, type AddressPlate, type PlateEdit } from "./plate";
 import { HISTORY_LIMIT, mergeEdits, type PaintMap, type Stroke, type StrokeMark } from "./strokes";
 import { beatsOf } from "./timeline";
@@ -1113,7 +1128,53 @@ export interface Merged extends Rebased {
 // ── revisions: taking a frame edit back ──────────────────────────────────
 
 /**
- * The timeline's own past: whole sessions, remembered before a rewrite.
+ * EVERYTHING A REWRITE CAN MOVE, in one value: the session, and the timeline
+ * tree that lives beside its journal.
+ *
+ * ── Why the tree is here, measured ──────────────────────────────────────
+ *
+ * `nested.ts` keeps the timeline tree BESIDE `Journal.past` rather than inside
+ * `Session`, on this file's own argument run one step further: a `Move` cannot
+ * reach the journal, and putting the tree inside a `Session` would put it
+ * somewhere a `Move` could reach, at which point undo becomes recursive. That
+ * decision is correct and it is not revisited here — but it makes the tree a
+ * SECOND thing that a rewrite moves, and a revision that remembered only the
+ * first was a silent loss rather than an incomplete undo.
+ *
+ * MEASURED, on six gestures with a beat each. Merge frames 3, 4 and 5 into one:
+ * the journal goes to four rungs and `nested.rebaseTree` takes the tree to four
+ * beats. Undo the revision, and the journal came back at six while the caller
+ * was still holding the four-beat tree — so gestures 4 and 5 had no beat, and
+ * TWO GESTURES THE PERSON DREW STOPPED APPEARING IN THE ANIMATION with nothing
+ * anywhere reporting a problem. `test/frames.test.ts` reproduces exactly that
+ * and now asserts the repair.
+ *
+ * ── Why the key is REQUIRED and the value is nullable ───────────────────
+ *
+ * `timeline?: Timeline` would have been the smaller diff and it is the same
+ * defect wearing a default: a caller that forgot the tree on one of the four
+ * paths — `remember`, `undoRevision`, `redoRevision`, or the live value handed
+ * to either — would silently get `undefined` and lose it again. This is
+ * `layers.MoveGesture`'s rule verbatim, and that comment says why it is a rule:
+ * "REQUIRED on the move rather than optional … `was` was optional, three
+ * consumers existed, and the third … simply did not mention it and nothing said
+ * so. Required, the compiler names every construction site the day a fourth
+ * appears."
+ *
+ * `null` is therefore a CLAIM — "this document has no nested timeline" — and
+ * never an omission, exactly as `layers.NO_GESTURE` is.
+ */
+export interface Revision {
+  readonly session: Session;
+  /**
+   * The nested timeline as it stood beside that journal, or `null` for a
+   * document that has none. `nested.Timeline`.
+   */
+  readonly timeline: Timeline | null;
+}
+
+/**
+ * The timeline's own past: whole revisions, remembered before a rewrite.
  *
  * A SECOND UNDO AXIS, and the header argues why it has to be one rather than a
  * rung of the first. In short: a `Move` acts on a `Composition`, the journal is
@@ -1121,15 +1182,18 @@ export interface Merged extends Rebased {
  *
  * It is the STRONGEST form of undo in the program, not the weakest: the other two
  * stacks store inverses and replay them, while this stores the thing itself. A
- * revision cannot drift from what it restores, because it IS what it restores.
+ * revision cannot drift from what it restores, because it IS what it restores —
+ * and that promise is only true of a value that holds EVERY part of what it
+ * restores, which is why `Revision` and not `Session` is what is stacked here.
  *
- * The cost is a pointer array. Every `Act`, `Layer` and `Map` in this codebase is
- * immutable and shared, so remembering a session copies `past` — at most
- * `HISTORY_LIMIT` references — and pins a tree that is already alive.
+ * The cost is a pointer array. Every `Act`, `Layer`, `Map` and timeline `Step` in
+ * this codebase is immutable and shared, so remembering a revision copies `past`
+ * — at most `HISTORY_LIMIT` references — and pins two trees that are already
+ * alive.
  */
 export interface Revisions {
-  readonly past: readonly Session[];
-  readonly future: readonly Session[];
+  readonly past: readonly Revision[];
+  readonly future: readonly Revision[];
 }
 
 export const NO_REVISIONS: Revisions = { past: [], future: [] };
@@ -1140,32 +1204,72 @@ export const NO_REVISIONS: Revisions = { past: [], future: [] };
  * Far shorter than `HISTORY_LIMIT`, and for a different reason. That limit is
  * about a promise — past 256 gestures the undo stack is no longer something a
  * person is tracking. This one is about WEIGHT: each revision pins a whole
- * journal array alive, so an unbounded stack turns a long editing session into a
- * slow leak of arrays nobody can reach any more. Thirty-two deliberate,
- * structural edits is already well past what a person holds in their head, and a
- * frame edit is a deliberate act rather than a stroke.
+ * journal array — and now a whole timeline tree — alive, so an unbounded stack
+ * turns a long editing session into a slow leak of structure nobody can reach
+ * any more. Thirty-two deliberate, structural edits is already well past what a
+ * person holds in their head, and a frame edit is a deliberate act rather than a
+ * stroke.
+ *
+ * THE NUMBER DOES NOT MOVE FOR THE TREE. A `Timeline` is one `Step` per beat of
+ * a journal that is already bounded by `HISTORY_LIMIT`, and every node of it is
+ * immutable and shared with the tree the next revision holds — a merge rebuilds
+ * the spine and reuses every beat it did not touch — so the second half of a
+ * revision is the same order of cost as the first.
  */
 export const REVISION_LIMIT = 32;
 
 /**
- * Remember a session, about to be rewritten.
+ * Remember a revision, about to be rewritten.
  *
  * The redo branch is discarded, on the standard linear-history rule `strokes.
  * commit` and `layers.act` both keep: once you rewrite after undoing a rewrite,
  * the thing you undid is no longer a future anyone can reach.
  *
- * Called BEFORE the rewrite, with the session the rewrite is about to replace.
- * The two-line caller pattern is
+ * Called BEFORE the rewrite, with the state the rewrite is about to replace.
+ * The three-line caller pattern is
  *
  *     const done = editFrame(session, k, recolour);
- *     if (done.ok) setRevisions(remember(revisions, session));
+ *     if (done.ok) setRevisions(remember(revisions, { session, timeline }));
  *
  * and it is in that order deliberately: a refused rewrite must not cost a
  * revision, and testing `done.ok` first is the only arrangement in which it
  * cannot.
+ *
+ * ── EVERY REWRITE PATH, AND WHAT EACH OWES THE TREE ─────────────────────
+ *
+ * Audited, because "remember the pair" is only half a rule if one of the paths
+ * moves one half without the other:
+ *
+ *   `editFrame` — `rewriteFrames` with `count === 1` replaced by one act. The
+ *   journal keeps its length, so `nested.rebaseTree` is the IDENTITY on the tree
+ *   and the pair remembered is `{ session, timeline }` with the same timeline on
+ *   both sides. Nothing to do beyond remembering it.
+ *
+ *   `mergeFrames` — `count === n` replaced by one. The journal shrinks by n-1
+ *   and the tree MUST be rebased with the same three numbers the plan carried:
+ *   `rebaseTree(timeline, at, count, 1)`. This is the path the measured loss was
+ *   found on.
+ *
+ *   `rewriteFrames` DIRECTLY — the general splice, and the one a caller can get
+ *   wrong. `replaced` is `plan.acts.length` and NOT always one; `Rebased.replaced`
+ *   reports the acts that came out, so `plan.count` and `plan.acts.length` are
+ *   both in the caller's hand at the call site. A delete (`acts: []`) takes the
+ *   tree to `rebaseTree(tl, at, count, 0)`.
+ *
+ *   `nested.group`, `nested.ungroup`, `nested.insertHold` — these move the TREE
+ *   and never the journal. They are revisions too, and the paired value spells
+ *   them directly: the same `Session` on both sides, a different timeline. That
+ *   is what lets them share this stack rather than needing a third one.
+ *
+ *   `mergeActs` — a pure function on acts with no session and no tree. It is
+ *   `mergeFrames`' ingredient and owes nothing here.
  */
-export function remember(revisions: Revisions, before: Session): Revisions {
-  const past = [...revisions.past, before];
+export function remember(revisions: Revisions, before: Revision): Revisions {
+  // NORMALISED rather than stored as given. `RevisionStep` extends `Revision`,
+  // so the value a caller has in hand after an undo is accepted here — and
+  // storing it whole would pin a `Revisions` inside a `Revisions`, one stack
+  // holding a copy of itself at every rung. Two fields, taken by name.
+  const past = [...revisions.past, { session: before.session, timeline: before.timeline }];
   return {
     past:
       past.length > REVISION_LIMIT ? past.slice(past.length - REVISION_LIMIT) : past,
@@ -1173,45 +1277,57 @@ export function remember(revisions: Revisions, before: Session): Revisions {
   };
 }
 
-export interface RevisionStep {
+/**
+ * The state to stand in, and the stacks it leaves behind.
+ *
+ * EXTENDS `Revision`, so the result of an undo is itself a live value the next
+ * `undoRevision`/`redoRevision`/`remember` will take — the caller never has to
+ * reassemble the pair, which is the arrangement in which it cannot be
+ * reassembled wrongly.
+ */
+export interface RevisionStep extends Revision {
   readonly revisions: Revisions;
-  /** The session to stand in. */
-  readonly session: Session;
 }
 
 /**
- * Back to the session before the last frame edit, or `null` when there was none.
+ * Back to the state before the last frame edit, or `null` when there was none.
  *
- * `live` is the session as it stands, and it goes onto the redo branch — so this
- * is a swap rather than a pop, and the round trip is the identity. `null` rather
- * than the live session unchanged, so a caller cannot mistake "nothing happened"
- * for "something happened and it looked the same".
+ * `live` is the document as it stands — session AND tree — and it goes onto the
+ * redo branch, so this is a swap rather than a pop and the round trip is the
+ * identity on both halves. `null` rather than the live state unchanged, so a
+ * caller cannot mistake "nothing happened" for "something happened and it looked
+ * the same".
  */
 export function undoRevision(
   revisions: Revisions,
-  live: Session
+  live: Revision
 ): RevisionStep | null {
   if (revisions.past.length === 0) return null;
-  const session = revisions.past[revisions.past.length - 1];
+  const at = revisions.past[revisions.past.length - 1];
   return {
     revisions: {
       past: revisions.past.slice(0, -1),
-      future: [live, ...revisions.future],
+      future: [{ session: live.session, timeline: live.timeline }, ...revisions.future],
     },
-    session,
+    session: at.session,
+    timeline: at.timeline,
   };
 }
 
-/** Forward again. The exact inverse of `undoRevision`. */
+/** Forward again. The exact inverse of `undoRevision`, on both halves. */
 export function redoRevision(
   revisions: Revisions,
-  live: Session
+  live: Revision
 ): RevisionStep | null {
   if (revisions.future.length === 0) return null;
-  const [session, ...rest] = revisions.future;
+  const [at, ...rest] = revisions.future;
   return {
-    revisions: { past: [...revisions.past, live], future: rest },
-    session,
+    revisions: {
+      past: [...revisions.past, { session: live.session, timeline: live.timeline }],
+      future: rest,
+    },
+    session: at.session,
+    timeline: at.timeline,
   };
 }
 

@@ -19,14 +19,52 @@
  *      is `group`'s inverse and the round trip is asserted on the tree. Merge is
  *      not invertible at all, and the asymmetry is measured with the real
  *      `frames.mergeActs` rather than described.
+ *
+ *   5. THE TREE SURVIVES LIVING BESIDE THE JOURNAL, including across the case
+ *      that was named as the risk to it: a merge whose range contains a `place`
+ *      move. It survives because `rebaseTree` is index arithmetic over
+ *      `Beat.act` and CANNOT SEE A MOVE AT ALL — asserted by rebasing two
+ *      journals of the same length, one with a reorder in the merged range and
+ *      one without, and comparing the trees character for character. What it
+ *      does not keep is a wrapper every beat of which fell inside the range;
+ *      that is measured too, and left standing as a name that dangles rather
+ *      than fixed into a number that is wrong.
+ *
+ *   6. A REVISION REMEMBERS BOTH HALVES. `frames.Revision` is `{session,
+ *      timeline}`, because remembering only the session restored a six-rung
+ *      journal beside a four-beat tree and dropped two gestures from the
+ *      animation. The defect's arithmetic and its repair are asserted in the
+ *      same test, so neither can be read without the other.
  */
 
 import { describe, expect, it } from "vitest";
-import { layerId, type Act, type Move } from "../src/lib/layers";
-import { mergeActs } from "../src/lib/frames";
+import {
+  act,
+  addLayer,
+  arrange,
+  find,
+  fromPlate,
+  layerId,
+  newSession,
+  NO_GESTURE,
+  select,
+  type Act,
+  type Composition,
+  type Move,
+  type Session,
+} from "../src/lib/layers";
+import {
+  mergeActs,
+  mergeFrames,
+  NO_REVISIONS,
+  redoRevision,
+  remember,
+  undoRevision,
+} from "../src/lib/frames";
 import { serialise, type EmitDoc, type EmitLayer } from "../src/lib/emit";
+import { buildHexagon } from "../src/lib/hexagon";
 import type { ArtCell } from "../src/lib/strokes";
-import type { Address } from "../src/lib/plate";
+import { addressBook, planPlateEdits, type Address, type AddressBook } from "../src/lib/plate";
 import {
   beatCount,
   compile,
@@ -100,6 +138,95 @@ function path(tl: Timeline, id: StepId): number[] | null {
     return null;
   };
   return walk(tl, []);
+}
+
+// ── a real journal, for the sections that need one ──────────────────────
+
+/**
+ * A real journal, so the merges measured below are `frames.mergeFrames` and not
+ * descriptions of it.
+ *
+ * The whole point of this section is that `rebaseTree` is being driven by a
+ * splice a REAL rewrite performed, on a range that contains the one move kind
+ * `frames.ts` spends its second-largest paragraph on — a `place`, which carries
+ * a frozen `Layer` and which `arrange` emits as a `[remove, insert]` PAIR
+ * sharing one object. A synthetic `timelineOf(Array.from(...))` cannot reach
+ * that case, because it has no moves in it at all.
+ */
+const book: AddressBook = addressBook(buildHexagon(2));
+const L1 = layerId(1);
+const L2 = layerId(2);
+const GOLD = "#aa8800";
+const RED = "#cc0000";
+const INK = "#111111";
+
+const fresh = (): Session => newSession(fromPlate(new Map()));
+
+/** A paint move planned against the composition as it stands. */
+function paintMove(
+  comp: Composition,
+  layer: ReturnType<typeof layerId>,
+  targets: Address[],
+  colours: (string | null)[]
+): Move {
+  const l = find(comp, layer);
+  if (l === null) throw new Error(`no layer ${layer}`);
+  return {
+    kind: "paint",
+    layer,
+    stroke: { edits: planPlateEdits(l.plate, book, targets, colours) },
+    gesture: NO_GESTURE,
+  };
+}
+
+const drew = (
+  s: Session,
+  targets: Address[],
+  colours: (string | null)[],
+  note: string,
+  layer = L1
+): Session => act(s, [paintMove(s.composition, layer, targets, colours)], note);
+
+/**
+ * Five acts, the middle one a REORDER.
+ *
+ *   0  paint into L1
+ *   1  add L2
+ *   2  reorder L1 above L2   ← `[place remove, place insert]`, one frozen Layer
+ *   3  paint into L1
+ *   4  paint into L2
+ *
+ * The notes are all distinct, because "the tree still names the same work" is
+ * asserted on what each rung SAYS rather than on an index that would still line
+ * up if the work behind it had moved.
+ */
+function withAPlace(): Session {
+  let s = fresh();
+  s = drew(s, ["s0:AA"], [GOLD], "paint under");
+  s = addLayer(s); // adds L2 and selects it
+  s = { ...s, composition: select(s.composition, L1) };
+  const moved = arrange(s, "up");
+  if (!moved.ok) throw new Error(moved.said);
+  s = moved.value;
+  s = drew(s, ["s0:AB"], [RED], "paint after");
+  s = drew(s, ["s0:AC"], [INK], "into L2", L2);
+  return s;
+}
+
+/** The same five rungs with NO structural move: five plain paints. */
+function withNoPlace(): Session {
+  let s = fresh();
+  const cells: Address[] = ["s0:AA", "s0:AB", "s0:AC", "s0:AX", "s0:BA"];
+  const notes = ["paint under", "second", "third", "paint after", "into L2"];
+  cells.forEach((c, k) => {
+    s = drew(s, [c], [GOLD], notes[k]);
+  });
+  return s;
+}
+
+/** What each beat of a tree NAMES in a journal: the rung's note, in play order. */
+function notesOf(tl: Timeline, past: readonly Act[]): (string | null)[] {
+  return acts(tl).map((a) => (a === null ? null : (past[a]?.note ?? "DANGLING")));
 }
 
 // ── 1. does nesting localise renumbering? ────────────────────────────────
@@ -302,21 +429,184 @@ describe("the tree beside a journal that moves", () => {
     expect(acts(after)).toEqual([0, 1, null, 2]);
   });
 
-  it("DESYNCHRONISES from frames.Revisions, which is the real cost", () => {
-    // `frames.Revisions` remembers whole `Session` values, and a `Session` is
-    // `{composition, journal}` — the timeline tree is NOT in it. So undoing a
-    // revision restores the journal and leaves the tree rebased, and the tree
-    // then references act indices the journal no longer has.
+  it("USED TO DESYNCHRONISE from frames.Revisions, and no longer can", () => {
+    // THE DEFECT, first, because the arithmetic that caused it has not changed
+    // and is what a reader has to see to know the repair is a repair. A merge
+    // takes the tree to four beats naming acts 0…3 while the journal a revision
+    // restores has six rungs — so acts 4 and 5 would have no beat at all.
     const past = Array.from({ length: 6 }, () => ({ moves: [], note: "", events: 0 }));
     const tl = timelineOf(past);
-    const merged = rebaseTree(tl, 1, 3, 1); // journal would now be 4 long
-    const restoredJournalLength = past.length; // the revision puts 6 back
+    const merged = rebaseTree(tl, 1, 3, 1); // the journal is now 4 long
     const highest = Math.max(...(acts(merged).filter((a) => a !== null) as number[]));
     expect(highest).toBe(3);
-    // The tree now names at most act 3 while the restored journal has 6 acts:
-    // acts 4 and 5 have no beat, so undoing the revision silently drops two
-    // gestures from the animation. `Revisions` must carry the tree too.
-    expect(highest).toBeLessThan(restoredJournalLength - 1);
+    expect(highest).toBeLessThan(past.length - 1);
+
+    // THE REPAIR. `frames.Revision` is `{session, timeline}` — both halves of
+    // what a rewrite moves, in one remembered value — so an undo that restores
+    // the six-rung journal restores the six-beat tree in the same call. It is
+    // not possible to save one and not the other: the key is required, and the
+    // pair comes back together or `undoRevision` answers `null`.
+    const s = withAPlace();
+    const before = timelineOf(s.journal.past);
+    const done = mergeFrames(s, 1, 3, "merged");
+    expect(done.ok).toBe(true);
+    if (!done.ok) return;
+    const live = { session: done.value.session, timeline: rebaseTree(before, 1, 3, 1) };
+    const back = undoRevision(
+      remember(NO_REVISIONS, { session: s, timeline: before }),
+      live
+    );
+    expect(back).not.toBeNull();
+    if (back === null) return;
+    expect(back.session.journal.past).toHaveLength(5);
+    expect(beatCount(back.timeline as Timeline)).toBe(5);
+    expect(notesOf(back.timeline as Timeline, back.session.journal.past)).toEqual(
+      back.session.journal.past.map((a) => a.note)
+    );
+    // And forward again gives back the merged pair, not a half of it.
+    const forward = redoRevision(back.revisions, back);
+    expect(forward).not.toBeNull();
+    if (forward === null) return;
+    expect(forward.session.journal.past).toHaveLength(3);
+    expect(beatCount(forward.timeline as Timeline)).toBe(3);
+  });
+});
+
+// ── the tree across a REAL merge, with a `place` inside the range ────────
+
+describe("a merge whose range contains a place move", () => {
+  it("is the journal the assertions below claim it is", () => {
+    // The fixture guarding itself, on `frames.test.ts`' own rule: everything
+    // after this is worthless if act 2 is not really a reorder carrying a
+    // photograph of a plate.
+    const s = withAPlace();
+    expect(s.journal.past).toHaveLength(5);
+    const pair = s.journal.past[2].moves;
+    expect(pair.map((m) => m.kind)).toEqual(["place", "place"]);
+    if (pair[0].kind !== "place" || pair[1].kind !== "place") return;
+    expect(pair[0].op).toBe("remove");
+    expect(pair[1].op).toBe("insert");
+    // ONE object, shared by the two halves — the fact `frames.rebaseAct` keeps a
+    // per-act `frozen` map for.
+    expect(pair[0].node).toBe(pair[1].node);
+    expect([...pair[0].node.plate.entries()]).toEqual([["s0:AA", GOLD]]);
+  });
+
+  it("THE RISK: the tree survives it, and names each new rung exactly once", () => {
+    const s = withAPlace();
+    const before = timelineOf(s.journal.past);
+    expect(notesOf(before, s.journal.past)).toEqual([
+      "paint under",
+      "added Layer 2",
+      "moved Layer 1 up",
+      "paint after",
+      "into L2",
+    ]);
+
+    // Frames 1..3 — add, reorder, paint — coalesced into one rung.
+    const done = mergeFrames(s, 1, 3, "merged");
+    expect(done.ok).toBe(true);
+    if (!done.ok) return;
+    const past = done.value.session.journal.past;
+
+    // THE ARITHMETIC `rebaseTree` ASSUMES, checked against the real rewrite
+    // rather than assumed: n acts out, one in, nothing else added or dropped.
+    // A `place` in the range does not change the length of the splice.
+    expect(past).toHaveLength(5 - 3 + 1);
+    expect(done.value.replaced).toHaveLength(3);
+    // And the reorder really did survive the fold: three structural moves in one
+    // rung, both frozen nodes re-read, and L1 still above L2.
+    const merged = past[1];
+    expect(merged.moves.filter((m) => m.kind === "place")).toHaveLength(3);
+    expect(done.value.session.composition.layers.map((l) => l.id)).toEqual([L2, L1]);
+    // NOTHING WAS RE-FROZEN, and that is the measurement rather than the
+    // expectation this test was written with. `refrozen` counts photographs of
+    // a plate that no longer matches the live tree, and a MERGE rewrites no act
+    // BELOW the frozen node — act 0 is outside the range and is replayed
+    // nowhere — so the photograph is still accurate and `frames.rebaseAct`
+    // keeps it. A merge is not the operation that stales a `place`; an EDIT of
+    // an earlier frame is, which is what `test/frames.test.ts` measures.
+    expect(done.value.report.refrozen).toBe(0);
+
+    const after = rebaseTree(before, 1, 3, 1);
+    // ONE BEAT PER RUNG, in order, naming the same work. This is the whole
+    // verdict: no dangling index, no rung without a beat, no beat without a
+    // rung.
+    expect(acts(after)).toEqual([0, 1, 2]);
+    expect(notesOf(after, past)).toEqual(past.map((a) => a.note));
+    expect(notesOf(after, past)).toEqual(["paint under", "merged", "into L2"]);
+    // The minted names of the beats OUTSIDE the range are untouched, which is
+    // the property the whole addressing scheme exists for.
+    expect(resolve(after, stepId(0))).toBe(0);
+    expect(resolve(after, stepId(4))).toBe(2);
+  });
+
+  it("and it survives it because `rebaseTree` cannot see a move at all", () => {
+    // THE SHARP FORM OF THE VERDICT. `rebaseTree` is index arithmetic over
+    // `Beat.act`; the moves inside a rung are not an input to it. So the tree a
+    // journal WITH a reorder in the merged range rebases to is the same tree a
+    // journal of five plain paints rebases to, character for character.
+    const withPlace = timelineOf(withAPlace().journal.past);
+    const without = timelineOf(withNoPlace().journal.past);
+    expect(JSON.stringify(rebaseTree(withPlace, 1, 3, 1))).toBe(
+      JSON.stringify(rebaseTree(without, 1, 3, 1))
+    );
+    // Both journals really are five rungs, so the equality above is about the
+    // tree and not about two different-sized inputs agreeing by accident.
+    expect(withAPlace().journal.past).toHaveLength(5);
+    expect(withNoPlace().journal.past).toHaveLength(5);
+  });
+
+  it("a group and a hold over the merged range survive it too", () => {
+    const s = withAPlace();
+    // The composite case: the range the merge will eat is wrapped in a
+    // sub-composition, and a hold the person authored sits inside it.
+    const wrapped = group(timelineOf(s.journal.past), null, 1, 3, stepId(950)) as Timeline;
+    expect(wrapped).not.toBeNull();
+    const held = insertHold(wrapped, stepId(950), 1, stepId(951));
+    expect(beatCount(held)).toBe(6);
+
+    const done = mergeFrames(s, 1, 3, "merged");
+    expect(done.ok).toBe(true);
+    if (!done.ok) return;
+    const past = done.value.session.journal.past;
+
+    const after = rebaseTree(held, 1, 3, 1);
+    // The wrapper is still there, still holding the surviving beat and the hold
+    // — a merge of the gestures around a hold is not a statement about the hold.
+    expect(depth(after)).toBe(1);
+    expect(acts(after)).toEqual([0, 1, null, 2]);
+    expect(notesOf(after, past)).toEqual(["paint under", "merged", null, "into L2"]);
+    // Every name still resolves: nothing the person authored dangles.
+    for (const id of [stepId(0), stepId(4), stepId(950), stepId(951)]) {
+      expect(resolve(after, id)).not.toBeNull();
+    }
+    expect(wellOrdered(after)).toBe(true);
+  });
+
+  it("MEASURED AND LEFT STANDING: a wrapper emptied by a merge becomes a dangling name", () => {
+    // The one thing the merge repair does NOT keep, found while measuring the
+    // case above and written down rather than quietly fixed. It is not about
+    // `place` — it is about a composition ALL of whose beats fall inside the
+    // merged range. The first survivor is kept, so a wrapper over the range
+    // keeps one beat; a wrapper over a PROPER SUBSET of the range that does not
+    // contain the first survivor keeps none, and an empty composition resolves
+    // to `null` — `Comp` has no beat of its own to take an index from.
+    const s = withAPlace();
+    const wrapped = group(timelineOf(s.journal.past), null, 2, 2, stepId(960)) as Timeline;
+    expect(wrapped).not.toBeNull();
+    const after = rebaseTree(wrapped, 1, 3, 1);
+    expect(acts(after)).toEqual([0, 1, 2]);
+    // The wrapper is still IN the tree and names nothing. `resolve` answering
+    // `null` is the documented failure mode of addressing (see `resolve`), so
+    // this is a name that dangles rather than a number that is wrong — which is
+    // the difference the whole design was chosen for.
+    expect(resolve(after, stepId(960))).toBeNull();
+    expect(JSON.stringify(after)).toContain(stepId(960));
+    // It costs nothing in the animation: an empty composition contributes no
+    // beat and no time, so the drawing plays exactly as the flat tree does.
+    expect(beatCount(after)).toBe(3);
+    expect(wellOrdered(after)).toBe(true);
   });
 });
 
