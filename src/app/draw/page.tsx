@@ -10,6 +10,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import DrawBoard, {
+  focusFrame,
   PAINT_SEAM,
   SEAM,
   TILE,
@@ -20,7 +21,32 @@ import DrawBoard, {
   type ViewWindow,
 } from "@/components/DrawBoard";
 import { ADJUSTMENTS, ADJUST_NAMES, type AdjustName } from "@/lib/adjust";
-import { ARMS, armMaskOver, clipStamp, type Isolation } from "@/lib/arms";
+import { ARMS, clipStamp, type Isolation } from "@/lib/arms";
+import {
+  ROOT,
+  STEP_LABEL,
+  armResolver,
+  armStep,
+  clipMask,
+  enter,
+  exit,
+  exitTo,
+  focusCells,
+  focusedArm,
+  focusedSector,
+  gestureFor,
+  gestureIds,
+  hexagonDeeper,
+  pathLabel,
+  samePath,
+  scopeFor,
+  sectorResolver,
+  sectorStep,
+  seedMask,
+  type FocusPath,
+  type FocusResolvers,
+  type FocusStep,
+} from "@/lib/focus";
 import {
   cellCount,
   extractArt,
@@ -377,6 +403,20 @@ const MAX_IMPORT = 16;
 const ZOOM_MAX = 8;
 
 /**
+ * How long the drill-in zoom takes, in milliseconds.
+ *
+ * SHORT ON PURPOSE. The transition is not decoration: with the plate zoomed and
+ * five sixths of it dulled in one frame, there is nothing on screen that says
+ * the new picture is a part of the old one, and a person who looks away for the
+ * length of a click comes back to what reads as a different drawing. The travel
+ * is the sentence "this came from there". 180 ms is long enough to be seen as
+ * motion and short enough that nobody waits for it.
+ *
+ * `prefers-reduced-motion` skips it entirely; see `easeFocus`.
+ */
+const FOCUS_MS = 180;
+
+/**
  * How long a replay holds each gesture, in milliseconds.
  *
  * The range is set by the two things a replay is for. At the fast end it has to
@@ -514,6 +554,28 @@ const subscribeCoarse = (onChange: () => void) => {
 };
 const coarseNow = () => window.matchMedia("(pointer: coarse)").matches;
 const coarseOnServer = () => false;
+
+/**
+ * `prefers-reduced-motion`, read the same way `(pointer: coarse)` is.
+ *
+ * A store rather than a one-shot read for the same reason that one is: the
+ * setting can change while the page is open — macOS's Reduce Motion is a switch
+ * in the accessibility pane, not a boot flag — and a value sampled once would
+ * leave the drill-in animating for someone who has just asked it not to.
+ *
+ * FALSE ON THE SERVER, which is the same lie `coarseOnServer` tells and for the
+ * same reason: there is no media query in a render that has no window, and the
+ * first client render corrects it before anything can move. Nothing animates
+ * during hydration, so the wrong value is never acted on.
+ */
+const subscribeMotion = (onChange: () => void) => {
+  const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+  mq.addEventListener("change", onChange);
+  return () => mq.removeEventListener("change", onChange);
+};
+const motionNow = () =>
+  window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+const motionOnServer = () => false;
 
 interface Canvas {
   /** The model. Always the hexagon; the view says which part is drawn. */
@@ -841,6 +903,31 @@ const GLYPH_LEGEND: readonly { icon: React.ReactNode; what: string }[] = [
   { icon: <ActionGlyph name="load" />, what: "load an SVG onto the plate" },
 ];
 
+/**
+ * What ONE focus step calls itself, for a breadcrumb button.
+ *
+ * `focus.ts` has this function — `stepLabel` — and does not export it; what it
+ * exports is `pathLabel`, which joins every step into one string with a
+ * separator. That is the right shape for a sentence and the wrong shape for a
+ * row of buttons, and splitting the joined string back apart would be parsing a
+ * display string, which breaks the moment a gesture step's label contains the
+ * separator. So the per-step spelling is written out here, using `STEP_LABEL`
+ * and `gestureIds` — both exported — so the words themselves still come from the
+ * model. The right fix is for `focus.ts` to export its `stepLabel`; that file is
+ * outside this change's lane, so it is flagged rather than edited.
+ *
+ * The `gesture` case is not reachable from this page yet — nothing here pushes a
+ * gesture step — and is written anyway, because the alternative is a breadcrumb
+ * that prints a raw comma-separated id list the first time the filmstrip drives
+ * this mechanism.
+ */
+function crumbLabel(step: FocusStep): string {
+  if (step.kind !== "gesture") return `${STEP_LABEL[step.kind]} ${step.id}`;
+  const ids = gestureIds(step);
+  if (ids.length === 0) return "no gestures";
+  return ids.length === 1 ? `gesture ${ids[0]}` : `${ids.length} gestures`;
+}
+
 export default function DrawPage() {
   /**
    * Which part of the one plate is framed. NOT which plate — there is one.
@@ -879,14 +966,38 @@ export default function DrawPage() {
    */
   const [scope, setScope] = useState<BrushScope>("hexagon");
   /**
-   * One ftype ARM at a time, INSIDE the framed sector.
+   * WHICH THING THE HAND IS INSIDE — one stack, from the whole plate inward.
    *
-   * `null` is off. Offered in the sector view alone, which is the nesting the
-   * figure actually has: hexagon, then sector, then arm. In hexagon view the
-   * scope control is the same question asked one level up, and stacking both
-   * would be a pair of controls nobody can hold in mind at once.
+   * This replaces the `isolation` state that used to sit here, and it is the
+   * page's whole share of `lib/focus.ts`. `focusedArm(focus)` is the old
+   * `Isolation` value, so every consumer of it below is unchanged; what is new is
+   * that the same stack can also hold a SECTOR, and later a layer or a gesture,
+   * without a fourth piece of state and a fourth control.
+   *
+   * ── What it is NOT: the frame, and not the roaming brush sector ─────────
+   *
+   * `viewMode` and `sector` stay exactly where they are, and that is deliberate
+   * rather than unfinished. They are different questions:
+   *
+   *   viewMode  WHICH PART OF THE MODEL IS DRAWN. A reframe — the sector view
+   *             turns one sector apex-up at twice the scale and draws nothing
+   *             else. Drilling in is the opposite: it zooms and DULLS, so the
+   *             rest of the figure is still on screen. Folding the two together
+   *             would make "isolate" throw away the picture it is supposed to be
+   *             showing you the inside of.
+   *
+   *   sector    WHICH SECTOR THE POINTER IS OVER, kept stickily by `noteSector`
+   *             so a `sector`-scoped brush roams the whole plate with each stroke
+   *             staying local to where it started. That is a per-STROKE fact and
+   *             it changes on every pointer move; a focus is a standing state a
+   *             person chose. Driving the focus from the pointer would zoom and
+   *             dim the plate as the hand crossed a seam.
+   *
+   * So the focus COMPOSES with both rather than replacing either: see `effScope`
+   * for how one expression takes the scope buttons and the focus together, and
+   * `reframe` for why a frame change drops the focus.
    */
-  const [isolation, setIsolation] = useState<Isolation>(null);
+  const [focus, setFocus] = useState<FocusPath>(ROOT);
   const [reliefOn, setReliefOn] = useState(false);
   const [reading, setReading] = useState<Reading>("convex");
   const [schemeName, setSchemeName] = useState<SchemeName>("hexad");
@@ -1045,6 +1156,23 @@ export default function DrawPage() {
   const [spaceHeld, setSpaceHeld] = useState(false);
   const panned = useRef(false);
   /**
+   * The animation frame the drill-in zoom is travelling on, or `null`.
+   *
+   * THERE IS STILL ONE TRANSFORM AND ONE WRITER OF IT. This does not hold a
+   * second zoom; it holds a timer that writes `zoom` and `centre` — the same two
+   * pieces of state the zoom stepper, the pan and `reframe` write — a few times
+   * on its way to a value. Everything that sets the view cancels it first
+   * (`stopEasing`), so the last thing the user asked for is always the thing that
+   * wins, and a manual zoom during a drill-in is not a fight between two
+   * mechanisms but an interruption of one.
+   *
+   * The alternative was to DERIVE the transform from the focus path. It was
+   * rejected because it makes manual zoom impossible while focused: the stepper
+   * would set a value that the next render recomputed away, which is a control
+   * that visibly does nothing.
+   */
+  const easing = useRef<number | null>(null);
+  /**
    * Why the last load did not happen.
    *
    * Held rather than only announced, because a refusal that exists for one
@@ -1124,14 +1252,42 @@ export default function DrawPage() {
   const scheme = SCHEMES[schemeName];
   const adjust = ADJUSTMENTS[adjustName];
   /**
-   * The scope the brush is actually under.
+   * The scope the brush is actually under — the FRAME, the BUTTON and the FOCUS,
+   * in one expression.
    *
    * The sector view forces it, rather than the control being disabled there: a
    * framed sector's brush is the sector's own D₃ by definition, and the `scope`
    * state is left where the user put it so returning to hexagon view returns to
    * the group they had chosen.
+   *
+   * ── The three-way button and `scopeFor` are NOT two answers ─────────────
+   *
+   * `focus.scopeFor(path, repeatAll)` takes a BOOLEAN — "repeat in all six" —
+   * and the button here is a three-way. The brief that asked for the focus stack
+   * anticipated the buttons being removed and the boolean taking their place;
+   * they are staying for now, so the two have to compose rather than contend, and
+   * this is the composition:
+   *
+   *   sector6 pressed   → `repeatAll` is true, and `scopeFor` answers `sector6`
+   *                       WHEREVER the focus is. That IS the toggle; there is no
+   *                       second spelling of it.
+   *   sector pressed    → the roaming brush, named outright. The button says
+   *                       "this sector and nothing outside it" and the sector it
+   *                       means comes from the pointer (`noteSector`), so the
+   *                       focus has nothing to add and must not override it.
+   *   hexagon pressed   → `scopeFor` decides, which is the new behaviour: D₆ at
+   *                       the root, and the sector's own D₃ once you have drilled
+   *                       into a sector. Drilling in is a statement about where
+   *                       you are working, and the group follows it.
+   *
+   * `scopeFor`'s own header is worth reading here: `repeatAll` is honoured AT THE
+   * ROOT on purpose, and that is why the `sector6` branch is tested first rather
+   * than being conditioned on a sector being focused.
    */
-  const effScope: BrushScope = viewMode === "sector" ? "sector" : scope;
+  const effScope: BrushScope =
+    viewMode === "sector" || scope === "sector"
+      ? "sector"
+      : scopeFor(focus, scope === "sector6");
   const modes = SCOPE_MODES[effScope];
   /** A sector is a copy of the base triangle, so a sector brush wears D₃'s face. */
   const glyphKind: CanvasKind = effScope === "hexagon" ? "hexagon" : "triangle";
@@ -1140,6 +1296,21 @@ export default function DrawPage() {
   // the brush does — is unreachable on touch unless the press itself proposes.
   const coarse = useSyncExternalStore(subscribeCoarse, coarseNow, coarseOnServer);
   const dragMode = dragChoice ?? defaultDragMode(coarse);
+  /**
+   * Has the reader asked not to be moved about?
+   *
+   * Read here rather than left entirely to CSS because the drill-in's travel is
+   * a JavaScript tween over `zoom` and `centre` — an SVG `viewBox` is not an
+   * animatable CSS property in any engine, so `@media (prefers-reduced-motion)`
+   * in the stylesheet cannot reach it. The dim layer's fade IS a CSS transition
+   * and is switched off in the sheet, which is where that kind of thing belongs;
+   * the two together are the whole of the setting's effect here.
+   */
+  const reduceMotion = useSyncExternalStore(
+    subscribeMotion,
+    motionNow,
+    motionOnServer
+  );
 
   /**
    * The model. One figure, rebuilt only when the cut changes.
@@ -1268,21 +1439,88 @@ export default function DrawPage() {
   }, [zoom, centre, canvas]);
 
   /**
-   * Which cells the brush may touch — the ISOLATE control, sector view only.
+   * What a focus step MEANS on this plate.
    *
-   * The three ftype arms are a genuine partition of a sector minus its hub
-   * rather than a mask, and membership is the first non-X digit of the address,
-   * which every hexagon cell carries because every one of them is a copy of a
-   * base triangle cell. See `arms.ts`, including why the hub is excluded and
-   * what clipping costs the 3- and 6-fold brushes.
+   * Two kinds are reachable from the canvas — a sector and an arm — and both
+   * resolve off fields the hexagon's cells already carry, so nothing here
+   * computes a coordinate. Rebuilt with the figure, which is the discipline
+   * `focus.setResolver` asks for: a resolver caches, so a new figure needs a new
+   * one.
    *
-   * No sector test is needed: the SECTOR-scoped surface cannot carry a cell out
-   * of its own sector, and only the framed sector is on screen to be clicked.
+   * `layer` and `gesture` are deliberately absent. `focus.ts` supports both and
+   * the layers panel and the filmstrip will supply them; a resolver with no
+   * control to drive it would be an untested code path standing in for a feature.
+   * A step whose kind has no resolver is treated as holding everything, so
+   * nothing here breaks when one arrives.
    */
-  const keepCell = useMemo(
-    () => armMaskOver(hex.cells, viewMode === "sector" ? isolation : null),
-    [hex, viewMode, isolation]
+  const resolvers = useMemo<FocusResolvers>(
+    () => ({
+      sector: sectorResolver(hex.cells),
+      arm: armResolver(hex.cells),
+    }),
+    [hex]
   );
+
+  /**
+   * The arm the focus names, or `null`. The old `isolation` state, DERIVED.
+   *
+   * Kept under its old name because half a dozen readouts and the arm control
+   * itself are written in terms of it, and re-spelling them would have made this
+   * change look bigger than it is while testing nothing new.
+   */
+  const isolation: Isolation = focusedArm(focus);
+
+  /**
+   * Which cells the brush's STAMP may keep — arms, and only arms.
+   *
+   * This was `armMaskOver(hex.cells, isolation)` and it is `clipMask` now, which
+   * is the same predicate arrived at from the path instead of from one nullable
+   * value: `armResolver` declares `clips: true` and nothing else does, so the
+   * mask an arm-less path produces is the constant `true` it always was.
+   *
+   * THE SECTOR IS NOT IN HERE, and that is the property the whole module turns
+   * on. A `sector6` stroke seeded inside a focused sector must still reach all
+   * six — that group is defined as one sector's D₃ repeated six times, and a clip
+   * to the focused sector would make the toggle a control that does nothing.
+   * `focus.ts` states it and `test/focus.test.ts` measures it.
+   *
+   * One behaviour genuinely changed and is flagged rather than slipped in: the
+   * old mask was live only while a sector was FRAMED (`viewMode === "sector"`).
+   * An arm can now be focused in the hexagon view too — that is what drilling in
+   * with a double-tap does — and the clip applies there, which is the point of
+   * being able to drill in at all.
+   */
+  const keepCell = useMemo(() => clipMask(focus, resolvers), [focus, resolvers]);
+
+  /**
+   * Where a pointer may land: inside every MASKING step of the path.
+   *
+   * Illustrator's isolation mode, and the sentence `focus.seedMask` uses for it:
+   * inside the thing, the outside stays visible and stops being selectable. At
+   * the root this is the constant `true` — one shared closure, not an allocation
+   * per cell — so the common case costs a call and the guards below are free.
+   */
+  const inFocus = useMemo(() => seedMask(focus, resolvers), [focus, resolvers]);
+
+  /**
+   * The cells the focus HOLDS, as a set, or `null` at the root.
+   *
+   * `holdMask` and not `seedMask`, which is what `focusCells` is built on and
+   * what the display wants: a step that does not restrict the hand — a layer, a
+   * gesture — is still a thing you can point at on screen, and framing the
+   * whole plate for it would be the one answer that is useless.
+   *
+   * INTERSECTED WITH THE FRAME. In the sector view the geometry only draws one
+   * sector, and an arm step alone holds its arm in all six; a set carrying cells
+   * that are not on screen would put the dim layer's complement and the zoom box
+   * in two different places. `canvas.inView` admits everything in the hexagon
+   * view, so this is a no-op on the common path.
+   */
+  const focusHeld = useMemo<ReadonlySet<number> | null>(() => {
+    if (focus.length === 0) return null;
+    const held = focusCells(focus, resolvers, hex.cells.length);
+    return new Set(held.filter((i) => canvas.inView(i)));
+  }, [focus, resolvers, hex, canvas]);
 
   /** `(4^d − 1)/3` — the size §D predicts for one arm of one sector. */
   const armSize = (4 ** depth - 1) / 3;
@@ -1297,10 +1535,20 @@ export default function DrawPage() {
    * inside the hexagon view names the one sector it acts in, and SECTOR ×6 all
    * six copies, which is what that group actually contains.
    */
+  /*
+   * Written against `effScope` rather than against the `scope` BUTTON, which is
+   * a fix and not a tidy-up. Drilling into a sector takes the brush from D₆ to
+   * that sector's D₃ without the button moving, and the axis overlay is a
+   * picture of the group the brush is using — reading the button here would have
+   * drawn the hexagon's six diameters over a plate whose brush was mirroring
+   * about one sector's three medians. The sector NAMED is the focused one when
+   * there is one, and otherwise the roaming one the pointer left behind.
+   */
   const guideSectors = useMemo(() => {
-    if (viewMode === "sector" || scope === "hexagon") return null;
-    return scope === "sector" ? [sector] : [0, 1, 2, 3, 4, 5];
-  }, [viewMode, scope, sector]);
+    if (viewMode === "sector" || effScope === "hexagon") return null;
+    if (effScope === "sector6") return [0, 1, 2, 3, 4, 5];
+    return [focusedSector(focus) ?? sector];
+  }, [viewMode, effScope, focus, sector]);
 
   const guides = useMemo(
     () =>
@@ -1308,9 +1556,9 @@ export default function DrawPage() {
         canvas.frame,
         mode,
         guideSectors,
-        viewMode === "hexagon" && scope === "sector6" ? 6 : 0
+        viewMode === "hexagon" && effScope === "sector6" ? 6 : 0
       ),
-    [canvas, mode, guideSectors, scope, viewMode]
+    [canvas, mode, guideSectors, effScope, viewMode]
   );
 
   /**
@@ -1562,6 +1810,13 @@ export default function DrawPage() {
   const specFor = useCallback(
     (seed: number | null, colourBase?: Swatch): PreviewSpec | null => {
       if (seed === null || seed >= canvas.geom.cells.length) return null;
+      // NO GHOST OUTSIDE THE FOCUS, on the same rule as the paint guard: the
+      // ghost's whole job is to promise exactly what the stroke will lay, and
+      // `paintAt` refuses this seed, so a ghost here would promise a stroke that
+      // is not going to happen. It matters most at the moment it is most
+      // tempting to skip — hovering across the dulled five sixths of the plate
+      // on the way to a control.
+      if (!inFocus(seed)) return null;
       // Clipped, so the ghost promises exactly what the stroke will lay. A
       // preview that reached outside the isolated arm would be teaching the
       // wrong brush. `seedStamp` is the same call `paintAt` makes, so the ghost
@@ -1572,7 +1827,7 @@ export default function DrawPage() {
         colourBase
       );
     },
-    [canvas, shape, keepCell, specFromStamp]
+    [canvas, shape, keepCell, inFocus, specFromStamp]
   );
 
   /**
@@ -1859,14 +2114,275 @@ export default function DrawPage() {
    * sector frame is twice the scale and turned by 120°, so carrying a window
    * across would land it somewhere nobody asked for.
    */
+  // ── drilling in ─────────────────────────────────────────────────────────
+
+  /**
+   * Stop the drill-in travel dead.
+   *
+   * Called by EVERYTHING that writes the view — the stepper, the pan, the
+   * reframe, the next drill-in — because a timer still writing `zoom` after the
+   * user has asked for a different one is the "two writers" bug the whole
+   * arrangement exists to avoid. Idempotent, so callers do not have to know
+   * whether one is running.
+   */
+  const stopEasing = useCallback(() => {
+    if (easing.current === null) return;
+    cancelAnimationFrame(easing.current);
+    easing.current = null;
+  }, []);
+
+  // A page unmounted mid-travel would leave a frame callback holding setState.
+  useEffect(() => stopEasing, [stopEasing]);
+
+  /**
+   * Travel to a zoom and a centre, over `FOCUS_MS`.
+   *
+   * `prefers-reduced-motion` SKIPS THE TRAVEL AND KEEPS THE DESTINATION, which
+   * is the right reading of that setting: the person has asked not to be moved
+   * across the screen, not to be denied the zoom. A version that also refused to
+   * zoom would have turned an accessibility preference into a missing feature.
+   *
+   * The `requestAnimationFrame` test is for the same reason the media query is
+   * read through a store: this file is rendered on the server as well, and a
+   * callback that is never invoked there is still a callback that must not throw
+   * if some future path invokes it.
+   *
+   * The intermediate values are FRACTIONAL, which breaks the "zoom is a power of
+   * two" habit the stepper had. Flagged rather than papered over: the readout is
+   * rounded for display (see the zoom stepper) and `setZoomTo` still doubles and
+   * halves whatever it is handed, so the stops remain a power of two apart from
+   * wherever a drill-in left off. Snapping the drill-in to a power of two was the
+   * alternative and it is worse — it would frame the focused cells at up to twice
+   * or half the size asked for, which is the one thing "fills the canvas" means.
+   */
+  const easeTo = useCallback(
+    (to: { zoom: number; cx: number; cy: number }) => {
+      stopEasing();
+      const settle = () => {
+        setZoom(to.zoom);
+        // `null` at 1×, matching `setZoomTo`, so the `view` memo returns the
+        // untouched viewBox the board has always drawn at rest.
+        setCentre(to.zoom <= 1 ? null : { x: to.cx, y: to.cy });
+      };
+      if (reduceMotion || typeof requestAnimationFrame !== "function") {
+        settle();
+        return;
+      }
+      const z0 = zoom;
+      const x0 = centre?.x ?? canvas.geom.width / 2;
+      const y0 = centre?.y ?? canvas.geom.height / 2;
+      const t0 = performance.now();
+      const step = () => {
+        const u = Math.min(1, (performance.now() - t0) / FOCUS_MS);
+        if (u >= 1) {
+          easing.current = null;
+          settle();
+          return;
+        }
+        // Ease out, not linear: the picture leaves quickly and arrives slowly,
+        // which is what makes a short move readable as a move rather than as a
+        // cut. Cubic because it is the cheapest curve that does it.
+        const k = 1 - (1 - u) ** 3;
+        setZoom(z0 + (to.zoom - z0) * k);
+        setCentre({ x: x0 + (to.cx - x0) * k, y: y0 + (to.cy - y0) * k });
+        easing.current = requestAnimationFrame(step);
+      };
+      easing.current = requestAnimationFrame(step);
+    },
+    [reduceMotion, zoom, centre, canvas, stopEasing]
+  );
+
+  /**
+   * Go to a focus path: zoom to it, dim around it, and say where you are.
+   *
+   * ONE FUNCTION for every route in — the canvas double-tap, the two keys, the
+   * breadcrumb, the arm buttons and Escape — so there is one place that decides
+   * what entering and leaving a focus does and no control can implement half of
+   * it. That is the same discipline `pickView` and `pickScope` are written under.
+   *
+   * Three things happen besides the path itself.
+   *
+   * THE BRUSH MODE IS CLAMPED. Drilling into a sector can take `effScope` from
+   * `hexagon` to `sector`, and mode 12 is D₆'s reflections — a subgroup of D₆ and
+   * of nothing else. `pickScope` and `pickView` already apply exactly this rule
+   * when they change the scope; this is the third door into the same room.
+   *
+   * THE PROPOSAL IS DROPPED. A standing proposal is a set of seeds gathered under
+   * the group and the mask that were in force when it was gathered; committing it
+   * after the focus moved would lay a stroke nobody previewed. `pickScope` and
+   * `pickIsolation` have always done this for the same reason.
+   *
+   * THE VIEW TRAVELS. `focusFrame` over the cells the path HOLDS — `focusCells`
+   * is built on `holdMask`, which is the framing mask — intersected with what the
+   * frame actually draws. A path that holds NOTHING keeps the frame it has, which
+   * is what `focusCells` documents as the answer for a fresh layer, a hidden
+   * layer, an erase gesture or a query that matched nothing.
+   *
+   * THE INTERSECTION WITH `inView` IS LOAD-BEARING and not defensive. A framed
+   * sector's `geom.cells` is the WHOLE model, index-aligned — `view.plateFrame`
+   * maps every cell so the board can keep using model indices — and the ones in
+   * the other five sectors land outside the triangle frame entirely. A box taken
+   * over them would zoom to a rectangle containing five sectors that are not
+   * drawn. `canvas.inView` admits everything in the hexagon view, so the common
+   * path pays one predicate per cell and nothing else.
+   *
+   * KNOWN IMPRECISION, under the relief only. The box is taken over the FLAT
+   * vertices while the board draws the deformed ones. The deformation pins the
+   * rim at scale 1 and shrinks inward, so the drawn cells are never outside the
+   * flat box — the frame is a little loose rather than cropping, which is the
+   * error worth having. Threading the bend through would mean re-deriving the box
+   * per template ring, at the pointer's rate, to fix a gap of a few pixels.
+   */
+  const applyFocus = useCallback(
+    (next: FocusPath) => {
+      if (samePath(next, focus)) return;
+      setFocus(next);
+      setProposal(EMPTY_PROPOSAL);
+
+      const nextScope: BrushScope =
+        viewMode === "sector" || scope === "sector"
+          ? "sector"
+          : scopeFor(next, scope === "sector6");
+      const m = SCOPE_MODES[nextScope].includes(mode) ? mode : 6;
+      if (m !== mode) setMode(m);
+
+      if (next.length === 0) {
+        easeTo({
+          zoom: 1,
+          cx: canvas.geom.width / 2,
+          cy: canvas.geom.height / 2,
+        });
+        setAnnounce(
+          `the whole plate — nothing is dimmed and the brush reaches everywhere${
+            m === mode ? "" : `. Brush dropped to ${m}-fold`
+          }`
+        );
+        return;
+      }
+
+      const held = focusCells(next, resolvers, hex.cells.length).filter((i) =>
+        canvas.inView(i)
+      );
+      const frame = focusFrame(canvas.geom, held, ZOOM_MAX);
+      if (frame !== null) easeTo(frame);
+      setAnnounce(
+        `inside ${pathLabel(next)} — ${held.length} cell${
+          held.length === 1 ? "" : "s"
+        }${
+          frame === null
+            ? ", which name nothing to look at, so the frame is unchanged"
+            : `, zoomed to fill the frame`
+        }. The rest of the plate is dulled and the brush will not reach it. Double-tap a dulled cell, or press O, to step back out${
+          m === mode ? "" : `. Brush dropped to ${m}-fold — mode 12 is D₆'s alone`
+        }`
+      );
+    },
+    [focus, viewMode, scope, mode, resolvers, hex, canvas, easeTo]
+  );
+
+  /** The plate's own nesting rule: root → sector → arm → stop. See `focus.ts`. */
+  const deeper = useMemo(() => hexagonDeeper(hex.cells), [hex]);
+
+  /**
+   * A clean double-tap on a cell. `gestureFor` decides what it means.
+   *
+   * The whole decision is one call, and deliberately: "inside" is `seedMask`'s
+   * inside, "outside" is its complement, and the two cases are therefore total
+   * over the plate with no third case where a tap means neither. The board knows
+   * none of this — it reports a cell and this reads the answer off the model.
+   *
+   * EXIT POPS ONE LEVEL. Not to the root: `focus.exit`'s header gives the reason
+   * and it is the reason this page wanted the mechanism at all — "leave this arm
+   * but stay in this sector" has to be expressible, and a gesture that dropped to
+   * the root would make the middle of a three-level stack unreachable except by
+   * re-entering from scratch.
+   */
+  const onFocusTap = useCallback(
+    (i: number) => {
+      const act = gestureFor(focus, i, resolvers, deeper);
+      if (act === null) {
+        // Two ways to get here and both are no-ops: a double-tap at the root on
+        // a cell that names nothing, and a double-tap at the bottom of the stack.
+        // The second is worth a sentence, because a gesture that does nothing
+        // twice in a row reads as a broken control rather than as an edge.
+        if (focus.length > 0) {
+          setAnnounce(
+            `${pathLabel(focus)} — there is nothing further in from here${
+              focusedArm(focus) === null
+                ? "; the hub belongs to no arm"
+                : ""
+            }`
+          );
+        }
+        return;
+      }
+      applyFocus(
+        act.act === "exit" ? exit(focus) : enter(focus, act.step)
+      );
+    },
+    [focus, resolvers, deeper, applyFocus]
+  );
+
+  /**
+   * The keyboard's way IN — the cursor's cell, one level deeper.
+   *
+   * A REAL SECOND PATH and not a courtesy. Every scope and arm control on this
+   * page is a `<button>` with an `aria-label` precisely because a canvas gesture
+   * is a mouse-and-finger affordance, and a drill-in that could only be reached
+   * by double-tapping the plate would be the first control here that a keyboard
+   * cannot work. It reads the CURSOR, falling back to the hover, because those
+   * are the two things that already mean "where the hand is".
+   *
+   * Strictly IN, where the canvas gesture is in-or-out. From the keyboard the
+   * direction is chosen by which key was pressed, so inferring it from where the
+   * cursor happens to be sitting would make one key do two unrelated things.
+   */
+  const drillIn = useCallback(() => {
+    const at = cursor ?? hover;
+    if (at === null) {
+      setAnnounce(
+        "no cell under the cursor — put it on the plate with the lattice keys or the arrows first"
+      );
+      return;
+    }
+    if (!inFocus(at)) {
+      setAnnounce(
+        `the cursor is outside ${pathLabel(
+          focus
+        )} — press O to step out, or move it inside first`
+      );
+      return;
+    }
+    const step = deeper(at, focus);
+    if (step === undefined) {
+      setAnnounce(`${pathLabel(focus)} — there is nothing further in from here`);
+      return;
+    }
+    applyFocus(enter(focus, step));
+  }, [cursor, hover, inFocus, focus, deeper, applyFocus]);
+
+  /** The keyboard's way OUT, and the tail of the Escape chain. One level. */
+  const drillOut = useCallback(() => {
+    if (focus.length === 0) return;
+    applyFocus(exit(focus));
+  }, [focus, applyFocus]);
+
   const reframe = useCallback(() => {
+    stopEasing();
     setZoom(1);
     setCentre(null);
     setHover(null);
     setCursor(null);
     setProposal(EMPTY_PROPOSAL);
     setShapeDrag(null);
-  }, []);
+    // THE FOCUS GOES TOO, and this is a deviation from what isolation used to do
+    // — it survived a sector change. It should not. A focus step names a sector
+    // by NUMBER, so carrying `[sector 2, arm A]` across a change of frame would
+    // leave the breadcrumb saying "sector 2" while sector 3 is on screen, and the
+    // dim layer holding cells the new frame does not draw. The frame change is
+    // the bigger gesture and the focus is the thing inside it.
+    setFocus(ROOT);
+  }, [stopEasing]);
 
   const pickView = useCallback(
     (next: "hexagon" | "sector") => {
@@ -1991,15 +2507,35 @@ export default function DrawPage() {
     [depth, docCensus]
   );
 
+  /**
+   * The arm buttons, now spelled as a focus path.
+   *
+   * KEPT, and the brief that added the focus stack says to keep them: they are
+   * being replaced by a different control later, and removing them in the same
+   * pass as the drill-in would leave the arm reachable only by double-tapping,
+   * which is a mouse-and-finger gesture.
+   *
+   * The path is REBUILT rather than pushed onto, and that is the whole of the
+   * work here. `[sector s, arm A]` and not `[arm A]`, because an arm step alone
+   * holds its arm in ALL SIX sectors — `armOfWord` reads the address, which every
+   * sector's copy of a cell shares — and the control says "one third of the
+   * framed sector". Pressing B while A is isolated therefore replaces the arm
+   * instead of nesting one inside another, which is what `focus.enter`'s header
+   * says a caller that can produce a nonsense pair should do.
+   *
+   * A SECTOR STEP APPEARS EVEN THOUGH THE SECTOR IS ALREADY FRAMED. It has to:
+   * the frame is a camera and the focus is a mask, and it is the focus that
+   * `holdMask` reads when it decides which cells to dim and which box to zoom to.
+   *
+   * OFF goes to the ROOT rather than to `[sector s]`. The two look identical in
+   * the sector view — the frame draws that sector and nothing else, so a sector
+   * focus dims nothing and zooms to what is already on screen — but they read
+   * differently, and a button labelled "off" that left a breadcrumb standing
+   * would be saying that something is still isolated.
+   */
   const pickIsolation = (next: Isolation) => {
     if (next === isolation) return;
-    setIsolation(next);
-    setProposal(EMPTY_PROPOSAL);
-    setAnnounce(
-      next === null
-        ? "isolation off — the whole sector"
-        : `isolated to arm ${next} — the ftype-${next} triskelion arm of sector ${sector}, ${armSize} cells; the hub belongs to no arm and is out of reach`
-    );
+    applyFocus(next === null ? ROOT : [sectorStep(sector), armStep(next)]);
   };
 
   // ── painting ────────────────────────────────────────────────────────────
@@ -2019,6 +2555,17 @@ export default function DrawPage() {
       // A preview is not a canvas. Gated here as well as at the board's
       // handlers, because the keyboard reaches this function by three routes.
       if (previewing) return;
+      // OUTSIDE THE FOCUS IS INERT — Illustrator's isolation rule, and the
+      // sentence `focus.seedMask` is written in. At the root this predicate is
+      // the constant `true`, so this line costs one call on the common path.
+      //
+      // SILENT, unlike the locked-layer refusal below, and that is a choice
+      // rather than an omission. A refusal announced here would fire on every
+      // application of a drag — sixty a second — and the two cases are not
+      // alike: a locked layer looks exactly like an unlocked one, whereas the
+      // cells this refuses are the ones visibly dulled on screen, and the
+      // sentence that says so was already said when the focus was entered.
+      if (!inFocus(i)) return;
       const target = paintTarget(compRef.current);
       if (!target.ok) {
         // Once per gesture, not once per application: a drag over a locked
@@ -2089,6 +2636,7 @@ export default function DrawPage() {
     },
     [
       previewing,
+      inFocus,
       canvas,
       book,
       keepCell,
@@ -2679,12 +3227,17 @@ export default function DrawPage() {
   const propose = useCallback(
     (i: number) => {
       if (previewing) return;
+      // The same guard `paintAt` carries, and it has to be here as well rather
+      // than only at the commit: a proposal is a promise about what a commit
+      // will lay, so gathering a seed the brush may not use would show a ghost
+      // that commits to nothing.
+      if (!inFocus(i)) return;
       noteSector(i);
       setProposal((p) => proposeSeed(p, i));
       setCursor(i);
       setHover(null);
     },
-    [previewing, noteSector]
+    [previewing, inFocus, noteSector]
   );
 
   /**
@@ -3120,18 +3673,35 @@ export default function DrawPage() {
     }
   }, []);
 
+  /**
+   * The manual zoom. Still the only public way to set the factor by hand, and
+   * still the only place the clamp lives.
+   *
+   * It CANCELS a drill-in travel first, which is what keeps the "one writer"
+   * claim true: the tween and the stepper write the same state, so the last
+   * thing asked for has to be the thing that survives. A drill-in that a person
+   * zooms out of mid-flight stays where they put it, and the focus — the
+   * dimming, the breadcrumb, the inert outside — is untouched by that. THE ZOOM
+   * AND THE FOCUS ARE DELIBERATELY NOT LOCKED TOGETHER: the owner asked for
+   * isolate to zoom, not for zoom to become unavailable while isolated.
+   *
+   * The readout is rounded where it is displayed rather than here, because a
+   * drill-in lands on whatever factor makes the focused cells fill the frame and
+   * rounding the STATE would move the picture off the thing it just framed.
+   */
   const setZoomTo = useCallback(
     (z: number) => {
+      stopEasing();
       const next = Math.min(ZOOM_MAX, Math.max(1, z));
       setZoom(next);
       if (next === 1) setCentre(null);
       setAnnounce(
         next === 1
           ? "zoom 1× — the whole figure"
-          : `zoom ${next}× — hold Space and drag to pan`
+          : `zoom ${Math.round(next * 10) / 10}× — hold Space and drag to pan`
       );
     },
-    []
+    [stopEasing]
   );
 
   /**
@@ -3140,13 +3710,16 @@ export default function DrawPage() {
    */
   const onPan = useCallback(
     (dx: number, dy: number) => {
+      // A hand on the plate outranks a travel that is still arriving; without
+      // this the tween would keep writing the centre out from under the drag.
+      stopEasing();
       panned.current = true;
       setCentre((c) => ({
         x: (c?.x ?? canvas.geom.width / 2) - dx,
         y: (c?.y ?? canvas.geom.height / 2) - dy,
       }));
     },
-    [canvas]
+    [canvas, stopEasing]
   );
 
   /**
@@ -3218,7 +3791,17 @@ export default function DrawPage() {
           setAnnounce(`${shapeTool} cancelled`);
           return;
         }
-        dropProposal();
+        if (proposal.length > 0) {
+          dropProposal();
+          return;
+        }
+        // LAST, and it is the outermost thing there is. Escape unwinds from the
+        // inside out — menu, confirm, preview, anchored drag, proposal — and the
+        // focus is the only one of them that is not a transient: it is where you
+        // ARE rather than something you are part-way through, so nothing should
+        // be able to reach it while anything else is standing. One level per
+        // press, exactly as the double-tap does; see `focus.exit`.
+        drillOut();
         return;
       }
 
@@ -3348,6 +3931,31 @@ export default function DrawPage() {
         pickRelief(!reliefOn);
         return;
       }
+      // DRILL IN and DRILL OUT, on the two letters nearest their own words.
+      //
+      // The keyboard path exists because every other control that narrows what
+      // the brush may touch — the three scope buttons, the four arm buttons — is
+      // a real button with a real label, and a drill-in reachable only by
+      // double-tapping the canvas would be the first one here that a keyboard
+      // cannot work. The breadcrumb is the other half: it is the way OUT that a
+      // Tab key can find, and it names every level rather than only the last.
+      //
+      // NOT LISTED IN THE HELP PANEL, and that is a gap rather than a decision:
+      // `lib/shortcuts.ts` is the panel's source and it is outside the file lane
+      // this change was made under. The two keys are named in the breadcrumb's
+      // own title text and in the sentence the focus announces, so they are
+      // discoverable from the control they belong to; they should be added to
+      // `SHORTCUTS` by whoever next opens that file.
+      if (k === "i") {
+        drillIn();
+        return;
+      }
+      if (k === "o") {
+        if (focus.length === 0) {
+          setAnnounce("the whole plate — there is nothing to step out of");
+        } else drillOut();
+        return;
+      }
       // The two previews. P is the transport — open it, and then play/pause it
       // — and M is the scrub. Opening either while the other stands moves the
       // ONE preview across rather than raising a second one.
@@ -3437,6 +4045,10 @@ export default function DrawPage() {
     doUndo,
     doRedo,
     dropProposal,
+    proposal,
+    focus,
+    drillIn,
+    drillOut,
     helpOpen,
     closeHelp,
     openHelp,
@@ -4767,15 +5379,21 @@ export default function DrawPage() {
           <section className={styles.section}>
             <div className={styles.sectionHead}>
               <h2 className={styles.sectionTitle}>Brush symmetry</h2>
+              {/* The group the brush IS under, which is `effScope` and the
+                  focused arm — not the scope BUTTON. Drilling into a sector
+                  changes the group without the button moving, and a readout
+                  that named the button would say D₆ over a plate whose brush is
+                  one sector's D₃. Also shorter than what stood here, because
+                  the sector view no longer needs a branch of its own: it forces
+                  `effScope` to `sector`, so it falls out of the same three
+                  cases. */}
               <span className={styles.sectionMeta}>
-                {viewMode === "sector"
-                  ? isolation === null
-                    ? `sector ${sector} · D₃`
-                    : `arm ${isolation} · ⟨m_${isolation}⟩`
-                  : scope === "hexagon"
+                {isolation !== null
+                  ? `arm ${isolation} · ⟨m_${isolation}⟩`
+                  : effScope === "hexagon"
                   ? "D₆ subgroups"
-                  : scope === "sector"
-                  ? `sector ${sector} · D₃`
+                  : effScope === "sector"
+                  ? `sector ${focusedSector(focus) ?? sector} · D₃`
                   : "C₆ × D₃"}
               </span>
             </div>
@@ -4855,13 +5473,25 @@ export default function DrawPage() {
                     </button>
                   ))}
                 </div>
+                {/* The hint describes `effScope` for the same reason the meta
+                    does. The one case worth saying out loud is the new one: the
+                    button says hexagon and the FOCUS has made the brush local,
+                    which is a state the button cannot show. */}
+                {scope === "hexagon" && effScope === "sector" && (
+                  <p className={styles.hint}>
+                    <b>Drilled into sector {focusedSector(focus)}.</b> The scope
+                    button still says <i>hexagon</i>, and it will be D₆ again the
+                    moment you step back out — but inside a sector the brush is
+                    that sector&rsquo;s own D₃. Press <b>O</b> or Escape to leave.
+                  </p>
+                )}
                 <p className={styles.hint}>
-                  {scope === "hexagon" ? (
+                  {effScope === "hexagon" ? (
                     <>
                       <b>D₆ — the whole plate.</b> Its three spine mirrors each
                       reflect <i>two opposite sectors at once</i>.
                     </>
-                  ) : scope === "sector" ? (
+                  ) : effScope === "sector" ? (
                     <>
                       <b>The sector&rsquo;s own D₃</b>, in sector{" "}
                       <b>{sector}</b> alone — three medians and a 120° turn
@@ -5429,9 +6059,16 @@ export default function DrawPage() {
                       onClick={() => setZoomTo(1)}
                       disabled={zoom === 1}
                       title="fit the whole figure"
-                      aria-label={`zoom ${zoom} times — click to fit the whole figure`}
+                      // ROUNDED FOR DISPLAY ONLY. The stepper's own factors are
+                      // powers of two and print exactly; a drill-in lands on
+                      // whatever makes the focused cells fill the frame, and
+                      // "3.4641016151377544×" is a number nobody asked to read.
+                      // The state itself is left alone — see `setZoomTo`.
+                      aria-label={`zoom ${
+                        Math.round(zoom * 10) / 10
+                      } times — click to fit the whole figure`}
                     >
-                      {zoom}×
+                      {Math.round(zoom * 10) / 10}×
                     </button>
                     <button
                       type="button"
@@ -5971,6 +6608,72 @@ export default function DrawPage() {
               </p>
             )}
 
+            {/* WHERE YOU ARE, and every way back out.
+                Shown only when the path is non-empty, because at the root it
+                would be one crumb saying "the whole plate" beside a picture of
+                the whole plate.
+
+                PER-CRUMB, not `focus.pathLabel`. That function joins the whole
+                path into one string with a separator, and each level has to be
+                its own button here — `exitTo(focus, k)` per crumb is what makes
+                "leave this arm but stay in this sector" reachable in one click
+                from three levels down, which is the same thing `focus.exit`'s
+                header argues the double-tap must not give up. `pathLabel` is
+                still used, for the sentence the live region says, so the two
+                cannot come to describe different places.
+
+                IN NORMAL FLOW, above the plate, rather than floated on the
+                artwork beside undo. A floating strip over a drawing surface
+                needs the whole `pointer-events` dance the HUD carries, and it
+                would sit over the very cells a person is about to double-tap to
+                get back out. */}
+            {focus.length > 0 && (
+              <nav
+                className={styles.crumbs}
+                aria-label={`focus — ${pathLabel(focus)}`}
+              >
+                <button
+                  type="button"
+                  className={styles.crumb}
+                  aria-label="leave the focus — back to the whole plate, nothing dimmed"
+                  title="back to the whole plate (Escape steps out one level)"
+                  onClick={() => applyFocus(ROOT)}
+                >
+                  plate
+                </button>
+                {focus.map((step, k) => (
+                  <span key={`${step.kind}-${step.id}-${k}`} className={styles.crumbRow}>
+                    <span className={styles.crumbSep} aria-hidden="true">
+                      ›
+                    </span>
+                    <button
+                      type="button"
+                      className={styles.crumb}
+                      // The DEEPEST crumb is where you already are. It stays a
+                      // real button rather than becoming text, because `exitTo`
+                      // at the full depth is the identity and a control that
+                      // quietly turns into a label as you drill in is a control
+                      // whose Tab order changes shape under the hand.
+                      aria-current={k === focus.length - 1 ? "true" : undefined}
+                      aria-label={`focus on ${crumbLabel(step)} — ${
+                        k === focus.length - 1
+                          ? "where you are now"
+                          : "step back out to here"
+                      }`}
+                      title={
+                        k === focus.length - 1
+                          ? "where you are — press O or Escape to step out, I to go further in"
+                          : `back out to ${crumbLabel(step)}`
+                      }
+                      onClick={() => applyFocus(exitTo(focus, k + 1))}
+                    >
+                      {crumbLabel(step)}
+                    </button>
+                  </span>
+                ))}
+              </nav>
+            )}
+
             <div
               className={styles.canvasHold}
               data-tool={tool}
@@ -5999,8 +6702,15 @@ export default function DrawPage() {
                 shape={shapeTool}
                 panning={spaceHeld}
                 view={view}
+                // NOT dropped while a preview stands, unlike the ghost and the
+                // cursor beside it. Those are promises about a plate that is not
+                // on screen; this is where the hand IS, and it is as true of a
+                // preview as of the live drawing — the preview is the same
+                // addresses, reconstructed.
+                focused={focusHeld}
                 className={styles.canvas}
                 candidateClass={styles.marching}
+                dimClass={styles.dimFade}
                 label={`${
                   rewind === null
                     ? "drawing plate"
@@ -6025,10 +6735,23 @@ export default function DrawPage() {
                 onShapeDrag={
                   previewing
                     ? NOTHING
-                    : (anchor, at, alt) => setShapeDrag({ anchor, at, alt })
+                    : (anchor, at, alt) => {
+                        // The anchor is a seed like any other, so the focus
+                        // refuses it in the same place and on the same rule —
+                        // an anchored figure may not START outside the thing you
+                        // are inside. Where it REACHES is `clipToRegion`'s
+                        // business and it already confines a shape to the
+                        // anchor's own region of the symmetry surface.
+                        if (!inFocus(anchor)) return;
+                        setShapeDrag({ anchor, at, alt });
+                      }
                 }
                 onShapeEnd={previewing ? NOTHING : commitShape}
                 onPan={onPan}
+                // NOT gated on `previewing`: drilling in changes nothing about
+                // the drawing, and a person standing in a replay is exactly the
+                // person who wants to look closely at one arm of it.
+                onFocusTap={onFocusTap}
               />
               {/* The canvas HUD: UNDO, REDO, and the flag that says what the
                   brush is — top left, ON the artwork, in one row.
