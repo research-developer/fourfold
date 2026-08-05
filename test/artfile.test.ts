@@ -480,6 +480,100 @@ describe("a layer's gesture fields", () => {
     expect(JSON.stringify({ mode: NaN })).toBe('{"mode":null}');
   });
 
+  /**
+   * THREE FIELDS, THREE BOUNDS, and they were one.
+   *
+   * All three used to be checked against `MAX_LAYERS` — 8192, the layer-NODE
+   * budget. That is the right bound for `reveal`, which is an animation step and
+   * has one per gesture layer, and it is not a bound on the other two at all. It
+   * admitted `mode: 0`, a symmetry group that does not exist and one that
+   * `provenance.unmarked` cannot find, because that query tests `mode !==
+   * undefined`: the layer would count as MARKED and appear in a census as a
+   * `modes` bucket of zero. And it admitted an orbit of eight thousand cells on a
+   * canvas of twenty-four.
+   */
+  it("bounds `mode` by the canvas's own group, not by the layer budget", () => {
+    // Depth 1 hexagon: 24 cells, D₆, so 1, 2, 3, 6 and 12 and nothing else.
+    for (const mode of [1, 2, 3, 6, 12]) {
+      expect(extractArt(oneLayer({ mode }))?.comp?.layers[0].mode, `mode ${mode}`).toBe(
+        mode
+      );
+    }
+    for (const mode of [0, 4, 5, 7, 11, 13, 24, 384]) {
+      expect(extractArt(oneLayer({ mode })), `mode ${mode}`).toBeNull();
+    }
+  });
+
+  it("refuses mode 12 on a TRIANGLE, whose group is D₃ and has no such subgroup", () => {
+    // The same rule `validateView` applies to a sector on a triangle: a file
+    // claiming something its own canvas cannot have is refused whole rather than
+    // half-read. The sector scopes offer a SUBSET of the hexagon's modes, so one
+    // list per canvas covers every scope a file could have been drawn in.
+    const onTriangle = (mode: number): string =>
+      encodeArt({
+        version: ART_VERSION,
+        canvas: "triangle",
+        depth: 1,
+        convention: "apex",
+        cells: [[0, "#d4a017"]],
+        comp: { layers: [{ id: "g", mode }] } as ArtPayload["comp"],
+      });
+    for (const mode of [1, 2, 3, 6]) {
+      expect(extractArt(onTriangle(mode))?.comp?.layers[0].mode, `mode ${mode}`).toBe(mode);
+    }
+    expect(extractArt(onTriangle(12))).toBeNull();
+    // ...and the same file on the hexagon is fine, so the refusal is about the
+    // canvas rather than about the number.
+    expect(extractArt(oneLayer({ mode: 12 }))?.comp?.layers[0].mode).toBe(12);
+  });
+
+  it("bounds `orbit` by the cells the canvas HAS, and refuses an empty one", () => {
+    const n = cellCount("hexagon", 1);
+    expect(n).toBe(24);
+    expect(extractArt(oneLayer({ orbit: 1 }))?.comp?.layers[0].orbit).toBe(1);
+    expect(extractArt(oneLayer({ orbit: n }))?.comp?.layers[0].orbit).toBe(n);
+    // An orbit is the image of a seed under a subgroup and always contains the
+    // seed, so the smallest true one is the stabilised orbit of size 1. Zero is
+    // not a short orbit, it is an absent one — and `shortOrbits` would have
+    // reported it as the shortest of all.
+    expect(extractArt(oneLayer({ orbit: 0 }))).toBeNull();
+    expect(extractArt(oneLayer({ orbit: n + 1 }))).toBeNull();
+    expect(extractArt(oneLayer({ orbit: 8000 }))).toBeNull();
+  });
+
+  it("still keeps `mode` and `orbit` independent — the stabilised seed is ordinary", () => {
+    // The bounds are per FIELD. Nothing cross-checks one against the other: a
+    // 6-fold brush on a mirror line lays three cells, which is the case a
+    // symmetry-minded reader is most interested in.
+    expect(extractArt(oneLayer({ mode: 6, orbit: 3 }))?.comp?.layers[0].orbit).toBe(3);
+    expect(extractArt(oneLayer({ mode: 1, orbit: 24 }))?.comp?.layers[0].orbit).toBe(24);
+    expect(extractArt(oneLayer({ mode: 12, orbit: 1 }))?.comp?.layers[0].mode).toBe(12);
+    // And `orbit` alone, or `mode` alone, is a legal statement.
+    expect(extractArt(oneLayer({ orbit: 6 }))?.comp?.layers[0].mode).toBeUndefined();
+    expect(extractArt(oneLayer({ mode: 6 }))?.comp?.layers[0].orbit).toBeUndefined();
+  });
+
+  it("leaves `reveal` bounded by the layer budget, because that is what it counts", () => {
+    // One reveal step per gesture layer, so the node cap is its cap. Deliberately
+    // NOT narrowed to the canvas: an animated file legitimately has thousands of
+    // steps and none of them is a cell index.
+    expect(extractArt(oneLayer({ reveal: 0 }))?.comp?.layers[0].reveal).toBe(0);
+    expect(extractArt(oneLayer({ reveal: MAX_LAYERS }))?.comp?.layers[0].reveal).toBe(
+      MAX_LAYERS
+    );
+    expect(extractArt(oneLayer({ reveal: MAX_LAYERS + 1 }))).toBeNull();
+  });
+
+  it("refuses the WHOLE payload for a bad field on a nested layer", () => {
+    // Whole-file rejection, not a half-read tree: the outer layer is perfectly
+    // legal and goes with it.
+    expect(
+      extractArt(
+        withComp({ layers: [{ id: "outer", children: [{ id: "inner", mode: 0 }] }] })
+      )
+    ).toBeNull();
+  });
+
   it("carries the timing block, so an imported file still plays", () => {
     const back = extractArt(
       withComp({ anim: { stepMs: 250, holdMs: 1800, fadeMs: 90, steps: 6 }, layers: [] })

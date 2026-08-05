@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ALT_REST,
+  altDeclined,
   altDown,
   altLost,
   altUp,
@@ -178,6 +179,56 @@ describe("the crossing guard: a shape drag cannot get both meanings", () => {
   it("asks nothing of a pointer event that does not report Option", () => {
     for (const s of [ALT_REST, altDown(ALT_REST, FREE), altDown(ALT_REST, PRESSED)]) {
       expect(shapeAlt(s, false)).toBe(false);
+    }
+  });
+});
+
+/**
+ * A DECLINE IS A COUNTED PRECONDITION, NOT A SILENCE.
+ *
+ * `altDown` refuses two ways and both come out as `"modifier"`, so the shape of
+ * the return value cannot tell them apart — which is how the `brushOff` refusal
+ * came to say nothing at all. The two are not alike: the `pointerDown` refusal
+ * really IS the shape modifier and the figure changing under the finger is its
+ * announcement, whereas with a preview, the help panel or the save menu over the
+ * plate there is no figure and no effect, and the only evidence the key was
+ * received is a sentence. This is the predicate that tells them apart; the
+ * sentence itself is `page.tsx`'s and cannot be reached without a DOM.
+ */
+describe("the refusal that has to be said out loud", () => {
+  it("is the brush-off refusal and not the pointer one", () => {
+    expect(altDeclined(ALT_REST, { pointerDown: false, brushOff: true })).toBe(true);
+    expect(altDeclined(ALT_REST, { pointerDown: true, brushOff: true })).toBe(true);
+    // A press already down is the shape modifier doing its job, not a decline.
+    expect(altDeclined(ALT_REST, PRESSED)).toBe(false);
+    expect(altDeclined(ALT_REST, FREE)).toBe(false);
+  });
+
+  it("is false for a key REPEAT, on the same latch `altDown` uses", () => {
+    // A held modifier repeats on some platforms and every repeat is a fresh
+    // keydown. A decline announced sixty times is a decline nobody can read.
+    let s = altDown(ALT_REST, { pointerDown: false, brushOff: true });
+    expect(s.hold).toBe("modifier");
+    for (let k = 0; k < 3; k++) {
+      expect(altDeclined(s, { pointerDown: false, brushOff: true })).toBe(false);
+      s = altDown(s, { pointerDown: false, brushOff: true });
+    }
+    // The hold is still the inert one it latched as.
+    expect(s.hold).toBe("modifier");
+    expect(s.erasing).toBe(false);
+  });
+
+  it("agrees with `altDown` about every case: it is true exactly when the eraser was refused with nothing to show", () => {
+    for (const pointerDown of [false, true]) {
+      for (const brushOff of [false, true]) {
+        const ctx = { pointerDown, brushOff };
+        const next = altDown(ALT_REST, ctx);
+        // Declining implies the eraser did not arm...
+        if (altDeclined(ALT_REST, ctx)) expect(next.erasing).toBe(false);
+        // ...and the one refusal it does NOT name is the one with a visible
+        // effect of its own.
+        if (!next.erasing && !altDeclined(ALT_REST, ctx)) expect(pointerDown).toBe(true);
+      }
     }
   });
 });

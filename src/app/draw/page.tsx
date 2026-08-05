@@ -129,6 +129,7 @@ import {
 import {
   ALT_REST,
   SHORTCUTS,
+  altDeclined,
   altDown,
   altLost,
   altUp,
@@ -177,6 +178,7 @@ import {
   find as findLayer,
   flatten as flattenComposition,
   fromPlate,
+  gestureOf,
   graft,
   layerId,
   newSession,
@@ -195,6 +197,7 @@ import {
   undo as undoSession,
   type Composition,
   type Layer,
+  type LayerGesture,
   type LayerId,
   type Outcome,
   type Session,
@@ -1070,6 +1073,24 @@ export default function DrawPage() {
    * disagree.
    */
   const [proposal, setProposal] = useState<Proposal>(EMPTY_PROPOSAL);
+  /**
+   * The proposal a commit was REFUSED for, or `null`.
+   *
+   * Holds the proposal ITSELF rather than a flag or a sentence, and that is what
+   * makes it self-clearing. A refusal is only worth saying while it is still true,
+   * and it stops being true the instant the proposal changes — one more seed
+   * gathered, the whole thing dropped, a focus change that cleared it, a commit
+   * that finally landed. `proposeSeed` hands back the SAME array when nothing
+   * changed and a new one when something did, so `blocked === proposal` is
+   * exactly the question "is the standing proposal the one that was refused", and
+   * every one of the dozen places that write `setProposal` clears this without
+   * knowing it exists. A boolean would have needed all of them to remember.
+   *
+   * The sentence itself stays in `announce`, where `paintAt` and `endStroke`
+   * already put it in the layer model's own words. This says only which proposal
+   * it was about. See `said`.
+   */
+  const [blocked, setBlocked] = useState<Proposal | null>(null);
 
   /**
    * The drawing: a TREE of address plates, and the journal of what was done to
@@ -1222,11 +1243,30 @@ export default function DrawPage() {
    * from the board's four refs, and sees presses that begin outside the canvas
    * entirely.
    *
-   * A `Set` of pointer ids rather than a count, so a lost `pointerup` for one
-   * finger cannot leave a permanent phantom press behind on a touchscreen. The
-   * board already leans on window-level `pointerup`/`pointercancel` for exactly
-   * this reason — "a gesture can finish anywhere" — so this adds no assumption
-   * that the drawing surface was not already making.
+   * ── A `Set`, and what that does NOT buy ────────────────────────────────
+   *
+   * This comment used to claim that a `Set` of ids "cannot leave a permanent
+   * phantom press behind on a touchscreen", and on a touchscreen that is exactly
+   * backwards. Touch pointer ids are minted per contact and a released one is not
+   * handed out again, so an id whose `pointerup` never arrives is in this set for
+   * the life of the page — and `size > 0` then reads "a pointer is down" forever,
+   * which latches the momentary eraser OFF for the whole session. That is the
+   * one failure the discriminator can have, and it is the destructive-tool one in
+   * the safe direction, which is why it went unnoticed.
+   *
+   * The `Set` is still the right structure, for reasons the old comment did not
+   * give. It is IDEMPOTENT: a repeated `pointerdown` for one id cannot count
+   * twice, and a `pointerup` for a pointer whose press we never saw cannot take
+   * the census below zero — a counter does both. And a MOUSE keeps one id for the
+   * life of the page, so for the mouse a `Set` heals itself: press, lose the
+   * release, press again, release, and the id is gone. A counter would sit at one
+   * forever after the same sequence. A counter fixes nothing here; what fixes it
+   * is `clear` on the two events that mean "the presses this page can see are no
+   * longer this page's business", which the census effect below listens for.
+   *
+   * The board already leans on window-level `pointerup`/`pointercancel` — "a
+   * gesture can finish anywhere" — so this adds no assumption that the drawing
+   * surface was not already making.
    */
   const pointers = useRef<Set<number>>(new Set());
   /**
@@ -1306,6 +1346,18 @@ export default function DrawPage() {
    * finished gesture is journalled under.
    */
   const paintingInto = useRef<LayerId | null>(null);
+  /**
+   * The gesture that layer carried BEFORE this stroke started, for the rung.
+   *
+   * `layers.applyMove` strips a layer's `mode`/`orbit` when it is painted into,
+   * because those two numbers describe the cells that were there and painting
+   * changes them. Undo has to write them back, so the rung carries them — and it
+   * has to be the value from before the FIRST application, because by the time
+   * `endStroke` builds the rung the live `paintInto` calls have already stripped
+   * it. Captured beside `paintingInto` and cleared with it, so the two can only
+   * ever describe the same gesture.
+   */
+  const paintingWas = useRef<LayerGesture>({});
   /**
    * Whether this gesture has already said why it is refusing.
    *
@@ -2714,6 +2766,12 @@ export default function DrawPage() {
       }
       // The gesture belongs to the layer it STARTED on, and `endStroke`
       // journals against that id rather than against wherever it ended.
+      //
+      // The layer's OWN recorded gesture is taken at the same moment, and only
+      // at the first application: `paintInto` strips it, so every later
+      // application would read the stripped value and the rung would have nothing
+      // for undo to write back. Read BEFORE the paint, for the same reason.
+      if (paintingInto.current === null) paintingWas.current = gestureOf(into.layer);
       paintingInto.current = into.layer.id;
       compRef.current = paintInto(compRef.current, into, edits);
       pending.current = mergeEdits(pending.current, edits);
@@ -2736,23 +2794,38 @@ export default function DrawPage() {
     ]
   );
 
+  /**
+   * Close the gesture, and say whether it JOURNALLED.
+   *
+   * The answer is the whole reason this returns anything. Three of the four ways
+   * out of here push no rung — a refusal the layer model already announced, a
+   * gesture whose edits were all no-ops, and a gesture that never named a layer
+   * — and from the outside they used to be indistinguishable from a commit.
+   * `commitProposal` is the caller that cannot live with that: it must not throw
+   * away N gathered seeds on the strength of a call that did nothing. `true`
+   * means one rung was pushed and one undo takes it back; `false` means the plate
+   * is exactly as it was and there is nothing to undo. Every path says which,
+   * because a caller that guessed would be guessing about the journal.
+   */
   const endStroke = useCallback(
-    (how: "stroke" | "commit" = "stroke") => {
+    (how: "stroke" | "commit" = "stroke"): boolean => {
       const edits = pending.current;
       const used = pendingEvents.current;
       const groups = pendingGroups.current;
       const into = paintingInto.current;
+      const was = paintingWas.current;
       const refused = refusedRef.current;
       pending.current = [];
       pendingEvents.current = 0;
       pendingGroups.current = [];
       paintingInto.current = null;
+      paintingWas.current = {};
       refusedRef.current = false;
       setLiveEvents(0);
       // The refusal has already been said, in the layer model's own words. A
       // second sentence here would either repeat it or, worse, contradict it
       // with "nothing changed" — which is true and useless.
-      if (refused && edits.length === 0) return;
+      if (refused && edits.length === 0) return false;
       if (edits.length === 0 || into === null) {
         // Not silence. A gesture that changed nothing is the most confusing
         // thing an adjustment brush can do, and the reason is always the same
@@ -2762,7 +2835,7 @@ export default function DrawPage() {
             ? "nothing adjusted — the brush found no paint under it"
             : "nothing changed"
         );
-        return;
+        return false;
       }
       const mark: StrokeMark<Address> | undefined =
         groups.length === 0 ? undefined : { mode, groups };
@@ -2778,7 +2851,7 @@ export default function DrawPage() {
       setSession((s) =>
         journalAct(
           { ...s, composition: compRef.current },
-          [{ kind: "paint", layer: into, stroke }],
+          [{ kind: "paint", layer: into, stroke, was }],
           `painted ${edits.length} cells on ${name}`,
           used
         )
@@ -2794,6 +2867,7 @@ export default function DrawPage() {
           flattenComposition(compRef.current, book).size
         } on the plate`
       );
+      return true;
     },
     [tool, adjustName, mode, band, isolation, book]
   );
@@ -3101,10 +3175,13 @@ export default function DrawPage() {
       // `journalAct` APPLIES as well as records, and the effect on `compRef`
       // puts the ref back in step on the next render — so there is exactly one
       // place the composition is written and no chance of the two disagreeing.
+      // `was` is read here rather than captured earlier because this route
+      // applies nothing before journalling: the layer still carries whatever
+      // gesture the paint is about to invalidate.
       setSession((s) =>
         journalAct(
           { ...s, composition: compRef.current },
-          [{ kind: "paint", layer: into.id, stroke }],
+          [{ kind: "paint", layer: into.id, stroke, was: gestureOf(into) }],
           said(edits.length),
           spent
         )
@@ -3326,6 +3403,29 @@ export default function DrawPage() {
   );
 
   /**
+   * A commit was asked for and laid nothing. Say why, and keep the work.
+   *
+   * ONE DOOR for every way that can happen — a locked target, a brush that would
+   * change no cell, a tap the browser took away — so the sentence and the "still
+   * standing" clause can never come apart. The proposal is deliberately NOT
+   * cleared here: that is the whole of the fix, and `commitProposal`'s header
+   * says what clearing it used to cost.
+   */
+  const blockProposal = useCallback(
+    (why: string) => {
+      // There is no such thing as a blocked EMPTY proposal, and the guard is not
+      // only tidiness: `EMPTY_PROPOSAL` is one shared constant, so storing it
+      // here would make `blocked === proposal` true for every empty proposal
+      // afterwards — the identity trick the whole arrangement rests on, defeated
+      // by the one value that is not unique.
+      if (proposal.length === 0) return;
+      setBlocked(proposal);
+      setAnnounce(why);
+    },
+    [proposal]
+  );
+
+  /**
    * The whole proposal, laid down as ONE RUNG OF THE JOURNAL.
    *
    * This is the decision the whole feature turns on, so it is worth saying
@@ -3351,13 +3451,71 @@ export default function DrawPage() {
    * or the edits are all no-ops, and `endStroke` declines to journal a gesture
    * with no edits at all. So a proposal entirely over cells the brush cannot
    * touch commits nothing and says so, rather than pushing an empty rung.
+   *
+   * ── A COMMIT THAT LAID NOTHING DOES NOT SPEND THE PROPOSAL ──────────────
+   *
+   * This used to clear the proposal unconditionally, and on a locked target layer
+   * that was the worst outcome available: `paintAt` refuses all N seeds, the live
+   * region says "L2 is locked", and the N gathered applications are gone — with
+   * no rung, so ⌘Z cannot bring them back either. The user unlocks the layer and
+   * finds there is nothing left to commit.
+   *
+   * So the proposal is spent ONLY on the strength of `endStroke`'s answer, and
+   * `dropProposal`'s discipline applies to every other outcome: say plainly that
+   * the plate is unchanged and that the work is still standing, rather than
+   * leaving the user to infer it from a sentence about a lock. `blockProposal`
+   * is that sentence; see `said` for why it cannot simply go into `announce`.
+   *
+   * ── AND IT IS GATED THE SAME WAY THE BUTTON IS ─────────────────────────
+   *
+   * `proposalCommits === 0` disables the COMMIT button — an adjustment proposal
+   * over bare tiling really would change nothing — but the button is one of three
+   * doors into this function. The other two are a tap on the ghost and Enter on a
+   * held seed, and until now neither was gated at all, so the gesture routes did
+   * something the visible control refused to do: spend the proposal on a commit
+   * that laid nothing. The gate is here, at the one place all three arrive, which
+   * is also the only place it cannot be forgotten by a fourth caller.
    */
   const commitProposal = useCallback(() => {
     if (proposal.length === 0 || previewing) return;
+    // The same number `proposalCommits` reports and the button is disabled on,
+    // recomputed rather than shared because that memo is declared below this
+    // callback. It is a union over a handful of orbits, once per commit.
+    if (unionCells(proposalSpecs.map((s) => s.cells)).length === 0) {
+      blockProposal(
+        tool === "adjust"
+          ? "nothing to commit — the brush found no paint under any of these applications"
+          : "nothing to commit — the brush would change no cell here"
+      );
+      return;
+    }
     for (const seed of proposal) paintAt(seed);
-    endStroke("commit");
-    setProposal(EMPTY_PROPOSAL);
-  }, [proposal, previewing, paintAt, endStroke]);
+    if (endStroke("commit")) {
+      setProposal(EMPTY_PROPOSAL);
+      setBlocked(null);
+      return;
+    }
+    // `endStroke` and `paintAt` have already said WHY, in the layer model's own
+    // words for a refusal and in the brush's for a gesture that moved nothing.
+    // This adds only the half they cannot know: the proposal is still there.
+    setBlocked(proposal);
+  }, [proposal, proposalSpecs, previewing, tool, paintAt, endStroke, blockProposal]);
+
+  /**
+   * The browser took the commit tap away before the finger came up.
+   *
+   * `DrawBoard.proposeRelease` lists the four ordinary ways that happens — palm
+   * rejection, an OS edge gesture, a second contact starting a pinch, a
+   * long-press menu — and every one of them is a thing a hand does on a phone,
+   * which is the platform propose mode exists for. The proposal is untouched, so
+   * the only failure available here is silence: a tap on the ghost that lays
+   * nothing and says nothing reads as a control that stopped working.
+   */
+  const commitCancelled = useCallback(() => {
+    blockProposal(
+      "the commit tap was cancelled — the browser took the pointer before your finger came up"
+    );
+  }, [blockProposal]);
 
   /**
    * Drop it. No plate change, no rung, nothing to undo — which is the sentence
@@ -3849,10 +4007,19 @@ export default function DrawPage() {
    * The one writer of the Alt state, ref and render alike.
    *
    * Announces only on the edge that matters — whether the eraser is in force —
-   * so a hold that latches "modifier" says nothing at all. That is right: the
-   * shape modifier has a visible effect on the figure under the finger and has
-   * never announced itself, whereas arming a destructive brush from a key with
-   * no on-screen control is exactly the thing a live region is for.
+   * so a hold that latches "modifier" says nothing HERE. That is right for the
+   * modifier it is named for: the shape modifier has a visible effect on the
+   * figure under the finger and has never announced itself, whereas arming a
+   * destructive brush from a key with no on-screen control is exactly the thing a
+   * live region is for.
+   *
+   * It is NOT right for the inert `brushOff` hold, which also latches "modifier"
+   * and has no figure and no effect to be its own announcement. That decline is
+   * said at the keydown, where the reason is still in hand; `shortcuts.
+   * altDeclined` is the predicate and the note there is the argument. This edge
+   * test is deliberately left alone rather than taught about a third case: it
+   * asks one question about a destructive tool and answers it the same way from
+   * everywhere, which is the property the whole arrangement rests on.
    */
   const applyAlt = useCallback(
     (next: AltState) => {
@@ -3890,6 +4057,22 @@ export default function DrawPage() {
    * BEGIN UNLESS THE POINTER EVENT ITSELF REPORTS OPTION HELD. Without it the
    * disarm would still be correct but a render late, because `paintAt` reads
    * `tool` from the closure it was built with, and this press would erase.
+   *
+   * THE CENSUS OWNS ITS OWN RECOVERY, in the same effect and not in the keyboard
+   * one, because a census that depends on somebody else's listener for its only
+   * way out of a wrong answer is a census with a bug waiting in the next edit.
+   * Press and hold on a rail button, Alt-Tab away, let go over there: the
+   * `pointerup` is delivered to the other window and never to this one, the id
+   * stays in the set, and every later `altDown` reads "a pointer is already down"
+   * and refuses to arm the momentary eraser — for the rest of the session. The
+   * hold that leaks is exactly the hold `blur` fires for, so `blur` is where the
+   * set is emptied, with `visibilitychange` behind it for the same reason
+   * `applyAlt(altLost())` has both: a page can be hidden without its window
+   * losing focus. Emptying is safe rather than merely convenient — a press that
+   * really is still down will announce itself again on its next `pointermove`
+   * only if it is on the canvas, but its `pointerup` still arrives and
+   * `delete` of an absent id is a no-op, so the worst case is one keydown read as
+   * "nothing pressed" while the page is not even in front of the user.
    */
   useEffect(() => {
     const down = (e: PointerEvent) => {
@@ -3905,13 +4088,23 @@ export default function DrawPage() {
     const up = (e: PointerEvent) => {
       pointers.current.delete(e.pointerId);
     };
+    const forget = () => {
+      pointers.current.clear();
+    };
+    const onHidden = () => {
+      if (document.visibilityState === "hidden") forget();
+    };
     window.addEventListener("pointerdown", down, true);
     window.addEventListener("pointerup", up, true);
     window.addEventListener("pointercancel", up, true);
+    window.addEventListener("blur", forget);
+    document.addEventListener("visibilitychange", onHidden);
     return () => {
       window.removeEventListener("pointerdown", down, true);
       window.removeEventListener("pointerup", up, true);
       window.removeEventListener("pointercancel", up, true);
+      window.removeEventListener("blur", forget);
+      document.removeEventListener("visibilitychange", onHidden);
     };
   }, [applyAlt]);
 
@@ -4026,13 +4219,34 @@ export default function DrawPage() {
       // `brushOff` covers the three states in which the plate is not editable.
       // A hold latched there stays inert for its whole life rather than going
       // live the moment the panel closes under a finger that never let go.
+      //
+      // AND IT SAYS SO. `applyAlt` announces on the `erasing` edge, and this
+      // decline has none — it substitutes the shape modifier, so nothing changes
+      // and nothing was said. That is right for the `pointerDown` decline, where
+      // the figure under the finger is the announcement, and wrong here, where
+      // there is no figure and no visible effect at all: a key that does nothing
+      // and says nothing is indistinguishable from a key that was not received.
+      // `altDeclined` carries the distinction; the sentence names WHICH of the
+      // three, because "close it and try again" is only actionable if the user
+      // knows what to close.
       if (e.key === "Alt") {
-        applyAlt(
-          altDown(altRef.current, {
-            pointerDown: pointers.current.size > 0,
-            brushOff: previewing || helpOpen || saveOpen,
-          })
-        );
+        const ctx = {
+          pointerDown: pointers.current.size > 0,
+          brushOff: previewing || helpOpen || saveOpen,
+        };
+        const declined = altDeclined(altRef.current, ctx);
+        applyAlt(altDown(altRef.current, ctx));
+        if (declined) {
+          setAnnounce(
+            `erase not armed — ${
+              previewing
+                ? "a preview is standing"
+                : helpOpen
+                ? "the help panel is open"
+                : "the save menu is open"
+            }, so the plate cannot be edited. Release Option and press it again once the plate is back`
+          );
+        }
         return;
       }
       // Option is the shape modifier, read off the pointer event, and — since
@@ -5418,19 +5632,35 @@ export default function DrawPage() {
    * now two different numbers and the first one is the one that decides how many
    * steps of the progression the commit will spend. It also says "one gesture",
    * which is the promise the commit has to keep: one rung, one undo.
+   *
+   * ── A REFUSED COMMIT HAS TO GET PAST THE STANDING SENTENCE ─────────────
+   *
+   * The standing branch MASKS `announce`, which is right while nothing has gone
+   * wrong and wrong the moment something has: a commit that was refused says why
+   * through `announce` — "L2 is locked", in the layer model's own words — and now
+   * that a refused commit keeps its proposal, that sentence would be spoken to
+   * nobody. So a refusal that is still about THIS proposal leads, and the
+   * standing sentence follows it unchanged rather than being replaced, because
+   * what stands and how to act on it did not stop being true. `blocked` carries
+   * which proposal, and clears itself when the proposal moves.
    */
+  const standingSaid = !standing
+    ? ""
+    : `${proposalSpecs.length} application${
+        proposalSpecs.length === 1 ? "" : "s"
+      } proposed, last at cell ${
+        proposalSpecs[proposalSpecs.length - 1].seed
+      } — ${proposalReach} cell${
+        proposalReach === 1 ? "" : "s"
+      } under the ${tool} brush; tap the ghost or press Enter to commit them as one gesture, Escape to drop`;
   const said =
     dragSpec !== null
       ? `${dragSpec.said} — release to lay it, Escape to cancel`
       : !standing
       ? announce
-      : `${proposalSpecs.length} application${
-          proposalSpecs.length === 1 ? "" : "s"
-        } proposed, last at cell ${
-          proposalSpecs[proposalSpecs.length - 1].seed
-        } — ${proposalReach} cell${
-          proposalReach === 1 ? "" : "s"
-        } under the ${tool} brush; tap the ghost or press Enter to commit them as one gesture, Escape to drop`;
+      : blocked === proposal
+      ? `${announce} — nothing was laid and there is nothing to undo; the proposal still stands. ${standingSaid}`
+      : standingSaid;
 
   const schemeGradient = `linear-gradient(90deg, ${tape
     .map((s, k) => `${s.hex} ${(100 * k) / Math.max(tape.length - 1, 1)}%`)
@@ -7019,6 +7249,7 @@ export default function DrawPage() {
                 onStrokeEnd={previewing ? NOTHING : endStroke}
                 onPropose={previewing ? NOTHING : propose}
                 onCommit={previewing ? NOTHING : commitProposal}
+                onCommitCancelled={previewing ? NOTHING : commitCancelled}
                 onArrow={previewing ? NOTHING : onArrow}
                 onShapeDrag={
                   previewing

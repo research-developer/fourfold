@@ -62,6 +62,7 @@ import {
   paletteOf,
   pasteInto,
   pathOf,
+  gestureOf,
   promote,
   redo,
   removeLayer,
@@ -81,6 +82,7 @@ import {
   withGesture,
   type Composition,
   type Layer,
+  type LayerGesture,
   type LayerId,
   type Session,
   type Switches,
@@ -446,29 +448,36 @@ describe("undo never touches a switch", () => {
 // ── the gesture ──────────────────────────────────────────────────────────
 
 /**
- * THE GESTURE IS ON THE LAYER, AND THE JOURNAL CANNOT DISTURB IT.
+ * THE GESTURE IS ON THE LAYER, AND ONLY A `Move` MAY TOUCH IT.
  *
  * This is the mirror of the block above, and the two together are the argument
  * for why `reveal`/`mode`/`orbit` sit on `Layer` while `visible`/`locked` sit on
  * `Composition.switches`. The switches had to leave because they are MUTABLE AND
  * UNJOURNALLED: a `place` move freezes a copy of the `Layer`, so a fact that can
- * change without a rung of its own is one undo can silently roll back. The
- * gesture is written once, when the layer is born, and never afterwards — so a
- * frozen copy of it is the fact, and there is nothing for a rung to get wrong.
+ * change without a rung of its own is one undo can silently roll back.
  *
- * That reasoning is only as good as the property it claims, so the property is
- * measured here rather than argued: every structural act, forwards and
- * backwards, over reorder, promote, demote, arbitrary move, delete, rename and
- * paste. This is the class of bug that bit the switches and was caught by a
- * reviewer rather than by a test, which is the whole reason these exist.
+ * The gesture stays because everything that changes it is a rung. STRUCTURE
+ * cannot change it at all — a reorder, a promote, a delete and a paste move a
+ * layer without touching its cells — and that is asserted below over every one of
+ * them, forwards and backwards, because it is the class of bug that bit the
+ * switches and was caught by a reviewer rather than by a test.
+ *
+ * PAINT CAN, and does. `mode` and `orbit` describe the cells the gesture
+ * produced; painting into the layer produces different cells, so they stop
+ * describing anything that is there and `applyMove` strips them. That is the one
+ * mutation, it is inside a `Move`, and the rung carries `was` so undo puts them
+ * back — which is asserted here rather than assumed, in both directions. This
+ * block used to claim the gesture was written once and never afterwards, and the
+ * paint test asserted exactly the stale value that claim allowed.
  */
-describe("the gesture rides on the layer, and undo never touches it", () => {
+describe("the gesture rides on the layer, and only a rung may change it", () => {
   /** A six-fold stroke that came out THREE — a seed on a mirror line. */
   const STAB = { mode: 6, orbit: 3 } as const;
 
-  /** The three numbers a layer holds, or `null` when it holds none. */
-  const gestureOf = (l: Layer | null) =>
-    l === null ? null : { reveal: l.reveal, mode: l.mode, orbit: l.orbit };
+
+  /** `gestureOf`, but tolerant of the `null` a `find` miss returns. */
+  const gest = (l: Layer | null): LayerGesture | null =>
+    l === null ? null : gestureOf(l);
 
   /** Which of the three keys a layer actually HOLDS. Not which are defined. */
   const keysOf = (o: object): string[] =>
@@ -502,20 +511,20 @@ describe("the gesture rides on the layer, and undo never touches it", () => {
 
   it("survives a reorder, and the undo of one, and the redo of that", () => {
     const s0 = twoWithGesture();
-    const before = gestureOf(find(s0.composition, layerId(2)));
+    const before = gest(find(s0.composition, layerId(2)));
     expect(before).toEqual({ reveal: 4, mode: 6, orbit: 3 });
 
     const moved = arrange(s0, "down");
     expect(moved.ok).toBe(true);
     if (!moved.ok) return;
-    expect(gestureOf(find(moved.value.composition, layerId(2)))).toEqual(before);
+    expect(gest(find(moved.value.composition, layerId(2)))).toEqual(before);
 
     // The step that broke the switches: the rung carries `node: Layer`, so undo
     // writes a frozen copy back over the live tree.
     const back = undo(moved.value);
-    expect(gestureOf(find(back.session.composition, layerId(2)))).toEqual(before);
+    expect(gest(find(back.session.composition, layerId(2)))).toEqual(before);
     const again = redo(back.session);
-    expect(gestureOf(find(again.session.composition, layerId(2)))).toEqual(before);
+    expect(gest(find(again.session.composition, layerId(2)))).toEqual(before);
     // ...and the reorder really did happen and un-happen, so the assertions
     // above were made across a move rather than across nothing.
     expect(again.session.composition.layers.map((l) => l.id)).toEqual([
@@ -529,18 +538,18 @@ describe("the gesture rides on the layer, and undo never touches it", () => {
     // first fixed with: at the redo the layer leaves the tree carrying its
     // gesture, and at the undo the rung's snapshot is the only record left.
     const s0 = twoWithGesture();
-    const before = gestureOf(find(s0.composition, layerId(2)));
+    const before = gest(find(s0.composition, layerId(2)));
     const gone = removeLayer(s0);
     expect(gone.ok).toBe(true);
     if (!gone.ok) return;
     expect(find(gone.value.composition, layerId(2))).toBeNull();
 
     const back = undo(gone.value);
-    expect(gestureOf(find(back.session.composition, layerId(2)))).toEqual(before);
+    expect(gest(find(back.session.composition, layerId(2)))).toEqual(before);
     const again = redo(back.session);
     expect(find(again.session.composition, layerId(2))).toBeNull();
     const restored = undo(again.session);
-    expect(gestureOf(find(restored.session.composition, layerId(2)))).toEqual(before);
+    expect(gest(find(restored.session.composition, layerId(2)))).toEqual(before);
   });
 
   it("survives a rename, both ways", () => {
@@ -551,22 +560,25 @@ describe("the gesture rides on the layer, and undo never touches it", () => {
     expect(named.ok).toBe(true);
     if (!named.ok) return;
     expect(find(named.value.composition, layerId(2))?.name).toBe("Stabilised");
-    expect(gestureOf(find(named.value.composition, layerId(2)))).toEqual({
+    expect(gest(find(named.value.composition, layerId(2)))).toEqual({
       reveal: 4,
       mode: 6,
       orbit: 3,
     });
     const back = undo(named.value);
     expect(find(back.session.composition, layerId(2))?.name).toBe("L2");
-    expect(gestureOf(find(back.session.composition, layerId(2)))).toEqual({
+    expect(gest(find(back.session.composition, layerId(2)))).toEqual({
       reveal: 4,
       mode: 6,
       orbit: 3,
     });
   });
 
-  it("survives a paint, and the undo of one", () => {
-    // `applyMove`'s paint case rebuilds the layer as `{ ...l, plate }`.
+  it("loses the symmetry to a paint, keeps the reveal, and gets it back on undo", () => {
+    // THE ONE MUTATION. `mode: 6, orbit: 3` says a stabilised six-fold brush
+    // produced the cells this layer holds; painting into it means it holds other
+    // cells, and a layer that went on claiming those two numbers would export a
+    // `<g data-orbit="3">` with any number of shapes in it.
     const s0 = twoWithGesture();
     const t = paintTarget(s0.composition);
     expect(t.ok).toBe(true);
@@ -578,20 +590,56 @@ describe("the gesture rides on the layer, and undo never touches it", () => {
           kind: "paint",
           layer: layerId(2),
           stroke: { edits: [{ cell: "s0:AB" as Address, from: null, to: RED }] },
+          was: gestureOf(find(s0.composition, layerId(2)) as Layer),
         },
       ],
       "painted"
     );
-    expect(gestureOf(find(painted.composition, layerId(2)))).toEqual({
-      reveal: 4,
-      mode: 6,
-      orbit: 3,
-    });
-    expect(gestureOf(find(undo(painted).session.composition, layerId(2)))).toEqual({
-      reveal: 4,
-      mode: 6,
-      orbit: 3,
-    });
+    // The KEYS go, not merely the values: `data-mode=""` is what a writer that
+    // tested for the key rather than the value would emit.
+    const after = find(painted.composition, layerId(2)) as Layer;
+    expect(keysOf(after)).toEqual(["reveal"]);
+    expect(after.reveal).toBe(4);
+    // ...and the paint really landed, so the assertion above was made across a
+    // change rather than across nothing.
+    expect(after.plate.get("s0:AB" as Address)).toBe(RED);
+
+    // Undo puts the cells back, so it has to put the claim about them back too.
+    const back = find(undo(painted).session.composition, layerId(2)) as Layer;
+    expect(gestureOf(back)).toEqual({ reveal: 4, mode: 6, orbit: 3 });
+    expect(back.plate.has("s0:AB" as Address)).toBe(false);
+    // And redo takes it away again, so the rung is symmetric rather than a
+    // one-way restore.
+    expect(keysOf(find(redo(undo(painted).session).session.composition, layerId(2)) as Layer))
+      .toEqual(["reveal"]);
+  });
+
+  it("a paint on a layer with no gesture leaves it with none, either way", () => {
+    // The ordinary case: nothing to strip, nothing to restore, and `was` absent
+    // rather than `{ mode: undefined }`.
+    const s0 = newSession(C([L(1)], layerId(1)));
+    const painted = act(
+      s0,
+      [
+        {
+          kind: "paint",
+          layer: layerId(1),
+          stroke: { edits: [{ cell: "s0:AB" as Address, from: null, to: RED }] },
+          was: gestureOf(find(s0.composition, layerId(1)) as Layer),
+        },
+      ],
+      "painted"
+    );
+    expect(keysOf(find(painted.composition, layerId(1)) as Layer)).toEqual([]);
+    expect(keysOf(find(undo(painted).session.composition, layerId(1)) as Layer)).toEqual([]);
+  });
+
+  it("`gestureOf` states absence as an absent KEY", () => {
+    const s = addLayer(newSession(emptyComposition()), "fresh");
+    expect(keysOf(gestureOf(s.composition.layers[0]))).toEqual([]);
+    const withAll = find(twoWithGesture().composition, layerId(2)) as Layer;
+    expect(gestureOf(withAll)).toEqual({ reveal: 4, mode: 6, orbit: 3 });
+    expect(keysOf(gestureOf(withAll))).toEqual(["reveal", "mode", "orbit"]);
   });
 
   it("survives promote, demote and an arbitrary move, undone and redone", () => {
@@ -605,7 +653,7 @@ describe("the gesture rides on the layer, and undo never touches it", () => {
     const out = promote(s0);
     expect(out.ok).toBe(true);
     if (!out.ok) return;
-    expect(gestureOf(find(out.value.composition, layerId(3)))).toEqual(want);
+    expect(gest(find(out.value.composition, layerId(3)))).toEqual(want);
 
     const inAgain = demote({
       ...out.value,
@@ -613,23 +661,23 @@ describe("the gesture rides on the layer, and undo never touches it", () => {
     });
     expect(inAgain.ok).toBe(true);
     if (!inAgain.ok) return;
-    expect(gestureOf(find(inAgain.value.composition, layerId(3)))).toEqual(want);
+    expect(gest(find(inAgain.value.composition, layerId(3)))).toEqual(want);
 
     const anywhere = moveLayer(inAgain.value, layerId(3), layerId(2), 0);
     expect(anywhere.ok).toBe(true);
     if (!anywhere.ok) return;
-    expect(gestureOf(find(anywhere.value.composition, layerId(3)))).toEqual(want);
+    expect(gest(find(anywhere.value.composition, layerId(3)))).toEqual(want);
     expect(pathOf(anywhere.value.composition, layerId(3))).toEqual([1, 0]);
 
     // ...and every one of those three taken back, then put forward again.
     let s = anywhere.value;
     for (let k = 0; k < 3; k++) {
       s = undo(s).session;
-      expect(gestureOf(find(s.composition, layerId(3)))).toEqual(want);
+      expect(gest(find(s.composition, layerId(3)))).toEqual(want);
     }
     for (let k = 0; k < 3; k++) {
       s = redo(s).session;
-      expect(gestureOf(find(s.composition, layerId(3)))).toEqual(want);
+      expect(gest(find(s.composition, layerId(3)))).toEqual(want);
     }
     expect(pathOf(s.composition, layerId(3))).toEqual([1, 0]);
   });
@@ -646,7 +694,7 @@ describe("the gesture rides on the layer, and undo never touches it", () => {
     if (!pasted.ok) return;
     const landed = pasted.value.composition.layers[0].children[0];
     expect(landed.id).not.toBe(layerId(5));
-    expect(gestureOf(landed)).toEqual({ reveal: 7, mode: 6, orbit: 3 });
+    expect(gest(landed)).toEqual({ reveal: 7, mode: 6, orbit: 3 });
   });
 
   it("is NOT in the composition's switch map — that is the other placement", () => {

@@ -249,6 +249,32 @@ export function altDown(state: AltState, ctx: AltContext): AltState {
 }
 
 /**
+ * Did this keydown REFUSE the eraser with nothing to show for it?
+ *
+ * `altDown` declines by substituting `"modifier"`, and a caller that only watches
+ * `erasing` therefore cannot tell a decline from an ordinary shape modifier —
+ * which is how the `brushOff` case came to be perfectly silent. The two declines
+ * are not alike and this predicate names the one that has to be said out loud:
+ *
+ *   `pointerDown` — the hold really IS the shape modifier, there is a figure
+ *   under the finger, and it changes visibly as the key goes down. It has never
+ *   announced itself and does not need to; the picture is the announcement.
+ *
+ *   `brushOff` — a preview, the help panel or the save menu is over the plate.
+ *   There is no figure under anything and the key does nothing whatever. The
+ *   only evidence available to the user that Option was even received is a
+ *   sentence, and this codebase's rule is that a decline is a counted
+ *   precondition rather than a fallback, so there has to be one.
+ *
+ * FALSE FOR A REPEAT, on the same test `altDown` latches on: a held modifier
+ * repeats on some platforms, every repeat arrives as a fresh keydown, and a
+ * decline announced sixty times is a decline nobody can read.
+ */
+export function altDeclined(state: AltState, ctx: AltContext): boolean {
+  return state.hold === null && ctx.brushOff;
+}
+
+/**
  * Option/Alt came up. Always the resting state, from anywhere.
  *
  * There is no branch here on purpose. The single most important property of a

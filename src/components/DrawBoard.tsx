@@ -100,6 +100,13 @@ import { WELD_WIDTH, type PaintMap } from "@/lib/strokes";
  * paint. That asymmetry is the right way round — leaving is the gesture a
  * mis-aim can reach.
  *
+ * A TAP ON A STANDING PROPOSAL IS NOT THE SECOND OF A PAIR. The commit gesture
+ * and the drill-in gesture are the same two taps on the same cell — gathering a
+ * proposal at X and then committing it IS "tap X, tap X" — so one of them has to
+ * be tested first and the other one loses. The commit wins; `commitsProposal`
+ * carries the reason. Outside a standing ghost, which is the whole plate
+ * whenever no proposal is up, the double-tap is unchanged.
+ *
  * ── A drag gathers, it does not replace ─────────────────────────────────
  *
  * It used to replace: every cell the finger crossed became THE candidate and the
@@ -325,6 +332,81 @@ export function isDoubleTap(
 }
 
 /**
+ * Is this press the COMMIT of a standing proposal?
+ *
+ * THE ONE ANSWER, asked twice by `down` and asked in that order for a reason.
+ * A tap inside the standing ghost is the documented commit gesture — see the
+ * header — and the cell it lands on is necessarily the cell the tap that
+ * gathered the proposal landed on, so it is also, unavoidably, the second of two
+ * quick taps on one cell. Whichever of the two gestures is tested first wins
+ * every time, and the drill-in used to be: it armed, the release fired
+ * `onFocusTap`, the page entered a sector and dropped the proposal, and the
+ * gathered work went with it. Propose mode is the default on touch, where Enter
+ * — the only other commit route — does not exist, so that was the whole feature
+ * on the whole platform it was built for.
+ *
+ * So the commit wins, and the argument is not merely "it was reported": a tap
+ * inside the ghost ALREADY HAS A MEANING, stated on screen by the marching
+ * outline and by the live region, and a gesture that takes a meaning away from
+ * a control the user is looking at is worse than one that is unreachable. The
+ * drill-in keeps every cell that is not under a standing ghost, which at the
+ * moment a proposal stands is nearly the whole plate, and keeps all of them when
+ * none does.
+ *
+ * ANY of the gathered applications counts, because the whole ghost is one tap
+ * target — the whole ghost is one gesture. The shape and drag conditions are
+ * named here rather than inherited from the caller's branch order: `candidate`
+ * is empty in the other modes today, and this must not become a fact about what
+ * the page happens to pass down.
+ *
+ * Pure and exported for the tests, for the same reason `isDoubleTap` is.
+ */
+export function commitsProposal(
+  shape: ShapeTool,
+  drag: DragBehaviour,
+  candidate: readonly PreviewSpec[],
+  i: number
+): boolean {
+  if (shape !== "free" || drag !== "propose") return false;
+  return candidate.some((c) => previewCovers(c, i));
+}
+
+/** What a release does to a live propose-mode press. See `proposeRelease`. */
+export type ProposeRelease = "commit" | "cancelled" | "nothing";
+
+/**
+ * A propose-mode press has ended. Does the plate change?
+ *
+ * `"commit"` only for a press that ARMED on the standing ghost, never travelled
+ * past `TAP_SLOP`, and was released by the HAND.
+ *
+ * `"cancelled"` is the third answer and the reason this is a function rather
+ * than a conjunction. A `pointercancel` is the browser taking the pointer away —
+ * palm rejection, an OS edge gesture, a second contact starting a pinch, an
+ * orientation change, a long-press context menu — and it can never complete a
+ * tap, exactly as it can never complete a double-tap one branch above. This is
+ * the branch where that matters most: it is the only one that writes to the
+ * plate, so the version of this test that omitted `cancelled` would paint every
+ * application of a standing proposal, with a rung in the journal, off a finger
+ * that never came up.
+ *
+ * It is told apart from `"nothing"` because the proposal SURVIVES a cancel and
+ * the user is left looking at a ghost that did not commit. A decline that says
+ * nothing at all is a control that reads as broken; declines here are counted
+ * preconditions, not silences. `"nothing"` is the ordinary case — a press that
+ * was never on the ghost, or that became a drag — and has nothing to report,
+ * because the drag itself was the report.
+ */
+export function proposeRelease(
+  armed: boolean,
+  moved: boolean,
+  cancelled: boolean
+): ProposeRelease {
+  if (!armed || moved) return "nothing";
+  return cancelled ? "cancelled" : "commit";
+}
+
+/**
  * The relief, as the board needs it: the plate's polygons already deformed.
  *
  * Everything here is a DISPLAY substitution — the same cells, in the same order,
@@ -411,6 +493,17 @@ interface Props {
   onStrokeEnd: () => void;
   onPropose: (i: number) => void;
   onCommit: () => void;
+  /**
+   * An armed commit tap was taken away by the browser rather than released.
+   *
+   * A SEPARATE CALLBACK and not a flag on `onCommit`, because the two are not
+   * two flavours of one event: one lays paint and one lays none. The page has to
+   * say something — the proposal is still standing and the tap it just received
+   * did nothing visible — and a decline that shares a door with a commit is a
+   * decline that will one day be routed through the committing half of it.
+   * See `proposeRelease` for the four ways a browser takes a pointer away.
+   */
+  onCommitCancelled: () => void;
   onArrow: (dir: Direction) => void;
   /**
    * The anchored drag moved. `anchor` never changes during one gesture, `at` is
@@ -962,6 +1055,7 @@ export default function DrawBoard({
   onStrokeEnd,
   onPropose,
   onCommit,
+  onCommitCancelled,
   onArrow,
   onShapeDrag,
   onShapeEnd,
@@ -1035,6 +1129,11 @@ export default function DrawBoard({
    *
    * Non-null means this press laid nothing and is waiting for its release to say
    * whether the hand held still. See the header.
+   *
+   * IT BELONGS TO ONE PRESS. `down` clears it on its first line and `end` clears
+   * it on every release, so it cannot outlive the gesture that set it — which
+   * matters because the release is the one event that is not guaranteed to
+   * arrive, and a flag left standing would steal the NEXT press's release.
    */
   const focusArmed = useRef<number | null>(null);
 
@@ -1061,52 +1160,58 @@ export default function DrawBoard({
       // is the whole of the gesture: fire it if the hand held still, drop it
       // silently if it drifted. Either way the pair is spent — a third quick tap
       // starts a new one rather than firing again on the same cell.
-      if (focusArmed.current !== null) {
-        const held = !tapDrag.current && !cancelled;
-        const cell = focusArmed.current;
-        focusArmed.current = null;
-        lastTap.current = null;
-        tapCell.current = null;
-        tapFrom.current = null;
-        tapDrag.current = false;
-        if (held) onFocusTap(cell);
-        return;
-      }
+      //
+      // READ AND CLEARED HERE, but FIRED at the bottom. This branch used to
+      // return before every other one, which was only safe while nothing could
+      // arm a focus tap with a gesture already live — and nothing enforced that,
+      // because `down` never cleared this ref. A press whose release never
+      // reached the window (the window blurred, the OS took the pointer) left the
+      // flag set, and the NEXT press painted normally on the way down and then
+      // had its release stolen: the focus fired on a cell from the gesture
+      // before, and `onStrokeEnd` never ran at all, so edits already written into
+      // the page's composition were never journalled and undo could not reach
+      // them. `down` now clears the flag on every press, which closes that door;
+      // this closes the other side of it, so that an armed press with a live
+      // gesture behind it still ENDS the gesture rather than abandoning it.
+      const focusCell = focusArmed.current;
+      const focusHeld = focusCell !== null && !tapDrag.current && !cancelled;
+      focusArmed.current = null;
 
-      // Every other release: remember it as a tap if it never became a drag, and
-      // forget whatever was remembered if it did. Done BEFORE the branches
-      // below, because every one of them returns.
+      // Every release: remember it as a tap if it never became a drag, and
+      // forget whatever was remembered if it did. An ARMED release is never
+      // remembered — the pair is spent. Done BEFORE the branches below, because
+      // every one of them used to return and the bookkeeping is common to all.
       const cell = tapCell.current;
       lastTap.current =
-        cell !== null && !tapDrag.current && !cancelled ? { cell, t } : null;
+        focusCell === null && cell !== null && !tapDrag.current && !cancelled
+          ? { cell, t }
+          : null;
       tapCell.current = null;
       tapFrom.current = null;
       tapDrag.current = false;
 
       if (panFrom.current !== null) {
         panFrom.current = null;
-        return;
-      }
-      if (anchor.current !== null) {
+      } else if (anchor.current !== null) {
         anchor.current = null;
         onShapeEnd();
-        return;
-      }
-      if (proposing.current) {
-        const commitNow = armed.current && !moved.current;
+      } else if (proposing.current) {
+        const release = proposeRelease(armed.current, moved.current, cancelled);
         proposing.current = false;
         armed.current = false;
         moved.current = false;
         last.current = null;
-        if (commitNow) onCommit();
-        return;
+        if (release === "commit") onCommit();
+        else if (release === "cancelled") onCommitCancelled();
+      } else if (drawing.current) {
+        drawing.current = false;
+        last.current = null;
+        onStrokeEnd();
       }
-      if (!drawing.current) return;
-      drawing.current = false;
-      last.current = null;
-      onStrokeEnd();
+
+      if (focusHeld) onFocusTap(focusCell);
     },
-    [onStrokeEnd, onCommit, onShapeEnd, onFocusTap]
+    [onStrokeEnd, onCommit, onCommitCancelled, onShapeEnd, onFocusTap]
   );
 
   // A gesture can finish anywhere — off the plate, off the window, or by the
@@ -1139,6 +1244,19 @@ export default function DrawBoard({
   };
 
   const down = (e: React.PointerEvent<SVGSVGElement>) => {
+    // A STALE ARM CANNOT SURVIVE INTO THE NEXT PRESS. `focusArmed` is set by the
+    // double-tap branch below and consumed by that press's release — but the
+    // release is the one event that is not guaranteed to arrive, so a flag set
+    // and abandoned would steal the release of whatever press came next: a focus
+    // change on a cell from the gesture before, and, worse, an `onStrokeEnd` that
+    // never fires, leaving edits already written into the page's composition with
+    // no rung to undo them by.
+    //
+    // FIRST LINE OF THE FUNCTION, above the pan branch and above the "not a cell"
+    // return, because both of those are presses too and neither of them wants an
+    // arm from an older one. This ref is about THIS press and nothing else.
+    focusArmed.current = null;
+
     // Space wins over everything. A pan that only worked when the press landed
     // on a cell would fail exactly at the rim, where a pan is most wanted.
     if (panning) {
@@ -1159,12 +1277,17 @@ export default function DrawBoard({
     tapFrom.current = { x: e.clientX, y: e.clientY };
     tapDrag.current = false;
 
+    // Asked ONCE, before the double-tap test and again as the arm below, because
+    // the two gestures land on the same cell and whichever is tested first wins.
+    // See `commitsProposal` for why the commit is the one that must.
+    const committing = commitsProposal(shape, dragBehaviour, candidate, i);
+
     // THE SECOND OF A PAIR. Decided here so this press lays nothing — see the
     // header — but not FIRED here: the release decides, once the slop test has
     // something to say. `preventDefault` is for the mouse, where a second click
     // otherwise starts a text selection that drags across the whole page;
     // `touch-action: none` on the canvas already has the touch case.
-    if (isDoubleTap(lastTap.current, i, e.timeStamp)) {
+    if (!committing && isDoubleTap(lastTap.current, i, e.timeStamp)) {
       e.preventDefault();
       focusArmed.current = i;
       lastTap.current = null;
@@ -1183,12 +1306,11 @@ export default function DrawBoard({
       last.current = i;
       // Inside the standing proposal this press is a commit, and must NOT also
       // add to it: the plate would gain an application under the finger and then
-      // be painted somewhere the user did not aim. ANY of the gathered
-      // applications counts — the whole ghost is one tap target, because the
-      // whole ghost is one gesture.
-      const onCandidate = candidate.some((c) => previewCovers(c, i));
-      armed.current = onCandidate;
-      if (!onCandidate) onPropose(i);
+      // be painted somewhere the user did not aim. The same answer the double-tap
+      // veto above was taken from, so the two cannot come to disagree about what
+      // a tap on the ghost is.
+      armed.current = committing;
+      if (!committing) onPropose(i);
       return;
     }
 

@@ -41,7 +41,7 @@
 
 import { CONVENTIONS, type Convention, type Figure } from "./figure";
 import type { Hexagon } from "./hexagon";
-import type { CanvasKind } from "./orbit";
+import { HEXAGON_MODES, TRIANGLE_MODES, type CanvasKind } from "./orbit";
 import { READINGS, type Reading } from "./relief";
 import { swatchFromHex, type Swatch } from "./schemes";
 
@@ -308,6 +308,25 @@ export const MAX_ART_BYTES = 8 * 1024 * 1024;
 /** The conventions come from `figure.ts`; a second list here could drift from it. */
 const CANVASES: readonly CanvasKind[] = ["triangle", "hexagon"];
 
+/**
+ * Which brush symmetries a file may claim, per canvas.
+ *
+ * Taken from `orbit.ts` rather than written out here, for the reason the note on
+ * `CANVASES` gives: a second list of the subgroup orders would be a second thing
+ * to keep in step with the group theory, and it would fall behind silently — a
+ * file would simply stop loading, or start loading when it should not.
+ *
+ * The SECTOR scopes are covered without being named. `SCOPE_MODES` gives both of
+ * them `SECTOR_MODES`, which is `TRIANGLE_MODES`, which is a subset of
+ * `HEXAGON_MODES` — so a hexagon file drawn under any scope claims a mode in the
+ * hexagon list, and a triangle file claims one in the triangle list. The file
+ * does not record its scope and does not need to.
+ */
+const MODES_FOR: Readonly<Record<CanvasKind, ReadonlySet<number>>> = {
+  triangle: new Set(TRIANGLE_MODES),
+  hexagon: new Set(HEXAGON_MODES),
+};
+
 /** The exact shape the payload promises. Upper case is not accepted, it is normalised on the way in. */
 const HEX6 = /^#[0-9a-f]{6}$/;
 
@@ -475,7 +494,7 @@ function validate(version: number, raw: unknown): ArtPayload | null {
   const view = validateView(o.view, canvas);
   if (view === REJECT) return null;
 
-  const comp = validateComposition(o.comp, n);
+  const comp = validateComposition(o.comp, n, canvas);
   if (comp === REJECT) return null;
 
   return {
@@ -549,7 +568,8 @@ function validateView(
  */
 function validateComposition(
   raw: unknown,
-  cellsInCanvas: number
+  cellsInCanvas: number,
+  canvas: CanvasKind
 ): { comp: ArtComposition } | undefined | typeof REJECT {
   if (raw === undefined) return undefined;
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return REJECT;
@@ -586,7 +606,7 @@ function validateComposition(
   if (!Array.isArray(c.layers)) return REJECT;
   const seen = new Set<string>();
   const budget = { left: MAX_LAYERS };
-  const layers = validateLayers(c.layers, cellsInCanvas, seen, budget, 1);
+  const layers = validateLayers(c.layers, cellsInCanvas, canvas, seen, budget, 1);
   if (layers === REJECT) return REJECT;
 
   return {
@@ -601,6 +621,7 @@ function validateComposition(
 function validateLayers(
   raw: readonly unknown[],
   cellsInCanvas: number,
+  canvas: CanvasKind,
   seen: Set<string>,
   budget: { left: number },
   depth: number
@@ -639,13 +660,55 @@ function validateLayers(
       }
       layer.opacity = l.opacity;
     }
-    for (const num of ["reveal", "mode", "orbit"] as const) {
-      const v = l[num];
-      if (v === undefined) continue;
+    // THREE FIELDS, THREE BOUNDS, and they were one. All three used to be
+    // checked against `MAX_LAYERS`, which is the layer-NODE budget: the right
+    // bound for `reveal`, which is an animation step and has one per gesture
+    // layer, and a bound that means nothing at all for the other two. It admitted
+    // `mode: 0` — a symmetry group that does not exist, and one that `unmarked`
+    // will not find, because it tests `mode !== undefined`; so the layer counts
+    // as MARKED and turns up in a census as a `modes` bucket of zero. It admitted
+    // `orbit: 8000` on a canvas of 384 cells, which is an orbit larger than the
+    // plate it is an orbit of.
+    //
+    // So each is bounded by the thing it is a number OF.
+    if (l.reveal !== undefined) {
+      const v = l.reveal;
       if (typeof v !== "number" || !Number.isInteger(v) || v < 0 || v > MAX_LAYERS) {
         return REJECT;
       }
-      layer[num] = v;
+      layer.reveal = v;
+    }
+    if (l.mode !== undefined) {
+      // The canvas's OWN modes. The triangle's group is D3 and the hexagon's is
+      // D6, so 12 is a hexagon word and a triangle file claiming it disagrees
+      // with its own canvas — the same rule `validateView` applies to a sector on
+      // a triangle. The sector scopes offer a SUBSET of the hexagon's modes, so
+      // one list per canvas covers every scope a file could have been drawn in.
+      if (!MODES_FOR[canvas].has(l.mode as number)) return REJECT;
+      layer.mode = l.mode as number;
+    }
+    if (l.orbit !== undefined) {
+      // A count of CELLS, so the canvas is the bound. One at the bottom and not
+      // zero: an orbit is the image of a seed under a subgroup and always
+      // contains the seed, so the smallest true orbit is the stabilised one of
+      // size 1. `orbit: 0` claims a gesture that painted nothing, which is not a
+      // short orbit but an absent one, and `shortOrbits` would report it as the
+      // shortest of all.
+      //
+      // NOT CROSS-CHECKED AGAINST `mode`, and nothing here may start. `mode: 6,
+      // orbit: 3` is a seed on a mirror line: the ordinary case, and the case a
+      // symmetry-minded reader is most interested in. See `emit.ts`'s header,
+      // `layers.ts`'s `LayerGesture`, and this file's own note above.
+      const v = l.orbit;
+      if (
+        typeof v !== "number" ||
+        !Number.isInteger(v) ||
+        v < 1 ||
+        v > cellsInCanvas
+      ) {
+        return REJECT;
+      }
+      layer.orbit = v;
     }
 
     if (l.cells !== undefined) {
@@ -676,7 +739,14 @@ function validateLayers(
 
     if (l.children !== undefined) {
       if (!Array.isArray(l.children)) return REJECT;
-      const kids = validateLayers(l.children, cellsInCanvas, seen, budget, depth + 1);
+      const kids = validateLayers(
+        l.children,
+        cellsInCanvas,
+        canvas,
+        seen,
+        budget,
+        depth + 1
+      );
       if (kids === REJECT) return REJECT;
       layer.children = kids;
     }

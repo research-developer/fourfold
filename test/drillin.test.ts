@@ -31,9 +31,12 @@
 import { describe, expect, it } from "vitest";
 import {
   DOUBLE_TAP_MS,
+  commitsProposal,
   focusFrame,
   isDoubleTap,
+  proposeRelease,
   type BoardGeometry,
+  type PreviewSpec,
 } from "../src/components/DrawBoard";
 import { buildHexagon } from "../src/lib/hexagon";
 import { plateFrame } from "../src/lib/view";
@@ -318,5 +321,126 @@ describe("isDoubleTap — the guard on the gesture", () => {
   it("takes a narrower window when it is given one", () => {
     expect(isDoubleTap({ cell: 1, t: 0 }, 1, 200, 100)).toBe(false);
     expect(isDoubleTap({ cell: 1, t: 0 }, 1, 90, 100)).toBe(true);
+  });
+});
+
+// ── the commit path: which of two gestures a tap on the ghost is ─────────
+
+/**
+ * A tap inside a standing proposal is a COMMIT, and it used to be a drill-in.
+ *
+ * Still no DOM, so nothing here presses anything. What is reachable — and what
+ * was moved out of `down` and `end` so that it could be — is the pair of pure
+ * decisions those two handlers now make: which gesture a press IS, and what a
+ * release DOES. Between them they are the whole of the bug, which was that the
+ * two gestures were tested in the wrong order and that a cancelled pointer was
+ * allowed to complete a commit.
+ *
+ * The board's own bookkeeping — the refs, the window listeners, the arm and the
+ * clear on the next press — is verified by structure and by reading, exactly as
+ * the header of this file says of everything else in `page.tsx`.
+ */
+describe("commitsProposal — a tap on the ghost is not the second of a pair", () => {
+  /** One application of a 6-fold brush, as the page hands it down. */
+  const ghost = (cells: readonly number[], inert: readonly number[] = []): PreviewSpec => ({
+    cells,
+    colours: cells.map(() => "#d4a017"),
+    inert,
+    seed: cells[0] ?? 0,
+    erasing: false,
+  });
+
+  it("is true for any cell of any gathered application", () => {
+    const candidate = [ghost([4, 9]), ghost([11])];
+    for (const i of [4, 9, 11]) {
+      expect(commitsProposal("free", "propose", candidate, i)).toBe(true);
+    }
+    // The whole ghost is ONE tap target because the whole ghost is one gesture.
+    expect(commitsProposal("free", "propose", candidate, 5)).toBe(false);
+  });
+
+  it("counts a cell the brush merely REACHES, inert or not", () => {
+    // An adjustment landing on bare tiling is drawn as an outline and is part of
+    // the ghost the user is looking at, so tapping it is tapping the proposal.
+    expect(commitsProposal("free", "propose", [ghost([4], [7])], 7)).toBe(true);
+  });
+
+  it("is false in every mode that cannot have a proposal", () => {
+    const candidate = [ghost([4])];
+    expect(commitsProposal("free", "paint", candidate, 4)).toBe(false);
+    expect(commitsProposal("line", "propose", candidate, 4)).toBe(false);
+    expect(commitsProposal("ring", "propose", candidate, 4)).toBe(false);
+    // The page already sends an empty candidate in those modes; this does not
+    // rely on that, which is the point of naming the conditions here.
+    expect(commitsProposal("free", "propose", [], 4)).toBe(false);
+  });
+
+  /**
+   * THE BUG, as the sequence that produced it.
+   *
+   * Tap X: the proposal gathers X, and a clean zero-drag release remembers X as
+   * a tap. Tap X again — the documented commit gesture, and necessarily the same
+   * cell, and necessarily inside the ghost X's own application draws. Before the
+   * fix `isDoubleTap` was asked first, said yes, and the release drilled into a
+   * sector and dropped the proposal on the way in. The commit had no other route
+   * on touch, where `propose` is the default and there is no Enter key.
+   */
+  it("outranks a double-tap on the same cell, and only there", () => {
+    const candidate = [ghost([4, 9])];
+    const prev = { cell: 4, t: 1000 };
+    const t = 1000 + DOUBLE_TAP_MS - 1;
+    // Both gestures claim this press. The commit takes it.
+    expect(isDoubleTap(prev, 4, t)).toBe(true);
+    expect(commitsProposal("free", "propose", candidate, 4)).toBe(true);
+    // And OUTSIDE the ghost the double-tap is untouched — which is the whole
+    // plate whenever no proposal stands.
+    expect(commitsProposal("free", "propose", candidate, 5)).toBe(false);
+    expect(isDoubleTap({ cell: 5, t: 1000 }, 5, t)).toBe(true);
+    expect(commitsProposal("free", "propose", [], 4)).toBe(false);
+  });
+});
+
+describe("proposeRelease — a cancelled pointer never lays paint", () => {
+  it("commits only an armed press that never moved and was released", () => {
+    expect(proposeRelease(true, false, false)).toBe("commit");
+  });
+
+  /**
+   * THE MERGE BLOCKER. A standing proposal, a finger down on a covered cell, no
+   * movement, and then the browser takes the pointer — palm rejection, an OS
+   * edge gesture, a second contact starting a pinch, an orientation change, a
+   * long-press menu. Without the `cancelled` term this returns "commit" and the
+   * page paints every application with a rung in the journal, off a finger that
+   * never came up.
+   */
+  it("declines a cancel that would otherwise have been a clean tap", () => {
+    expect(proposeRelease(true, false, true)).toBe("cancelled");
+  });
+
+  it("says nothing for a press that was never on the ghost, cancelled or not", () => {
+    expect(proposeRelease(false, false, false)).toBe("nothing");
+    expect(proposeRelease(false, false, true)).toBe("nothing");
+    expect(proposeRelease(false, true, true)).toBe("nothing");
+  });
+
+  it("says nothing for a drag, because the drag was its own report", () => {
+    expect(proposeRelease(true, true, false)).toBe("nothing");
+    expect(proposeRelease(true, true, true)).toBe("nothing");
+  });
+
+  /**
+   * The property that matters more than any single row: NO CANCEL COMMITS. It is
+   * checkable by exhaustion because there are only eight inputs, which is why
+   * the decision was made a function of three booleans rather than a conjunction
+   * inside the handler.
+   */
+  it("never commits on a cancel, from any state at all", () => {
+    for (const armed of [false, true]) {
+      for (const moved of [false, true]) {
+        expect(proposeRelease(armed, moved, true)).not.toBe("commit");
+        // ...and a cancel is the only way to reach the announced decline.
+        expect(proposeRelease(armed, moved, false)).not.toBe("cancelled");
+      }
+    }
   });
 });

@@ -792,6 +792,15 @@ export type FocusGesture =
  * `undefined`. Returning `undefined` yields `null` — a double-tap at the bottom
  * of the stack is a no-op rather than an exit, since exiting on it would make the
  * deepest level impossible to double-tap inside of without leaving it.
+ *
+ * THERE IS EXACTLY ONE NO-OP, and it is that one. The exit branch used to carry a
+ * second — `path.length === 0 ? null : exit` — which could not fire: a mask built
+ * from no steps is `ALWAYS` (see `maskOf`), so at the root every cell is inside
+ * and `!inside` is unreachable. It is the same fact the paragraph above states in
+ * its general form, that a path of only non-masking steps never answers `exit`,
+ * and a guard that restates an invariant it cannot enforce reads as though
+ * something were being checked. Falling into the exit branch is itself the proof
+ * that some step masks, and therefore that the path is not empty.
  */
 export function gestureFor(
   path: FocusPath,
@@ -800,7 +809,7 @@ export function gestureFor(
   deeper: (cell: number, path: FocusPath) => FocusStep | undefined
 ): FocusGesture {
   const inside = seedMask(path, resolvers)(cell);
-  if (!inside) return path.length === 0 ? null : { act: "exit" };
+  if (!inside) return { act: "exit" };
   const step = deeper(cell, path);
   return step === undefined ? null : { act: "enter", step };
 }

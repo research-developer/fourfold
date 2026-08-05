@@ -399,6 +399,132 @@ describe("gestureLayers", () => {
     expect(drawn.size).toBe(resolved.size);
     for (const [i, hex] of resolved) expect(drawn.get(i)).toBe(hex);
   });
+
+  /**
+   * THE EXCEPTION THE PARAGRAPH ABOVE USED TO DENY.
+   *
+   * The test above passes and proves less than it was cited for: all four of its
+   * gestures are PAINTS, and the module header claimed the equality outright.
+   * An erase removes a colour and a layer stack has no way to remove anything —
+   * every layer is drawn over the one before it — so the two halves are stated
+   * and measured separately here.
+   */
+  it("does NOT reconstruct the plate through an erase, and says which way it is wrong", () => {
+    const s = fresh();
+    const seed = book.index.get("s0:AAA") as number;
+    commit(s, "sector", plain(6), [seed], "#d4a017");
+    const laid = resolvePlate(s.plate, book).size;
+    // A stabilised seed: the 6-fold sector brush lays three cells here.
+    expect(laid).toBe(3);
+    commit(s, "sector", plain(6), [seed], null);
+    expect(s.past).toHaveLength(2);
+    expect(resolvePlate(s.plate, book).size).toBe(0);
+
+    // The record of what each gesture PAINTED. The erase painted nothing, so the
+    // stack still shows the colour it took away — three cells, not none.
+    const record = flatten(gestureLayers(s.past, book));
+    expect(record.size).toBe(3);
+    expect(resolvePlate(s.plate, book).size).toBe(0);
+    // The erase is still a gesture: its own layer, its own place in the reveal
+    // order, its own symmetry, and no paint.
+    const layers = gestureLayers(s.past, book);
+    expect(layers).toHaveLength(2);
+    expect(layers[1].reveal).toBe(1);
+    expect(layers[1].mode).toBe(6);
+    expect(layers[1].orbit).toBe(3);
+    expect(layers[1].paint).toBeUndefined();
+  });
+
+  it("draws the plate when the erase is given a colour to be drawn in", () => {
+    const UNPAINTED = "#141110";
+    const s = fresh();
+    const seed = book.index.get("s0:AAA") as number;
+    commit(s, "sector", plain(6), [seed], "#d4a017");
+    commit(s, "sector", plain(6), [seed], null);
+
+    const drawn = flatten(gestureLayers(s.past, book, { unpainted: UNPAINTED }));
+    const resolved = resolvePlate(s.plate, book);
+    // Every cell the stack names now draws what the plate draws: an erased cell
+    // carries the document's unpainted fill, which is the colour the tiling under
+    // it would have shown anyway. `replay.animationSteps` makes an animation
+    // additive the same way and for the same reason.
+    for (const [i, hex] of drawn) expect(resolved.get(i) ?? UNPAINTED).toBe(hex);
+    // ...and it is the ERASE that made the difference, not the option in general:
+    // with it the three cells read as unpainted, without it as gold.
+    expect([...drawn.values()]).toEqual([UNPAINTED, UNPAINTED, UNPAINTED]);
+    expect([...flatten(gestureLayers(s.past, book)).values()]).toEqual([
+      "#d4a017",
+      "#d4a017",
+      "#d4a017",
+    ]);
+    // A paint-only history is unaffected by the option, so nothing that existed
+    // changes shape.
+    const paints = fresh();
+    commit(paints, "hexagon", plain(6), [seedWithOrbit("hexagon", 6, 6)], "#c0392b");
+    expect(flatten(gestureLayers(paints.past, book, { unpainted: UNPAINTED }))).toEqual(
+      flatten(gestureLayers(paints.past, book))
+    );
+  });
+
+  /**
+   * `bins` counts the groups that CLAIMED a painted cell; `stated` counts the
+   * groups the mark recorded. They differ whenever a group's cells were all
+   * no-ops — a second seed landing on an orbit the first already painted, which
+   * is half of what a propose-mode drag does.
+   */
+  it("does not split off a single child that would hold what the parent holds", () => {
+    const stroke: Stroke<Address> = {
+      edits: [{ cell: "s0:ABC" as Address, from: null, to: "#d4a017" }],
+      mark: { mode: 6, groups: [["s0:ABC"], ["s2:AAA", "s2:AAB", "s2:AAC"]] },
+    };
+    // Two recorded groups of different sizes, so `auto` would nest — but only one
+    // of them put a cell on the plate.
+    const [layer] = gestureLayers([stroke], book, { nest: "auto" });
+    expect(layer.children).toBeUndefined();
+    expect(layer.paint?.size).toBe(1);
+    expect(layer.mode).toBe(6);
+    // No orbit: the gesture's groups really were 1 and 3, and it is not a
+    // one-orbit gesture just because the 3 painted nothing this time.
+    expect(layer.orbit).toBeUndefined();
+    expect(layer.name).not.toContain("orbits");
+    // `always` declines it for the same reason it declines a single recorded
+    // group: the child would hold exactly what the parent holds.
+    expect(gestureLayers([stroke], book, { nest: "always" })[0].children).toBeUndefined();
+    // And two claiming bins still nest, so the gate is on the bins and not on
+    // nesting itself.
+    const both: Stroke<Address> = {
+      edits: [
+        { cell: "s0:ABC" as Address, from: null, to: "#d4a017" },
+        { cell: "s2:AAA" as Address, from: null, to: "#c0392b" },
+      ],
+      mark: { mode: 6, groups: [["s0:ABC"], ["s2:AAA", "s2:AAB", "s2:AAC"]] },
+    };
+    expect(gestureLayers([both], book, { nest: "auto" })[0].children).toHaveLength(2);
+  });
+
+  it("names a child by the cells it DRAWS, and states the orbit separately", () => {
+    // A shallow address covers four cells at the book's depth, so the group's
+    // length and the child's cell count are two different numbers. The name used
+    // to say "1 cells" on a layer holding four.
+    const stroke: Stroke<Address> = {
+      edits: [
+        { cell: "s0:AB" as Address, from: null, to: "#d4a017" },
+        { cell: "s1:ABC" as Address, from: null, to: "#c0392b" },
+      ],
+      mark: { mode: 6, groups: [["s0:AB"], ["s1:ABC"]] },
+    };
+    const [layer] = gestureLayers([stroke], book, { nest: "always" });
+    const kids = layer.children ?? [];
+    expect(kids).toHaveLength(2);
+    expect(kids[0].paint?.size).toBe(4);
+    expect(kids[0].name).toBe("orbit 1 of 2 · 4 cells");
+    // `orbit` is still the symmetry's own number, taken from the mark, so the
+    // two facts are both present and neither pretends to be the other.
+    expect(kids[0].orbit).toBe(1);
+    // ...and the singular is a singular.
+    expect(kids[1].paint?.size).toBe(1);
+    expect(kids[1].name).toBe("orbit 2 of 2 · 1 cell");
+  });
 });
 
 // ── the compound-path query ──────────────────────────────────────────────
