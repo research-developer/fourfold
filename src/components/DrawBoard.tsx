@@ -1282,13 +1282,24 @@ export default function DrawBoard({
     // See `commitsProposal` for why the commit is the one that must.
     const committing = commitsProposal(shape, dragBehaviour, candidate, i);
 
-    // THE SECOND OF A PAIR. Decided here so this press lays nothing — see the
-    // header — but not FIRED here: the release decides, once the slop test has
-    // something to say. `preventDefault` is for the mouse, where a second click
-    // otherwise starts a text selection that drags across the whole page;
-    // `touch-action: none` on the canvas already has the touch case.
-    if (!committing && isDoubleTap(lastTap.current, i, e.timeStamp)) {
-      e.preventDefault();
+    // THE SECOND OF A PAIR — two decisions, and they are not the same decision.
+    //
+    // WHETHER THE BROWSER GETS THIS CLICK is a question about the mouse, and the
+    // answer is no for every second press on one cell however this program then
+    // reads it. `DOUBLE_TAP_MS` is 400 and sits inside every UA's double-click
+    // window, `touch-action: none` on the canvas covers only touch, and there is
+    // no `user-select: none` anywhere — so an unguarded second click starts a
+    // text selection that drags across the whole page. That is true of the
+    // commit tap as well, which is the ordinary mouse gesture in propose mode:
+    // gather at X, click X again. The veto below moved the `preventDefault` with
+    // it for one commit and put the selection drag back on exactly that click.
+    //
+    // WHETHER IT ARMS A DRILL-IN is the question the veto answers. Decided here
+    // so this press lays nothing — see the header — but not FIRED here: the
+    // release decides, once the slop test has something to say.
+    const pair = isDoubleTap(lastTap.current, i, e.timeStamp);
+    if (pair) e.preventDefault();
+    if (pair && !committing) {
       focusArmed.current = i;
       lastTap.current = null;
       return;

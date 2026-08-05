@@ -219,7 +219,7 @@
  * that is there. Measured: import a layer carrying them over three cells, clear
  * it, and the export writes `data-orbit="3" data-mode="6"` around no shapes.
  *
- * So `paint` strips them and carries `was` for undo to write back, which puts the
+ * So `paint` strips them and carries `MoveGesture` for undo to write back, which puts the
  * gesture squarely in the second clause: mutated, and only by a journalled
  * `Move`. There is still no `setMode` — no control re-records a stroke's symmetry
  * — and a `place` move carrying `node: Layer` still carries whatever gesture that
@@ -968,6 +968,59 @@ export function soleLayer(comp: Composition): Layer | null {
 export type Place = "insert" | "remove";
 
 /**
+ * A layer's gesture either side of a paint. THE SAME SHAPE AS A `CellEdit`.
+ *
+ * `from` is what the layer's `mode`/`orbit` were before the move and `to` is
+ * what they are after, exactly as `CellEdit` names the colour before and the
+ * colour after. `applyMove` writes `to` going forwards and `from` going back,
+ * and that is the whole of it.
+ *
+ * ── Why a PAIR, and not the single value this started as ────────────────
+ *
+ * It started as one field — `was`, the gesture the paint destroyed — on the
+ * reasoning that a paint always strips, so only the way back needs remembering.
+ * That is true of a paint and false of the JOURNAL, because `composer.
+ * invertMove` builds a move whose forward application must RESTORE: `revertMoves`
+ * turns the acts between two states into their inverses and `doRevert` journals
+ * them as one ordinary forward act, so every one of them runs `"do"`. A `"do"`
+ * that could only strip made REVERT the one control in this program that
+ * destroyed provenance for good — and destroyed it while announcing "⌘Z brings
+ * them all back", because the undo of that rung found nothing to restore and
+ * stripped a second time. Measured in `test/composer.test.ts`.
+ *
+ * A pair fixes it in the way that cannot come apart again: `invertMove` SWAPS
+ * the two, which is character for character what it already does to every
+ * `CellEdit` in the same stroke. The cells and the claim about them are inverted
+ * by one gesture of the same hand, so there is no direction in which they can
+ * disagree about which way they are going.
+ *
+ * REQUIRED on the move rather than optional, and that is the second half of the
+ * fix. `was` was optional, three consumers existed, and the third — added in the
+ * same commit as the other two — simply did not mention it and nothing said so.
+ * Required, the compiler names every construction site the day a fourth appears.
+ * `NO_GESTURE` is the honest spelling for the ordinary case, and it is a claim
+ * ("no gesture on either side of this") rather than an omission.
+ *
+ * `reveal` is not read from here. It is a fact about ORDER rather than about
+ * cells, a paint cannot move a layer in the playback sequence, and `applyMove`
+ * therefore takes it from the live layer in both directions. It is still carried
+ * by `gestureOf`, because that function answers "what gesture does this layer
+ * hold" and the answer includes it.
+ */
+export interface MoveGesture {
+  /** Before the move. Written back by `undo`. Absent means "none". */
+  readonly from?: LayerGesture;
+  /**
+   * After the move. Written by `do`. Absent means "none", which is what an
+   * ordinary paint leaves — it invalidates the symmetry it found.
+   */
+  readonly to?: LayerGesture;
+}
+
+/** No gesture either side: the layer carried none and still carries none. */
+export const NO_GESTURE: MoveGesture = {};
+
+/**
  * The four things that can happen to the drawing, and nothing else.
  *
  * Every named operation below is built out of these, which is why undo is one
@@ -979,21 +1032,21 @@ export type Place = "insert" | "remove";
  * always held — so the gesture's `mark` rides along untouched. Nothing here
  * reads it; `replay.ts` does.
  *
- * IT ALSO CARRIES `was`, WHICH IS THE INVERSE OF A THING THE PAINT DESTROYS.
+ * IT ALSO CARRIES `gesture`, WHICH IS THE SAME KIND OF THING `CellEdit` IS.
  * Painting into a layer that already carried an imported `mode`/`orbit` makes
  * those two numbers false — they describe the gesture that produced the cells
- * that were there, and those are no longer the cells that are there — so
- * `applyMove` strips them, and it can only do that reversibly if the rung
- * remembers what it stripped. Absent means the layer carried no gesture, which
- * is every layer this program makes itself; see `LayerGesture`.
+ * that were there, and those are no longer the cells that are there — so a paint
+ * strips them. A strip is only reversible if the move remembers both sides of
+ * it, which is exactly what every cell edit in the stroke already does. See
+ * `MoveGesture`.
  */
 export type Move =
   | {
       readonly kind: "paint";
       readonly layer: LayerId;
       readonly stroke: Stroke<Address>;
-      /** The gesture this paint invalidated, for undo to write back. */
-      readonly was?: LayerGesture;
+      /** The layer's gesture either side of this move. `NO_GESTURE` for none. */
+      readonly gesture: MoveGesture;
     }
   | { readonly kind: "rename"; readonly layer: LayerId; readonly from: string; readonly to: string }
   | { readonly kind: "place"; readonly op: Place; readonly at: Path; readonly node: Layer };
@@ -1145,21 +1198,22 @@ export function applyMove(
         // orbit: 3` over three cells, clear it, and `emit.ts` writes
         // `data-orbit="3" data-mode="6"` around no shapes at all.
         //
-        // Only the two SYMMETRY numbers go. `reveal` stays, because it is the
-        // step this layer comes up at in a playback and is a fact about ORDER
-        // rather than about cells — repainting a layer does not move it in the
-        // sequence, and dropping it would silently break an animated import the
-        // first time anyone touched it.
+        // READ OFF THE MOVE, one side per direction, exactly as the plate above
+        // is. This does NOT hard-code the strip: an ordinary paint states no
+        // `to` and therefore strips, and the INVERSE of one states the gesture
+        // as its `to` and therefore restores — which is the only reason REVERT
+        // works, since it runs inverses forwards. See `MoveGesture`.
         //
-        // Reversible, which is why the rung carries `was`: undo puts the cells
-        // back, so it has to put the claim about them back too. Anything else
-        // would make painting-then-undoing a way to lose provenance quietly,
-        // which is the exact class of loss this whole module exists to close.
+        // Only the two SYMMETRY numbers are the move's to give. `reveal` comes
+        // from the live layer in both directions, because it is the step this
+        // layer comes up at in a playback — a fact about ORDER rather than about
+        // cells. Repainting a layer does not move it in the sequence, and
+        // dropping it would silently break an animated import the first time
+        // anyone touched it.
+        const g = direction === "do" ? move.gesture.to : move.gesture.from;
         return withGesture(
           { ...l, plate },
-          direction === "do"
-            ? { reveal: l.reveal }
-            : { reveal: l.reveal, mode: move.was?.mode, orbit: move.was?.orbit }
+          { reveal: l.reveal, mode: g?.mode, orbit: g?.orbit }
         );
       });
       if (!hit) throw new Error(`layers: no layer ${move.layer} to paint into`);
@@ -1551,12 +1605,13 @@ export function paintInto(
       kind: "paint",
       layer: into.layer.id,
       stroke: { edits: [...edits] },
-      // Read off the CHECKED target, which `Target` guarantees was resolved from
-      // the composition being painted — so this is the gesture as it stands now,
-      // which is the one this application is about to invalidate. A caller that
-      // journals its own rung for the same stroke must capture it at the FIRST
-      // application, before any of them has stripped it; see `draw/page.tsx`.
-      was: gestureOf(into.layer),
+      // `from` is read off the CHECKED target, which `Target` guarantees was
+      // resolved from the composition being painted — so this is the gesture as
+      // it stands now, which is the one this application is about to invalidate.
+      // No `to`: a paint leaves none. A caller that journals its own rung for
+      // the same stroke must capture `from` at the FIRST application, before any
+      // of them has stripped it; see `draw/page.tsx`.
+      gesture: { from: gestureOf(into.layer) },
     },
     "do"
   );
@@ -1667,9 +1722,14 @@ export function clearLayer(session: Session): Outcome<Session> {
       const stroke = clearStroke(l.plate);
       cells += stroke.edits.length;
       // Clearing a layer is the sharpest case of a paint invalidating a gesture:
-      // the cells the `mode`/`orbit` described are all gone. `was` is what undo
+      // the cells the `mode`/`orbit` described are all gone. `from` is what undo
       // writes back with them.
-      moves.push({ kind: "paint", layer: l.id, stroke, was: gestureOf(l) });
+      moves.push({
+        kind: "paint",
+        layer: l.id,
+        stroke,
+        gesture: { from: gestureOf(l) },
+      });
     }
     for (const c of l.children) go(c);
   };

@@ -56,6 +56,7 @@ import {
   layerId,
   moveLayer,
   newSession,
+  NO_GESTURE,
   OPEN,
   paintInto,
   paintTarget,
@@ -590,7 +591,7 @@ describe("the gesture rides on the layer, and only a rung may change it", () => 
           kind: "paint",
           layer: layerId(2),
           stroke: { edits: [{ cell: "s0:AB" as Address, from: null, to: RED }] },
-          was: gestureOf(find(s0.composition, layerId(2)) as Layer),
+          gesture: { from: gestureOf(find(s0.composition, layerId(2)) as Layer) },
         },
       ],
       "painted"
@@ -615,8 +616,8 @@ describe("the gesture rides on the layer, and only a rung may change it", () => 
   });
 
   it("a paint on a layer with no gesture leaves it with none, either way", () => {
-    // The ordinary case: nothing to strip, nothing to restore, and `was` absent
-    // rather than `{ mode: undefined }`.
+    // The ordinary case: nothing to strip, nothing to restore, and the move's
+    // `gesture` empty on both sides rather than carrying `{ mode: undefined }`.
     const s0 = newSession(C([L(1)], layerId(1)));
     const painted = act(
       s0,
@@ -625,7 +626,7 @@ describe("the gesture rides on the layer, and only a rung may change it", () => 
           kind: "paint",
           layer: layerId(1),
           stroke: { edits: [{ cell: "s0:AB" as Address, from: null, to: RED }] },
-          was: gestureOf(find(s0.composition, layerId(1)) as Layer),
+          gesture: { from: gestureOf(find(s0.composition, layerId(1)) as Layer) },
         },
       ],
       "painted"
@@ -860,7 +861,7 @@ describe("painting reaches exactly one layer", () => {
     const live = paintInto(start.composition, mustTarget(start.composition), edits);
     const out = act(
       { ...start, composition: live },
-      [{ kind: "paint", layer: layerId(1), stroke: { edits } }],
+      [{ kind: "paint", layer: layerId(1), stroke: { edits }, gesture: NO_GESTURE }],
       "painted"
     );
     expect(find(out.composition, layerId(1))?.plate.size).toBe(2);
@@ -929,6 +930,7 @@ describe("painting reaches exactly one layer", () => {
         {
           kind: "paint",
           layer: layerId(1),
+          gesture: NO_GESTURE,
           stroke: {
             edits: lay(new Map(), ["s0:AA"], RED),
             mark: { mode: 6, groups: [["s0:AA"]] },
@@ -1857,6 +1859,7 @@ describe("the operations are total", () => {
           kind: "paint",
           layer: layerId(9),
           stroke: { edits: [{ cell: "s0:AA", from: null, to: RED }] },
+          gesture: NO_GESTURE,
         },
         "do"
       )

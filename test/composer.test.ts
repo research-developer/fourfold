@@ -31,8 +31,10 @@ import {
   find,
   flatten,
   fromPlate,
+  gestureOf,
   layerId,
   newSession,
+  NO_GESTURE,
   OPEN,
   pasteInto,
   redo,
@@ -72,6 +74,9 @@ const paint = (layer: string, cell: string, from: string | null, to: string | nu
   kind: "paint",
   layer: layerId(Number(layer.slice(1))),
   stroke: { edits: [{ cell: cell as Address, from, to }] },
+  // These layers are made by this file and carry no gesture, so the move both
+  // starts and ends with none. A claim, not an omission — see `MoveGesture`.
+  gesture: NO_GESTURE,
 });
 
 /** The shape of a tree, as a string, so two trees can be compared by eye. */
@@ -263,6 +268,7 @@ describe("the journal, as gestures", () => {
     const withMark: Move = {
       kind: "paint",
       layer: layerId(1),
+      gesture: NO_GESTURE,
       stroke: {
         edits: [{ cell: "s0:AA" as Address, from: null, to: "#111111" }],
         mark: { mode: 6, groups: [["s0:AA" as Address]] },
@@ -826,6 +832,7 @@ describe("the event log is the journal", () => {
           kind: "paint",
           layer: s.composition.layers[0].id,
           stroke: { edits: [{ cell: cell as Address, from: null, to: GOLD }] },
+          gesture: NO_GESTURE,
         },
       ],
       "painted",
@@ -939,3 +946,144 @@ function svgDoc(layers: readonly EmitLayer[]): EmitDoc {
     },
   };
 }
+
+// ── the gesture, across the one control that journals its inverses ───────
+
+/**
+ * REVERT runs INVERSES FORWARD, which is the one direction a paint's gesture
+ * strip is not automatically reversible in.
+ *
+ * `applyMove`'s paint case strips a layer's `mode`/`orbit` going `"do"`, because
+ * a paint invalidates them, and writes them back going `"undo"` from what the
+ * rung remembers. Undo and the scrub both walk backwards, so both restore. REVERT
+ * does not: `revertMoves` builds the inverses through `invertMove` and `doRevert`
+ * journals them as one ORDINARY FORWARD act, so every one of them is applied
+ * `"do"` — and a `do` that could only ever strip made REVERT the one control that
+ * destroys provenance, permanently, in flat contradiction of the sentence it
+ * speaks while doing it ("⌘Z brings them all back").
+ *
+ * That is what `Move.gesture` is for and why it is a `{ from, to }` pair rather
+ * than a single remembered value: `invertMove` swaps the two exactly as it swaps
+ * every `CellEdit`, so there is no direction in which the gesture and the cells
+ * can disagree about which way they are going.
+ */
+describe("a reverted paint gives the gesture back", () => {
+  const GOLD = "#d4a017";
+  const RED = "#c0392b";
+
+  /** A document imported from a file whose one layer states a gesture. */
+  const imported = (): Session => {
+    const { stack } = stackFromEmit(
+      [
+        {
+          id: "g0",
+          name: "six fold on a mirror",
+          reveal: 4,
+          mode: 6,
+          orbit: 3,
+          paint: new Map([[0, GOLD]]),
+        },
+      ],
+      BOOK,
+      1
+    );
+    return newSession({
+      layers: stack,
+      selected: stack[0].id,
+      nextId: 2,
+      switches: new Map(),
+    });
+  };
+
+  it("survives REVERT, and the undo of the revert", () => {
+    const s0 = imported();
+    const id = s0.composition.layers[0].id;
+    expect(gestureOf(find(s0.composition, id) as Layer)).toEqual({
+      reveal: 4,
+      mode: 6,
+      orbit: 3,
+    });
+
+    // Paint into it. The symmetry goes, because it described the cells that were
+    // there and those are no longer the cells that are there.
+    const painted = act(
+      s0,
+      [
+        {
+          kind: "paint",
+          layer: id,
+          stroke: { edits: [{ cell: "s0:AB" as Address, from: null, to: RED }] },
+          gesture: { from: gestureOf(find(s0.composition, id) as Layer) },
+        },
+      ],
+      "painted"
+    );
+    expect(gestureOf(find(painted.composition, id) as Layer)).toEqual({ reveal: 4 });
+
+    // REVERT to the state before the paint. The cells come back...
+    const moves = revertMoves(painted.journal.past, painted.journal.past.length, 0);
+    const reverted = act(painted, moves, "reverted");
+    expect(find(reverted.composition, id)?.plate.has("s0:AB" as Address)).toBe(false);
+    // ...and so does the claim about them. This is the assertion that was false.
+    expect(gestureOf(find(reverted.composition, id) as Layer)).toEqual({
+      reveal: 4,
+      mode: 6,
+      orbit: 3,
+    });
+
+    // And ⌘Z on the revert rung is the sentence the control speaks: everything
+    // back, including the strip the paint performed.
+    const back = undo(reverted);
+    expect(find(back.session.composition, id)?.plate.get("s0:AB" as Address)).toBe(RED);
+    expect(gestureOf(find(back.session.composition, id) as Layer)).toEqual({ reveal: 4 });
+  });
+
+  it("agrees with the scrub preview it is the commit of", () => {
+    // `stepComposition` walks backwards with `applyMove(…, "undo")` and REVERT
+    // walks the inverses forwards. They are two routes to one state and the
+    // preview is what the user is looking at when they press the button, so a
+    // disagreement between them is the drawing changing at the moment of commit.
+    const s0 = imported();
+    const id = s0.composition.layers[0].id;
+    const painted = act(
+      s0,
+      [
+        {
+          kind: "paint",
+          layer: id,
+          stroke: { edits: [{ cell: "s0:AB" as Address, from: null, to: RED }] },
+          gesture: { from: gestureOf(find(s0.composition, id) as Layer) },
+        },
+      ],
+      "painted"
+    );
+    const past = painted.journal.past;
+    for (let k = 0; k <= past.length; k++) {
+      const preview = stepComposition(painted.composition, past, past.length, k);
+      const committed = act(painted, revertMoves(past, past.length, k), "reverted");
+      expect(
+        gestureOf(find(committed.composition, id) as Layer),
+        `state ${k}`
+      ).toEqual(gestureOf(find(preview, id) as Layer));
+    }
+  });
+
+  it("inverts twice to the move it started as", () => {
+    // The property that makes the pair safe: `invertMove` is an involution on
+    // the gesture exactly as it is on the edits, so no sequence of inversions
+    // can leave the two describing opposite directions.
+    const move: Move = {
+      kind: "paint",
+      layer: layerId(1),
+      stroke: { edits: [{ cell: "s0:AB" as Address, from: null, to: RED }] },
+      gesture: { from: { reveal: 4, mode: 6, orbit: 3 } },
+    };
+    expect(invertMove(invertMove(move))).toEqual(move);
+    // ...and one inversion really does turn the strip into a restore.
+    const back = invertMove(move);
+    expect(back.kind).toBe("paint");
+    if (back.kind !== "paint") return;
+    expect(back.gesture.to).toEqual({ reveal: 4, mode: 6, orbit: 3 });
+    expect(back.gesture.from).toBeUndefined();
+  });
+});

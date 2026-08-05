@@ -1074,23 +1074,32 @@ export default function DrawPage() {
    */
   const [proposal, setProposal] = useState<Proposal>(EMPTY_PROPOSAL);
   /**
-   * The proposal a commit was REFUSED for, or `null`.
+   * The refused commit that is still standing: WHICH proposal, and WHY.
    *
-   * Holds the proposal ITSELF rather than a flag or a sentence, and that is what
-   * makes it self-clearing. A refusal is only worth saying while it is still true,
-   * and it stops being true the instant the proposal changes — one more seed
-   * gathered, the whole thing dropped, a focus change that cleared it, a commit
-   * that finally landed. `proposeSeed` hands back the SAME array when nothing
-   * changed and a new one when something did, so `blocked === proposal` is
+   * Holds the proposal ITSELF rather than a flag, and that is what makes it
+   * self-clearing. A refusal is only worth saying while it is still true, and it
+   * stops being true the instant the proposal changes — one more seed gathered,
+   * the whole thing dropped, a focus change that cleared it, a commit that
+   * finally landed. `proposeSeed` hands back the SAME array when nothing changed
+   * and a new one when something did, so `blocked.proposal === proposal` is
    * exactly the question "is the standing proposal the one that was refused", and
    * every one of the dozen places that write `setProposal` clears this without
    * knowing it exists. A boolean would have needed all of them to remember.
    *
-   * The sentence itself stays in `announce`, where `paintAt` and `endStroke`
-   * already put it in the layer model's own words. This says only which proposal
-   * it was about. See `said`.
+   * IT HOLDS ITS OWN SENTENCE, and the version that did not was wrong in a way
+   * the identity check could not catch. `why` used to live in `announce`, spliced
+   * into the standing line at render — but `announce` is the shared channel and
+   * moves on its own: with the same proposal still up, one ⌘Z made the live
+   * region read "undid painted 12 cells on L1 … — nothing was laid and there is
+   * nothing to undo; the proposal still stands", which is a flat contradiction
+   * one keystroke from the refusal. The reason is frozen here at the moment of
+   * refusal, where it cannot be re-rented. `endStroke` hands back the words for
+   * exactly this. See `said`.
    */
-  const [blocked, setBlocked] = useState<Proposal | null>(null);
+  const [blocked, setBlocked] = useState<{
+    readonly proposal: Proposal;
+    readonly why: string;
+  } | null>(null);
 
   /**
    * The drawing: a TREE of address plates, and the journal of what was done to
@@ -1351,21 +1360,27 @@ export default function DrawPage() {
    *
    * `layers.applyMove` strips a layer's `mode`/`orbit` when it is painted into,
    * because those two numbers describe the cells that were there and painting
-   * changes them. Undo has to write them back, so the rung carries them — and it
-   * has to be the value from before the FIRST application, because by the time
-   * `endStroke` builds the rung the live `paintInto` calls have already stripped
-   * it. Captured beside `paintingInto` and cleared with it, so the two can only
-   * ever describe the same gesture.
+   * changes them. Undo has to write them back, so the rung carries them as its
+   * move's `gesture.from` — and it has to be the value from before the FIRST
+   * application, because by the time `endStroke` builds the rung the live
+   * `paintInto` calls have already stripped it. Captured beside `paintingInto`
+   * and cleared with it, so the two can only ever describe the same gesture.
    */
   const paintingWas = useRef<LayerGesture>({});
   /**
-   * Whether this gesture has already said why it is refusing.
+   * The sentence this gesture has already said in refusing, or `null`.
    *
    * A drag over a locked layer applies the brush sixty times a second and every
    * one of them refuses; without this the live region would repeat one sentence
    * until the pointer came up, which is how a screen reader is made useless.
+   *
+   * IT HOLDS THE WORDS AND NOT A FLAG, because `endStroke` has to hand them back
+   * to `commitProposal`, which keeps the refused proposal standing and has to be
+   * able to say WHY without reading `announce` — a piece of state it cannot see
+   * the fresh value of, and which the next unrelated announcement would take
+   * over. The words are the layer model's own; see `layers.paintTarget`.
    */
-  const refusedRef = useRef(false);
+  const refusedRef = useRef<string | null>(null);
   /**
    * Colouring events spent by the gesture in progress.
    *
@@ -2707,8 +2722,8 @@ export default function DrawPage() {
       if (!target.ok) {
         // Once per gesture, not once per application: a drag over a locked
         // layer would otherwise repeat the same sentence sixty times a second.
-        if (!refusedRef.current) {
-          refusedRef.current = true;
+        if (refusedRef.current === null) {
+          refusedRef.current = target.said;
           setAnnounce(target.said);
         }
         return;
@@ -2802,13 +2817,21 @@ export default function DrawPage() {
    * gesture whose edits were all no-ops, and a gesture that never named a layer
    * — and from the outside they used to be indistinguishable from a commit.
    * `commitProposal` is the caller that cannot live with that: it must not throw
-   * away N gathered seeds on the strength of a call that did nothing. `true`
-   * means one rung was pushed and one undo takes it back; `false` means the plate
-   * is exactly as it was and there is nothing to undo. Every path says which,
-   * because a caller that guessed would be guessing about the journal.
+   * away N gathered seeds on the strength of a call that did nothing.
+   * `journalled` true means one rung was pushed and one undo takes it back;
+   * false means the plate is exactly as it was and there is nothing to undo.
+   * Every path says which, because a caller that guessed would be guessing about
+   * the journal.
+   *
+   * `said` is the sentence this call leaves standing — the layer model's own
+   * words for a refusal, the brush's for a gesture that moved nothing, the whole
+   * commit line for one that landed. Returned rather than left in `announce`
+   * because a caller that keeps its proposal has to be able to REPEAT the reason
+   * later, and `announce` is a shared channel that the next undo or tool change
+   * will have taken over by then. See `blocked`.
    */
   const endStroke = useCallback(
-    (how: "stroke" | "commit" = "stroke"): boolean => {
+    (how: "stroke" | "commit" = "stroke"): { journalled: boolean; said: string } => {
       const edits = pending.current;
       const used = pendingEvents.current;
       const groups = pendingGroups.current;
@@ -2820,22 +2843,24 @@ export default function DrawPage() {
       pendingGroups.current = [];
       paintingInto.current = null;
       paintingWas.current = {};
-      refusedRef.current = false;
+      refusedRef.current = null;
       setLiveEvents(0);
       // The refusal has already been said, in the layer model's own words. A
       // second sentence here would either repeat it or, worse, contradict it
       // with "nothing changed" — which is true and useless.
-      if (refused && edits.length === 0) return false;
+      if (refused !== null && edits.length === 0) {
+        return { journalled: false, said: refused };
+      }
       if (edits.length === 0 || into === null) {
         // Not silence. A gesture that changed nothing is the most confusing
         // thing an adjustment brush can do, and the reason is always the same
         // one worth teaching: there was no colour under it to transform.
-        setAnnounce(
+        const nothing =
           tool === "adjust"
             ? "nothing adjusted — the brush found no paint under it"
-            : "nothing changed"
-        );
-        return false;
+            : "nothing changed";
+        setAnnounce(nothing);
+        return { journalled: false, said: nothing };
       }
       const mark: StrokeMark<Address> | undefined =
         groups.length === 0 ? undefined : { mode, groups };
@@ -2851,23 +2876,22 @@ export default function DrawPage() {
       setSession((s) =>
         journalAct(
           { ...s, composition: compRef.current },
-          [{ kind: "paint", layer: into, stroke, was }],
+          [{ kind: "paint", layer: into, stroke, gesture: { from: was } }],
           `painted ${edits.length} cells on ${name}`,
           used
         )
       );
       const verb =
         tool === "erase" ? "erased" : tool === "adjust" ? adjustName : "painted";
-      setAnnounce(
-        `${how === "commit" ? "committed — " : ""}${verb} ${edits.length} cell${
-          edits.length === 1 ? "" : "s"
-        } on ${name} with the ${mode}-fold brush${
-          band === null ? "" : `, band ${band}`
-        }${isolation === null ? "" : `, arm ${isolation}`} — ${
-          flattenComposition(compRef.current, book).size
-        } on the plate`
-      );
-      return true;
+      const landed = `${how === "commit" ? "committed — " : ""}${verb} ${
+        edits.length
+      } cell${edits.length === 1 ? "" : "s"} on ${name} with the ${mode}-fold brush${
+        band === null ? "" : `, band ${band}`
+      }${isolation === null ? "" : `, arm ${isolation}`} — ${
+        flattenComposition(compRef.current, book).size
+      } on the plate`;
+      setAnnounce(landed);
+      return { journalled: true, said: landed };
     },
     [tool, adjustName, mode, band, isolation, book]
   );
@@ -3175,13 +3199,20 @@ export default function DrawPage() {
       // `journalAct` APPLIES as well as records, and the effect on `compRef`
       // puts the ref back in step on the next render — so there is exactly one
       // place the composition is written and no chance of the two disagreeing.
-      // `was` is read here rather than captured earlier because this route
-      // applies nothing before journalling: the layer still carries whatever
-      // gesture the paint is about to invalidate.
+      // `gesture.from` is read here rather than captured earlier because this
+      // route applies nothing before journalling: the layer still carries
+      // whatever gesture the paint is about to invalidate.
       setSession((s) =>
         journalAct(
           { ...s, composition: compRef.current },
-          [{ kind: "paint", layer: into.id, stroke, was: gestureOf(into) }],
+          [
+            {
+              kind: "paint",
+              layer: into.id,
+              stroke,
+              gesture: { from: gestureOf(into) },
+            },
+          ],
           said(edits.length),
           spent
         )
@@ -3419,7 +3450,10 @@ export default function DrawPage() {
       // afterwards — the identity trick the whole arrangement rests on, defeated
       // by the one value that is not unique.
       if (proposal.length === 0) return;
-      setBlocked(proposal);
+      setBlocked({ proposal, why });
+      // `said` renders `blocked.why` while the proposal stands, so this is not
+      // what the user hears now — it is what `announce` should hold once the
+      // proposal is gone, so the last thing said stays true after a drop.
       setAnnounce(why);
     },
     [proposal]
@@ -3490,15 +3524,16 @@ export default function DrawPage() {
       return;
     }
     for (const seed of proposal) paintAt(seed);
-    if (endStroke("commit")) {
+    const end = endStroke("commit");
+    if (end.journalled) {
       setProposal(EMPTY_PROPOSAL);
       setBlocked(null);
       return;
     }
-    // `endStroke` and `paintAt` have already said WHY, in the layer model's own
-    // words for a refusal and in the brush's for a gesture that moved nothing.
-    // This adds only the half they cannot know: the proposal is still there.
-    setBlocked(proposal);
+    // `endStroke` hands back the words it left standing — the layer model's own
+    // for a refusal, the brush's for a gesture that moved nothing. This adds the
+    // half they cannot know: the proposal is still there.
+    blockProposal(end.said);
   }, [proposal, proposalSpecs, previewing, tool, paintAt, endStroke, blockProposal]);
 
   /**
@@ -5637,12 +5672,19 @@ export default function DrawPage() {
    *
    * The standing branch MASKS `announce`, which is right while nothing has gone
    * wrong and wrong the moment something has: a commit that was refused says why
-   * through `announce` — "L2 is locked", in the layer model's own words — and now
-   * that a refused commit keeps its proposal, that sentence would be spoken to
-   * nobody. So a refusal that is still about THIS proposal leads, and the
-   * standing sentence follows it unchanged rather than being replaced, because
-   * what stands and how to act on it did not stop being true. `blocked` carries
-   * which proposal, and clears itself when the proposal moves.
+   * — "L2 is locked", in the layer model's own words — and now that a refused
+   * commit keeps its proposal, that sentence would be spoken to nobody. So a
+   * refusal that is still about THIS proposal leads, and the standing sentence
+   * follows it unchanged rather than being replaced, because what stands and how
+   * to act on it did not stop being true.
+   *
+   * THE REASON IS READ OFF `blocked` AND NOT OFF `announce`. Splicing the live
+   * `announce` into this template was the first attempt and it rented a channel
+   * that moves: `doUndo` does not clear the proposal, so ⌘Z after a refusal
+   * spliced "undid painted 12 cells" into "…nothing was laid and there is
+   * nothing to undo", a contradiction inside one aria-live sentence. `blocked`
+   * freezes the words with the proposal they are about, and both fall away
+   * together the moment that proposal changes.
    */
   const standingSaid = !standing
     ? ""
@@ -5658,8 +5700,8 @@ export default function DrawPage() {
       ? `${dragSpec.said} — release to lay it, Escape to cancel`
       : !standing
       ? announce
-      : blocked === proposal
-      ? `${announce} — nothing was laid and there is nothing to undo; the proposal still stands. ${standingSaid}`
+      : blocked?.proposal === proposal
+      ? `${blocked.why} — nothing was laid and there is nothing to undo; the proposal still stands. ${standingSaid}`
       : standingSaid;
 
   const schemeGradient = `linear-gradient(90deg, ${tape

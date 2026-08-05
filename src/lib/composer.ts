@@ -89,6 +89,15 @@ export function invertMove(move: Move): Move {
             (e): CellEdit<Address> => ({ cell: e.cell, from: e.to, to: e.from })
           ),
         },
+        // SWAPPED, on the same line of reasoning as the edits above and in the
+        // same breath, which is the whole reason `layers.MoveGesture` is a
+        // `{ from, to }` pair. The inverse of a paint that stripped a gesture is
+        // a move that RESTORES it going forwards, and forwards is the only
+        // direction these are ever applied in: `revertMoves` hands them to
+        // `layers.act`, which is an ordinary journal rung. Left out, REVERT
+        // dropped `mode` and `orbit` for good and said "⌘Z brings them all back"
+        // while doing it.
+        gesture: { from: move.gesture.to, to: move.gesture.from },
       };
     case "rename":
       return { kind: "rename", layer: move.layer, from: move.to, to: move.from };
