@@ -77,7 +77,7 @@ import {
   type Address,
   type AddressBook,
 } from "./plate";
-import { animationTiming, markLookup } from "./replay";
+import { animationTiming, clampSpan, markLookup, spanSteps, type InOut } from "./replay";
 import type { History, Stroke } from "./strokes";
 
 /** What this module needs of an address book: the two directions, and the stem. */
@@ -169,6 +169,40 @@ export interface GestureOptions {
    * picture asks for one; the caller that wants a faithful record does not.
    */
   unpainted?: string;
+  /**
+   * THE WRITER FOR `emit.EmitLayer.nest`: one trail per gesture, index-aligned
+   * with `history`, from `timeline.compTrails`.
+   *
+   * ── Why this is a parameter and not an import ───────────────────────────
+   *
+   * A gesture layer IS a beat — one node per thing the replay shows coming up,
+   * in play order — so `compTrails(tree)[k]` is by construction the trail of the
+   * layer this module gives `reveal: k`. Writing it is therefore an assignment
+   * and not a computation, and the whole of the writer half the field has been
+   * missing since `artfile.ArtLayer.nest` and `timeline.treeFromTrails` landed.
+   *
+   * It arrives as an ARGUMENT rather than as a `Timeline` this module walks,
+   * because the tree is a fact about the JOURNAL and this module is a fact about
+   * a STROKE LIST. Taking the tree would put `nested.ts` and `timeline.ts` in
+   * this module's import graph to re-derive a list the caller already holds, and
+   * would let the two disagree about which beat is which — the caller is the
+   * only place that knows whether it is handing in every act, every beat, or a
+   * cut of them, and the alignment is its to keep. `test/gestureexport.test.ts`
+   * measures the alignment on a history built by the real machinery.
+   *
+   * ABSENT, SHORT AND `undefined` ALL WRITE NOTHING. A drawing that has never
+   * been grouped produces a trail of `undefined` at every beat — that is
+   * `compTrails`' own spelling for "at the root" — so an ungrouped document
+   * writes no `nest` key anywhere and its bytes are the bytes it wrote before
+   * this existed. `test/artfile.test.ts` pins that on the exact payload rather
+   * than on a re-encode, which would agree if both sides gained a key.
+   *
+   * CHILDREN NEVER CARRY ONE, on the same argument that keeps `reveal` off them:
+   * a sub-orbit sits inside its gesture's `<g>`, the gesture is the beat, and a
+   * composition boundary restated on the orbits inside a beat would be the same
+   * fact written `orbit` times and a second place for it to drift.
+   */
+  trails?: readonly (string | undefined)[];
 }
 
 const DEFAULT_PREFIX = "g";
@@ -266,6 +300,8 @@ function addressResolver(book: ProvenanceBook): (a: Address) => readonly number[
  *            which is a different statement, and a false one.
  *   orbit    the size of the recorded group, which is the REALISED orbit and not
  *            the mode. See the header.
+ *   nest     the nested-timeline compositions this beat sits inside, when the
+ *            caller supplies the trails. See `GestureOptions.trails`.
  *   paint    the cells this gesture SET, resolved to the book's depth.
  *
  * ── Erases paint nothing, and are still gestures ────────────────────────
@@ -313,6 +349,7 @@ export function gestureLayers(
   const nest: GestureNesting = options.nest ?? "auto";
   const withReveal = options.reveal ?? true;
   const unpainted = options.unpainted;
+  const trails = options.trails;
   const cellsOf = addressResolver(book);
 
   const out: EmitLayer[] = [];
@@ -393,6 +430,15 @@ export function gestureLayers(
     if (withReveal) layer.reveal = k;
     if (mark !== undefined) layer.mode = mark.mode;
     if (!split && uniform !== null) layer.orbit = uniform;
+    // The composition boundary, straight off the caller's list — see
+    // `GestureOptions.trails`. Guarded on the empty string as well as on
+    // `undefined` because `artfile`'s validator REFUSES `nest: ""` rather than
+    // reading it as "no nesting": absent is the one spelling of that, and a
+    // second spelling is a second way for a round trip to pick the other one.
+    // `compTrails` never produces the empty string; this is the guard for a
+    // caller that assembled its list some other way.
+    const trail = trails?.[k];
+    if (trail !== undefined && trail.length > 0) layer.nest = trail;
     layer.name = nameOf(k, mark?.mode, split ? null : uniform, split ? bins.size : 0);
 
     if (!split) {
@@ -476,7 +522,7 @@ const plural = (n: number, word: string): string =>
   `${n} ${word}${n === 1 ? "" : "s"}`;
 
 /**
- * The timing an animated export of `steps` gesture layers wants.
+ * The timing an animated export of `steps` gesture layers wants, cut to `span`.
  *
  * Derived rather than chosen, so the `steps` in the file cannot disagree with
  * the number of reveals the layers actually carry — a mismatch that shows up as
@@ -486,12 +532,115 @@ const plural = (n: number, word: string): string =>
  *
  * Clamped to what `artfile`'s validator accepts, so a document built from this
  * is a document that loads back.
+ *
+ * ── `steps` IS THE DRAWING'S LENGTH; the timing is scaled to WHAT PLAYS ──
+ *
+ * The two are different numbers the moment there is a cut, and each is read by
+ * something that would be wrong with the other one.
+ *
+ *   `steps` is the drawing's own beat count, because `EmitAnimation.in` and
+ *   `.out` are indices into the SAME reveal space the layers carry, and a
+ *   `steps` shortened to the cut would put both marks outside the space they
+ *   index. `emit.animationRules` derives the cycle from `out - in + 1` itself.
+ *
+ *   The HOLD is scaled to `spanSteps`, because it is a share of the drawing
+ *   time and the drawing time is what the cut changes.
+ *   `replay.animationTiming` says so in as many words — "`steps` IS THE BOUNDED
+ *   COUNT when a replay has an in and an out point" — and gives the number: a
+ *   hundred-gesture drawing cut to five would otherwise spend four fifths of
+ *   its loop on a still frame.
+ *
+ * A WHOLE SPAN WRITES NEITHER MARK, so a drawing with nothing cut re-encodes to
+ * exactly the four keys this function wrote before the pair existed, in the same
+ * order. That is `emit.compositionOf`'s own rule — "both or neither, and last" —
+ * and it is what keeps `test/inout.test.ts`'s byte claims true of this producer
+ * as well as of the one they were written for.
  */
-export function gestureAnimation(steps: number, stepMs: number): EmitAnimation {
+export function gestureAnimation(
+  steps: number,
+  stepMs: number,
+  span?: InOut | null
+): EmitAnimation {
   const n = Math.min(MAX_LAYERS, Math.max(0, Math.floor(steps) || 0));
   const step = Math.max(1, Math.min(3_600_000, Math.floor(stepMs) || 1));
-  const t = animationTiming(step, n);
-  return { stepMs: step, holdMs: t.holdMs, fadeMs: t.fadeMs, steps: n };
+  // `clampSpan` rather than a check: it is the UI-facing end of the marks and
+  // it already brings a span left over from a longer drawing or a wider frame
+  // inside this one, which is exactly the state a cut set before a reframe is
+  // in. `null` is a replay with no beats, which has nothing to cut.
+  const cut = clampSpan(span, n);
+  const t = animationTiming(step, cut === null ? n : spanSteps(cut));
+  const base: EmitAnimation = {
+    stepMs: step,
+    holdMs: t.holdMs,
+    fadeMs: t.fadeMs,
+    steps: n,
+  };
+  if (cut === null || (cut.in === 0 && cut.out === n - 1)) return base;
+  return { ...base, in: cut.in, out: cut.out };
+}
+
+// ── how many nodes a gesture tree costs ──────────────────────────────────
+
+/** How big a gesture tree is, against the only limit that can refuse a file. */
+export interface LayerBudget {
+  /** Every node of the tree, parents and children alike. */
+  readonly layers: number;
+  /** `artfile.MAX_LAYERS`, restated so a caller can report the pair. */
+  readonly limit: number;
+  /** What to say when it does not fit, or `null` when it does. */
+  readonly said: string | null;
+}
+
+/**
+ * Whether this tree can be written down at all — COUNTED BEFORE EMITTING.
+ *
+ * ── Why the count has to happen here and not at the file ────────────────
+ *
+ * `artfile.MAX_LAYERS` is 8192 NODES for the whole composition and a payload
+ * past it is REFUSED ON LOAD rather than truncated. So a producer that writes
+ * one and hands it to a person has produced a file that this program cannot
+ * open: the loss is silent at save time and total at load time, which is the
+ * worst available ordering. Counting first turns it into a decline the person
+ * reads while the drawing is still in front of them.
+ *
+ * IT IS REACHABLE, which is why it is here and not a comment. `layers.
+ * HISTORY_LIMIT` caps the journal at 256 gestures, so a flat tree can never come
+ * close — but `GestureNesting` `auto` adds A CHILD PER CLAIMING GROUP whenever a
+ * drag's recorded groups disagree in size, and one drag across a deep plate
+ * applies the brush hundreds of times. 256 gestures averaging 33 orbits apiece
+ * is 8448 nodes, and a propose-mode drag on a depth-5 canvas passes that without
+ * being an unusual thing to draw. `test/gestureexport.test.ts` builds exactly
+ * such a history out of real strokes rather than asserting that it could.
+ *
+ * A SENTENCE AND NOT A BOOLEAN, because the caller is a button and the person
+ * who pressed it needs to know three things: that nothing was written, how far
+ * over the drawing is, and what would bring it under.
+ *
+ * IT OFFERS WHAT A CONTROL CAN ACTUALLY DO. `nest: "never"` would fix it in one
+ * word — a flat tree is exactly as long as the history, so at most 256 nodes —
+ * and the sentence deliberately does NOT say so, because nothing in the editor
+ * sets that option and advice a reader cannot act on is worse than none. Merging
+ * frames is a control the timeline strip already has, and it shortens the
+ * history itself; exporting the still is the other button on the same panel.
+ */
+export function layerBudget(layers: readonly EmitLayer[]): LayerBudget {
+  let count = 0;
+  const walk = (list: readonly EmitLayer[]): void => {
+    for (const l of list) {
+      count += 1;
+      if (l.children !== undefined) walk(l.children);
+    }
+  };
+  walk(layers);
+  if (count <= MAX_LAYERS) return { layers: count, limit: MAX_LAYERS, said: null };
+  return {
+    layers: count,
+    limit: MAX_LAYERS,
+    said:
+      `nothing written — this drawing's gestures come to ${count} groups and a ` +
+      `FOURFOLD file may hold ${MAX_LAYERS}, so the file would have been refused ` +
+      `on load. Merge frames in the timeline, or export the still instead.`,
+  };
 }
 
 // ── selection by symmetry: the compound-path query ───────────────────────

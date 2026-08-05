@@ -170,6 +170,7 @@ import {
   actAfterMerge,
   actAtStep,
   beatsOf,
+  compTrails,
   GROUND,
   lostSaid,
   markIn,
@@ -272,7 +273,27 @@ import {
   stackFromEmit,
   stepComposition,
 } from "@/lib/composer";
-import { parse as parseEmit, serialise as serialiseEmit } from "@/lib/emit";
+import {
+  parse as parseEmit,
+  serialise as serialiseEmit,
+  type EmitDoc,
+} from "@/lib/emit";
+/**
+ * THE GESTURE TREE, which until now was built, tested and called by nothing.
+ *
+ * `provenance.gestureLayers` reads the journal as one layer per BEAT — each
+ * carrying the brush symmetry it was made under, the orbit that symmetry
+ * actually realised, and its place in the reveal order. `emitLayersOf` reads the
+ * COMPOSITION as the layers a person built. Both are legitimate and they answer
+ * different questions, so the export picks by what the document is FOR: see
+ * `gestureDoc`.
+ */
+import {
+  gestureAnimation,
+  gestureLayers,
+  layerBudget,
+  provenanceCensus,
+} from "@/lib/provenance";
 import {
   SCHEMES,
   SCHEME_NAMES,
@@ -6212,6 +6233,122 @@ export default function DrawPage() {
     };
   }, [comp, past, bakedFrame, canvas, book, showTiling, playCut]);
 
+  /**
+   * THE SAME REPLAY AS A FOURFOLD DOCUMENT, with one layer per gesture.
+   *
+   * ── Two layer trees, and the export picks by what the file is FOR ───────
+   *
+   * `emitDoc` builds the EDITOR's layers — the containers a person made — and
+   * that is the right tree for a still: it answers "what is this drawing made
+   * of?". This builds the HISTORY's layers, one node per beat, and that is the
+   * right tree for a replay: it answers "how did this drawing happen?". Both are
+   * true at once and neither can be derived from the other, because MANY
+   * GESTURES PAINT INTO ONE LAYER and a layer outlives every gesture that
+   * touched it. Giving `layers.Layer` a `reveal` would force one of them to win,
+   * which is the same "one number is a lie about the others" error `provenance.
+   * ts` argues at length about `orbit`.
+   *
+   * So the still path is untouched — `svgText` and `svgOfScope` call `emitDoc`
+   * and get exactly the bytes they always got — and this spreads that document
+   * and replaces the two fields an animation owns.
+   *
+   * ── The reveals are in BEAT space, which is the whole of the alignment ──
+   *
+   * `frameBeats()` is `timeline.beatsOf`: the acts that actually changed a shown
+   * cell, in order, which is precisely the list `animationSteps` turns into
+   * steps and `EmitAnimation.steps` counts. Handing `past` in whole instead would
+   * put the reveals in ACT space — a rename, a reorder and a stroke that landed
+   * in another sector all occupy a position there and none of them is a beat — so
+   * the last gesture of a 40-act, 31-beat drawing would ask to be revealed at
+   * step 39 of a 31-step animation and would never come up. The strokes are
+   * therefore SELECTED BY BEAT, `beats.map(a => strokes[a])`, and every index
+   * downstream is an index into that list: the reveals, the trails, and the in
+   * and out points.
+   *
+   * ── The cut is written as a PAIR OF MARKS and not as a shorter list ─────
+   *
+   * `boundAnimation` cuts the step list for `animatedSvg` and for the GIF,
+   * because neither format can express "already on the plate" or "in the file and
+   * not in the picture" — they have to be handed a ground and a truncated list.
+   * THIS FORMAT CAN, and does it in the stylesheet: `emit.animationRules` gives a
+   * layer before the in point `opacity: 1` from the first frame and a layer past
+   * the out point `opacity: 0`, and `EmitAnimation.in`/`.out` are the marks it
+   * reads. So every gesture keeps its `<g>`, its `data-mode` and its `data-orbit`
+   * whether or not the cut plays it — which `emit.ts` states as a rule ("a file
+   * whose out point dropped the last three strokes must still say that those
+   * three strokes were six-fold; the cut is what the file DRAWS, the markup is
+   * what it MEANS") — and, load bearing for the picture, THE FOLDED GROUND IS
+   * STILL PAINT. Handing this path the bound list instead would leave the cells
+   * drawn before the in point in no layer at all, so `serialise` would put them
+   * in the tiling group wearing the unpainted fill and the exported first frame
+   * would be a different picture from the one REPLAY opens on.
+   * `test/gestureexport.test.ts` measures that difference rather than asserting
+   * it.
+   *
+   * ── What is announced rather than thrown ────────────────────────────────
+   *
+   * Both refusals are stated here because both are about the DRAWING rather than
+   * about the file: a frame in which no gesture moved a cell has no animation to
+   * write, and a gesture tree past `artfile.MAX_LAYERS` is a file `parse` would
+   * refuse on load, so it is declined before a byte is written rather than
+   * discovered by the person who tries to open it. `serialise`'s own refusal —
+   * a child revealing before its ancestor — cannot arise here and is still caught
+   * by the caller: gesture layers put the reveal on the gesture and leave the
+   * orbits under it with no time at all, which is exactly the shape
+   * `emit.revealBreak` can never fault.
+   */
+  const gestureDoc = useCallback((): EmitDoc | null => {
+    if (past.length === 0) {
+      setAnnounce("nothing to animate — no committed gesture changed a cell in this frame");
+      return null;
+    }
+    const beats = frameBeats();
+    if (beats.length === 0) {
+      setAnnounce("nothing to animate — no committed gesture changed a cell in this frame");
+      return null;
+    }
+    // The tree is brought into step with the beat list HERE, by the one function
+    // that does it anywhere — a tree naming beats this frame does not have would
+    // hand `compTrails` a list of the wrong length and silently shift every
+    // composition boundary by the difference. `standTree` returns the same object
+    // when nothing moved, so the ordinary export sets no state.
+    const trails = compTrails(standTree(beats).tree);
+    const strokes = actStrokes(past);
+    const layers = gestureLayers(
+      beats.map((a) => strokes[a]),
+      book,
+      {
+        // THE ANIMATED PATH'S OWN UNPAINTED FILL, the same expression
+        // `animationModel` hands `animationSteps` and for the same reason: an
+        // erase sets a cell to nothing, a layer stack can only draw over, so an
+        // erase drawn in the fill an unpainted cell wears is what makes the
+        // stack additive and lets it reconstruct the plate. Without it a gesture
+        // that rubbed something out would leave the colour it removed on screen.
+        unpainted: showTiling ? TILE : PLATE_BG,
+        trails,
+      }
+    );
+    const budget = layerBudget(layers);
+    if (budget.said !== null) {
+      setAnnounce(budget.said);
+      return null;
+    }
+    return {
+      ...emitDoc(),
+      layers,
+      animation: gestureAnimation(beats.length, stepMs, playCut.span),
+    };
+  }, [
+    past,
+    frameBeats,
+    standTree,
+    book,
+    showTiling,
+    emitDoc,
+    stepMs,
+    playCut,
+  ]);
+
   const animationText = useCallback(
     (grouping: "orbit" | "cell") => {
       const model = animationModel();
@@ -6308,6 +6445,56 @@ export default function DrawPage() {
       } (${orbitGroups} recorded orbits) over ${cells} cell${
         cells === 1 ? "" : "s"
       }, one CSS rule per gesture; ${Math.round(bytes.size / 1024)} kB`
+    );
+  };
+
+  /**
+   * The replay as a FOURFOLD document: the same animation, and loadable back.
+   *
+   * A THIRD FILE and not a replacement, which is a deliberate choice rather than
+   * an accretion. `animatedSvg`'s output is the smallest self-contained replay
+   * this program can write and the GIF is measured against it frame for frame;
+   * it carries no layer composition, so `emit.parse` returns `null` for it and
+   * dropping one back on the plate restores the finished drawing and none of its
+   * history. This one states the drawing AS THE HISTORY MADE IT — a `<g>` per
+   * gesture carrying `data-mode`, `data-orbit` and `data-reveal`, the timeline's
+   * own grouping as `nest`, and the payload every FOURFOLD file carries — so it
+   * animates in a browser, opens in Illustrator or Inkscape with every stroke an
+   * addressable compound path, AND comes back into this program with its
+   * gestures and its groups intact. The two answer different questions and the
+   * smaller one is not a subset of the larger.
+   *
+   * The census is the sentence's whole point: a file whose provenance can only
+   * be read by the program that wrote it is the thing this format exists not to
+   * be, so the announcement reports what a reader will find in it.
+   */
+  const exportGestureSvg = () => {
+    const doc = gestureDoc();
+    // Both refusals are announced by `gestureDoc`, which is where the reason is
+    // known. Nothing further to say here.
+    if (doc === null) return;
+    let text: string;
+    try {
+      text = serialiseEmit(doc);
+    } catch (err) {
+      // Unreachable for a gesture tree — see `gestureDoc` — and caught on the
+      // same rule `svgText` keeps: a refusal is a sentence, never a dead click.
+      refuseEmit(err);
+      return;
+    }
+    const name = nameFor("svg", "-gestures");
+    const bytes = new Blob([text], { type: "image/svg+xml;charset=utf-8" });
+    download(bytes, name);
+    const c = provenanceCensus(doc.layers);
+    const anim = doc.animation;
+    setAnnounce(
+      `exported ${name} — ${c.layers} layer${c.layers === 1 ? "" : "s"}, ${
+        c.marked
+      } carrying a brush symmetry, ${c.short} with an orbit shorter than its mode` +
+        (anim === null || anim.in === undefined || anim.out === undefined
+          ? ""
+          : `; cut to in ${anim.in}, out ${anim.out} of ${anim.steps}`) +
+        `; ${Math.round(bytes.size / 1024)} kB`
     );
   };
 
@@ -8028,6 +8215,14 @@ export default function DrawPage() {
                       >
                         save svg animation
                       </button>
+                      <button
+                        type="button"
+                        className={styles.rewindAction}
+                        onClick={exportGestureSvg}
+                        aria-label="save the replay as a layered FOURFOLD file — one group per gesture carrying its brush symmetry, the orbit it realised and its place in the timeline, animating in a browser and loading back into this program"
+                      >
+                        save layered svg
+                      </button>
 
                       <label className={styles.rewindField}>
                         <span className={styles.benchKey}>gif</span>
@@ -8118,6 +8313,12 @@ export default function DrawPage() {
                       it was. The exported animation is a{" "}
                       <b>separate file</b>: one <code>&lt;g&gt;</code> per orbit
                       carrying <i>one</i> CSS animation, not one per cell. The{" "}
+                      <b>layered svg</b> is the same replay written as a FOURFOLD
+                      document — one <code>&lt;g&gt;</code> per <i>gesture</i>,
+                      each stating the brush symmetry it was made under and the
+                      orbit that symmetry actually laid down, so a stroke is an
+                      addressable compound path in any SVG tool — and it loads
+                      back here with its gestures and its grouping intact. The{" "}
                       <b>GIF</b> is the same replay at the same step, one frame
                       per gesture, with the palette taken from the drawing
                       rather than quantised — so the colours are exact unless

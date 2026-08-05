@@ -333,10 +333,21 @@ export interface EmitLayer {
    * each id belonged to and would have no answer for a composition whose own
    * beats were all merged away.
    *
-   * NOT POPULATED YET — no producer sets it, so it is absent from every file
-   * this program currently writes. The reader half is complete and tested; the
-   * writer needs `EmitLayer.reveal` to be set from the drawing path, which is
-   * still the open gap it has been since gesture provenance landed.
+   * WRITTEN BY THE GESTURE PATH ONLY, which is the whole of what a trail can
+   * honestly be about. `provenance.gestureLayers` takes the trails as
+   * `GestureOptions.trails` and puts `compTrails(tree)[k]` on the layer it gives
+   * `reveal: k` — the two lists are the same beats in the same order, so the
+   * writer is an assignment. `composer.emitLayersOf` sets nothing: an EDITOR
+   * layer is not a beat, many gestures paint into one, and a layer that claimed
+   * a composition boundary would be picking one of them to be true about. That
+   * is the same "one number is a lie about the others" argument `provenance.ts`
+   * makes about `orbit`, one field along.
+   *
+   * SO AN UNGROUPED DRAWING AND EVERY STILL EXPORT STILL WRITE NO FIELD, and
+   * their bytes are the bytes they wrote before this existed — `compTrails`
+   * answers `undefined` at the root, and `toArtLayer` omits an absent or empty
+   * trail. Pinned on the exact payload in `test/artfile.test.ts` and on the
+   * exact still document in `test/gestureexport.test.ts`.
    */
   nest?: string;
 }
