@@ -106,13 +106,43 @@ for (2,3), (3,2), (2,2), (3,3), (2,6), (4,3).
 
 **Depth stops being resolution [PROVEN].** MIX-C's 354 leaves are all at depth 3
 and come in three different scales (12, 18, 27). The order that survives is not
-`≤` on depth; it is **divisibility of scale**. Concretely, in this codebase:
+`≤` on depth; it is **divisibility of scale**.
+
+> **SHARPENED after the refactor landed (`e4faf9c`).** "Depth stops being
+> resolution" was the right conclusion stated one notch too broadly. Depth
+> remains **the number of cuts**, which is real, durable, and still needed —
+> what it stops being is a *resolution*. The distinction was forced by a case
+> this scoping run did not anticipate: see *the gasket count* below. Counting
+> levels is fine; exponentiating by them was not.
+
+Concretely, in this codebase:
 
 - `figure.ts:252` and `hexagon.ts:196` (`const scale = 2 ** depth`),
   `lattice.ts:235,341`, `view.ts:243`, `relief.ts:297`, `artfile.ts:373`
   (`(canvas === "hexagon" ? 6 : 1) * 4 ** depth`) and `arms.ts:229`
   (`(4 ** depth − 1)/3`) all compute a scale or a count *from a depth*. Each is
   a place where depth is doing the work scale must do.
+
+  **The list was incomplete: there were sixteen, not eight.** All eight above
+  were real. The eight this run missed, found by doing the work:
+  `presets.ts:179` (the gasket count — see below), `plate.ts:235` (the
+  constraint site prefix inheritance actually runs through), `plate.ts:560` (an
+  equality-of-resolution test deciding whether the `plate` field is written to
+  the file at all), `provenance.ts:267–272` (a **three-way** same/deeper/
+  shallower comparison, not two-way), and six in `page.tsx` — one of which was
+  a second spelling of `arms.ts:229`. Out of that lane and still open:
+  `src/app/page.tsx`, `src/app/conventions/page.tsx` (five sites, all labels)
+  and `Board.tsx:330`, the only one that is arithmetic rather than display
+  (a pixel period divided by a scale).
+
+- **The gasket count is not a function of scale, and cannot be made one
+  [PROVEN, found during the refactor].** `presets.ts` computes `3 ** depth`.
+  Scale is the product of **edge divisions**; the gasket is the product of
+  **upright child counts** `k(k+1)/2`, and that is not recoverable from `k²`
+  once `k` varies — scale 6 is `2·3` (18 upright words) or `6·1` (21). It stays
+  a depth-indexed *product over levels*. This is the case that drew the line
+  above: a quantity indexed by the number of cuts is legitimate; a quantity
+  computed as `radix ** depth` was the bug.
 - MATH-76's quality field is a *depth* field. Under mixed radix a depth field no
   longer names a resolution, and a buffer keyed by depth would be comparing
   incomparable things. The fix is mechanical (key by scale) but it is not
@@ -334,9 +364,42 @@ codebase currently makes**:
    rep-9 charge exists only relative to a chosen basepoint, and the hub and the
    canonical arm decomposition go with it.
 
-### The first honest increment
+### The first honest increment — **LANDED, `e4faf9c`**
 
 **Replace depth with scale, at fixed radix 4, changing nothing else.**
+
+> **Outcome.** All four bullets below were done. **1,440 tests passed
+> unmodified**, 23 added; `tsc`, `eslint` and `next build` clean. Byte identity
+> pinned for all three export paths (still 17,228 B, animated 22,959 B, layered
+> gesture 20,449 B, each with its sha256), captured pre-refactor by stashing
+> `src/` so the pins could not be a re-encode of the new behaviour.
+>
+> **The single boundary is `src/lib/scale.ts`** — the only `EDGE_DIVISION **
+> depth` in `src/`, with exactly two callers, both seams where a depth *enters*
+> the model from outside: `buildFigure(depth)` (the UI states one) and
+> `cellCount(_, depth)` (the file states one). `ArtPayload.depth` is untouched.
+>
+> **The address rule is enforced by type, not by comment.** `radixAt(word,
+> level)` takes a string and an index and nothing else, so per-node radix data
+> cannot enter without changing the signature.
+>
+> **A guard-fire found a hole in the refactor's own test.** The first
+> byte-identity fixture hand-built its payload and stayed **green** under a
+> deliberately mutated `scaleOfDepth` — because the still picture's geometry is
+> genuinely scale-invariant: `buildFigure` multiplies barycentrics up by scale
+> and `toXY` divides them back, so a uniform scale error cancels in the pixels.
+> Rebuilt through the real `payloadFromPaint` + `plateEntries` path it reaches
+> `cellCount` and is lethal. **A pinned digest that cannot fail measures
+> nothing**, and only the mutation distinguished the two.
+>
+> **Two things marked rather than built.** Divisibility is a **partial** order,
+> so mixed radix admits a fourth case the current two- and three-way branches do
+> not decide: *incomparable* (18 against 27). It cannot arise at one radix, so
+> nothing was invented; both branch sites carry a comment saying where the case
+> goes. And `plate.depthCensus` is **still keyed by depth** — precisely the
+> depth-keyed buffer this document warns about — because rekeying changes what
+> the function returns, which that pass was not permitted to do. It is the
+> named follow-on.
 
 Every claim above says the geometry is ready and the *bookkeeping* is not. So
 the first increment should buy the bookkeeping and no new mathematics:
@@ -368,5 +431,33 @@ harden into the file format before anyone has decided what they mean.
   containment oracle, mixed-radix trees, the group/torsor search, the frame
   residual. No float anywhere; nothing in `src/app` imports it.
 - `test/reptile.test.ts` — 19 tests, all counts above.
-- Suite: 1,421 → **1,440** tests, all passing. `npx tsc --noEmit` clean,
-  `npx eslint` clean.
+- Suite at scoping: 1,421 → **1,440** tests, all passing.
+
+**Added by the refactor (`e4faf9c`), which this document specified:**
+
+- `src/lib/scale.ts` — the single depth↔scale boundary, `refines` (divisibility),
+  and `radixAt`, whose signature is what keeps an address determining its own
+  scale.
+- `test/scale.test.ts` — 20 tests, using `reptile.ts` as an **independent
+  geometric oracle**: `scale = 2^depth` checked against it rather than against
+  the formula, divisibility ≡ ordering at radix 4 *and* its failure on a mixed
+  tree the oracle builds, and an address determining its own scale with no
+  figure in hand.
+- `test/byteidentity.test.ts` — 3 tests, the pinned digests for the three export
+  paths.
+- Suite: 1,440 → **1,463** tests, **none of the 1,440 modified**.
+
+## Where this stands for fold-re
+
+The §9 amendment this work supports — from *"exactly 4 children"* to the
+alignment condition, with mixed radix admitted — is now backed by three things
+rather than one: the generalised theorem (Q1), the mixed-radix condition and its
+lethal guard-fire (Q2), and a worked demonstration in a real codebase that the
+representational cost is a clean no-op (`e4faf9c`).
+
+Cite by SHA, not by branch: `bca3e84` for this document, `e4faf9c` for the
+refactor. What does **not** transfer for free is MATH-76's quality field, which
+is a *depth* field feeding a descent policy with measured latency
+characteristics. Changing it there touches that verdict and needs its own ticket
+and its own committed artifact. This is evidence the change is clean, not a
+substitute for measuring it in fold-re.
