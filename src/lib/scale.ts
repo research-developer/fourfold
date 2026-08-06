@@ -16,10 +16,29 @@
  * checks it on the bytes of all three exports. Written after a second radix
  * existed, none of it would be checkable at all.
  *
- * This module is BOOKKEEPING. It adds no geometry, no new ring (Q4: subdivision
- * is scaling by an integer, so nothing here divides and no √ appears), and no
- * second radix. `src/lib/reptile.ts` remains the only place a k ≠ 2 exists, and
- * it is a measurement instrument that nothing in `src/app` imports.
+ * This module is BOOKKEEPING. It adds no geometry and no new ring (Q4:
+ * subdivision is scaling by an integer, so nothing here divides and no √
+ * appears).
+ *
+ * ── AMENDED: the second radix arrived, and it is ADDITIVE ────────────────
+ *
+ * When this module was written it added "and no second radix — `reptile.ts`
+ * remains the only place a k ≠ 2 exists". That is no longer true: `figure.ts`
+ * now also builds a rep-9 figure, `REP9_EDGE_DIVISION` is here, and `radixAt`
+ * has a body that reads the address instead of ignoring it.
+ *
+ * What has NOT changed, and is the whole discipline of the addition: radix 4 is
+ * still the default and is behaviourally untouched. Every address the program
+ * wrote before this change is spelled over `[ABCX]` plus the `s0:`–`s5:` sector
+ * tag, none of which is a rep-9 letter, so `radixAt` answers `EDGE_DIVISION` on
+ * every one of them exactly as the constant did. The rep-9 letters are a
+ * disjoint character set precisely so that this is a theorem about the alphabet
+ * and not a hope about the call sites — see `REP9_LETTERS`.
+ *
+ * `src/lib/reptile.ts` remains a measurement instrument that nothing in `src/`
+ * imports; it is the independent oracle the rep-9 tests decide against, and
+ * keeping it un-imported is what makes those tests evidence rather than a
+ * restatement.
  *
  * ── SCALE IS THE EDGE DIVISION PRODUCT, NOT THE CHILD COUNT ──────────────
  *
@@ -83,24 +102,86 @@
 export const EDGE_DIVISION = 2;
 
 /**
+ * The edge division of the SECOND radix: three, giving 3² = 9 children.
+ *
+ * THREE, NOT NINE, and the number is worth being loud about because the brief
+ * that commissioned this said nine. `radixAt` returns an EDGE DIVISION — it
+ * returns 2 at rep-4, whose child count is 4 — so the rep-9 answer is 3. A 9
+ * here would make `scaleOfWord` report 9^d where the geometry has 3^d and
+ * `cellsAtScale` report 81^d cells where there are 9^d, which is precisely the
+ * confusion the module header exists to prevent. Measured rather than argued:
+ * `test/rep9figure.test.ts` decides it against `reptile.descend(ROOT, 3, …).den`,
+ * an actual descent of an actual triangle that knows nothing about this file.
+ */
+export const REP9_EDGE_DIVISION = 3;
+
+/**
+ * The nine rep-9 letters, indexed `3·gradeClass + vertex` — corner A, corner B,
+ * corner C, edge A, edge B, edge C, inverted A, inverted B, inverted C.
+ *
+ * ── Why the alphabet lives HERE and not in `figure.ts` ───────────────────
+ *
+ * Because it is what makes the radix recoverable from the address, which is this
+ * module's one constraint. `figure.ts` derives everything else about a letter —
+ * its vertex, its grade, its child position, its frame — from the geometry; the
+ * only thing it takes from here is the spelling, so there is exactly one place
+ * where the nine characters are written down and no way for the dispatch below
+ * to drift from the alphabet it dispatches on.
+ *
+ * ── Why NOT `A B C / a b c / X Y Z`, which `docs/rep9-charge.md` suggests ─
+ *
+ * DEVIATION, and it is forced. That document offers `A B C` for the corner
+ * class, `a b c` for the edge class and `X Y Z` for the inverted class as "one
+ * admissible spelling", the point being that the letters must be named by
+ * (vertex, grade) rather than by an index order. The naming is honoured below.
+ * The *characters* cannot be: `A`, `B`, `C` and `X` are already rep-4 letters,
+ * so under that spelling `radixAt("A", 0)` has two right answers and an address
+ * stops determining its own scale — the exact property the module header calls
+ * the constraint, that `test/scale.test.ts` measures, and that `plate.ts`'s
+ * "prefix = ancestry" rests on. The alternative would be carrying the schedule
+ * as per-node data, which is the rejection this module was built around.
+ *
+ * So the nine are lowercase and disjoint from `[ABCX]`, and they still spell the
+ * two coordinates: position within a triple is the VERTEX (A, B, C), and which
+ * triple is the GRADE class. `abc` are the corner children — lowercase `ABC`,
+ * carrying rep-4's meaning, "the corner child at that vertex". `xyz` are the
+ * inverted children — lowercase `X`, rep-4's inverted letter, of which rep-9 has
+ * three rather than one. `uvw` are the remaining upright class, sitting
+ * immediately before `xyz` so the alphabet reads corner, edge, inverted in one
+ * run and the whole address alphabet is the single character class `[a-cu-z]`.
+ *
+ * Nothing in `[ABCX]`, in the `s0:`–`s5:` sector tag, or in the decimal digits
+ * collides with it, so every address the program can write today keeps the
+ * answer it has today. `test/scale.test.ts`'s existing regression guard on
+ * `radixAt` is unmodified and still green.
+ */
+export const REP9_LETTERS = "abcuvwxyz";
+
+const REP9_LETTER_SET: ReadonlySet<string> = new Set(REP9_LETTERS);
+
+/**
  * The edge division applied at `level` of `word` — a PURE FUNCTION OF THE
  * ADDRESS, which is the constraint the module header states.
  *
- * Both arguments are read today only to be ignored: at fixed radix the answer is
- * the constant. The signature is the point. A mixed-radix schedule is a
- * different BODY for this function — `word.charCodeAt(level)`, a parity of the
- * prefix, whatever the schedule turns out to be — and never a new argument,
- * because a new argument is how per-node data gets in.
+ * The signature was the point before there was a second radix, and it still is:
+ * a mixed-radix schedule is a different BODY for this function and never a new
+ * argument, because a new argument is how per-node data gets in. This is that
+ * body, and it reads exactly the one character the level names.
  *
  * Takes `(word, level)` rather than a prefix string so that walking an address
  * allocates nothing: `scaleOfWord` calls this once per level, and slicing a
  * prefix each time would make resolving a plate quadratic in the address length
  * for no gain.
+ *
+ * Anything that is not a rep-9 letter answers `EDGE_DIVISION`. That covers the
+ * four rep-4 letters, the sector tag, and an out-of-range level — the last
+ * mattering because `charAt` returns `""` past the end and a set membership test
+ * is the one form of this check that does not accidentally say yes to it.
  */
 export function radixAt(word: string, level: number): number {
-  void word;
-  void level;
-  return EDGE_DIVISION;
+  return REP9_LETTER_SET.has(word.charAt(level))
+    ? REP9_EDGE_DIVISION
+    : EDGE_DIVISION;
 }
 
 /**
@@ -115,6 +196,24 @@ export function radixAt(word: string, level: number): number {
  */
 export function scaleOfDepth(depth: number): number {
   return EDGE_DIVISION ** depth;
+}
+
+/**
+ * THE SAME BOUNDARY FOR REP-9. A depth from outside becomes a scale of 3^depth.
+ *
+ * A sibling rather than an optional second argument on `scaleOfDepth`. A default
+ * parameter would let a caller that has forgotten which figure it is holding
+ * still typecheck and still get an answer, and the answer would be the rep-4 one
+ * — a silent wrong number of exactly the kind the scale/depth confusion produced
+ * in the first place. Two names cannot be got wrong quietly.
+ *
+ * Its one caller is `buildRep9Figure`, the rep-9 analogue of `buildFigure`: the
+ * UI states a depth. The FILE does not yet state a rep-9 depth — the format work
+ * is a separate pass — so there is no second caller here where `scaleOfDepth`
+ * has two.
+ */
+export function scaleOfRep9Depth(depth: number): number {
+  return REP9_EDGE_DIVISION ** depth;
 }
 
 /**
@@ -205,10 +304,40 @@ export function gasketAtDepth(depth: number): number {
  * the state this refactor found it in, with `(4 ** depth − 1)/3` written out in
  * both places.
  *
- * Q3 prices what happens to this at rep-9: the rotation acts freely, there is no
- * hub, and the three arms need a transversal chosen by fiat. So this formula is
- * radix-4 structure and not a general law, and it is named for the figure rather
- * than for the scale to keep that visible.
+ * This formula is radix-4 structure and not a general law — the `−1` is the hub,
+ * which exists because the rotation fixes X — and it is named for the figure
+ * rather than for the scale to keep that visible. `rep9ArmCellsAtScale` is the
+ * other radix's answer, and the two differ by exactly that `−1`.
+ *
+ * CORRECTION. This comment used to end: *"Q3 prices what happens to this at
+ * rep-9: the rotation acts freely, there is no hub, and the three arms need a
+ * transversal chosen by fiat."* The last clause is wrong and
+ * `docs/rep9-charge.md` retracts it: 27 transversals are 9 decompositions, and
+ * requiring the MIRRORS to permute the parts — not merely the rotation — leaves
+ * exactly one. The rest of the sentence stands, and the missing hub is the same
+ * fact seen from the other side; see `rep9ArmCellsAtScale`.
  */
 export const armCellsAtScale = (scale: number): number =>
   (cellsAtScale(scale) - 1) / 3;
+
+/**
+ * Cells in one arm of the REP-9 figure: scale²/3, with no `−1` and no hub.
+ *
+ * The missing `−1` is not a tidier formula, it is the whole structural
+ * difference between the two radices, and it is one fact rather than two
+ * [PROVEN in `docs/rep9-charge.md`]. An arm label is a D₃-equivariant map from
+ * letters to the three vertices; a letter admits a value iff its stabiliser
+ * fixes one. At rep-4 the three mirror fixed sets are CONCURRENT — all three
+ * contain X — so X is fixed by all of D₃, no vertex is, and X has no admissible
+ * value: it is the hub, and it is the `−1`. At rep-9 the three mirror fixed sets
+ * are PARALLEL — three letters each, disjoint, covering, which happens iff
+ * 3k = k², i.e. only at k = 3 — so every letter has exactly one mirror in its
+ * stabiliser, every letter has exactly one admissible value, and the residual is
+ * zero. "Rep-9 has no hub" and "rep-9's arms partition" are the same statement.
+ *
+ * Exact, not merely integral: scale is a power of 3 here, so the division always
+ * lands. `test/rep9figure.test.ts` counts the arms of the built figure rather
+ * than trusting this, at every depth it builds.
+ */
+export const rep9ArmCellsAtScale = (scale: number): number =>
+  cellsAtScale(scale) / 3;

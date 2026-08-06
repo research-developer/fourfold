@@ -71,10 +71,56 @@
  * when I look at one arm": the mirror that fixes the arm, and nothing else.
  *
  * `test/arms.test.ts` measures all of the above rather than asserting it.
+ *
+ * ── AT REP-9 THE COST ABOVE IS NOT INCURRED, AND THAT IS DERIVED ─────────
+ *
+ * Everything in this module carries over to the rep-9 figure with one exception,
+ * and the exception is the paragraph headed "The hub belongs to no arm". That
+ * whole argument — three options weighed, exclusion chosen, the cost stated in
+ * the open that an isolated arm cannot reach the hub — describes a decision that
+ * at rep-9 is not available to make, because there is nothing to decide:
+ *
+ * > An arm label is a D₃-EQUIVARIANT map from letters to the three vertices, so
+ * > a letter's value must be fixed by everything that fixes the letter. A mirror
+ * > stabiliser admits exactly one value; a trivial stabiliser admits three; and a
+ * > letter fixed by ALL of D₃ admits NONE, because no vertex is fixed by all of
+ * > D₃ [PROVEN, `docs/rep9-charge.md`].
+ *
+ * So the hub is not excluded to protect disjointness — though it would break it.
+ * It is excluded because there is nothing equivariant to map it to. And at rep-9
+ * there is no such letter: the three mirror fixed sets are three letters each,
+ * disjoint and covering (3k = k² only at k = 3), where at rep-4 they are
+ * CONCURRENT and their common point is X. "Rep-9 has no hub" and "rep-9's arms
+ * partition with residual 0" are one statement about one set of three sets.
+ *
+ * **The cost this module states in the open is therefore a rep-4 cost, not a
+ * cost of arm isolation.** At rep-9 every cell is in an arm at every depth ≥ 1,
+ * so no cell becomes unreachable when an arm is isolated, and the "seeded on the
+ * hub paints nothing" case has no rep-9 counterpart.
+ *
+ * What DOES carry over verbatim is the induced action. The setwise stabiliser of
+ * rep-9's arm A is still ⟨m_A⟩ of order 2, so mode 3 still paints what mode 1
+ * paints and mode 6 what mode 2 paints — measured over all 243 cells of arm A at
+ * depth 3 in `docs/rep9-charge.md` and re-measured on the built figure in
+ * `test/rep9figure.test.ts`. Same table, same reason, one row of cost removed.
+ *
+ * Also carrying over is the count that made the transversal look arbitrary and
+ * is not: `docs/rep-tile-findings.md` Q3 said rep-9's split "needs a transversal
+ * of the three first-digit orbits (27 choices), and none is distinguished". 27 is
+ * the transversal count; the DECOMPOSITION count is 9 (T, πT and π²T name the
+ * same three parts); and requiring the MIRRORS to permute the parts as well as
+ * the rotation leaves EXACTLY ONE — the mirror fixed sets. Q3 asked a question
+ * the rotation alone cannot answer.
  */
 
-import { AXES, type Axis, type Figure } from "./figure";
-import { armCellsAtScale } from "./scale";
+import {
+  AXES,
+  REP9_BY_NAME,
+  type Axis,
+  type Figure,
+  type Rep9Figure,
+} from "./figure";
+import { armCellsAtScale, rep9ArmCellsAtScale } from "./scale";
 import type { BrushStamp } from "./brush";
 
 /** An arm is named by the ftype it collects: the first non-X digit. */
@@ -109,9 +155,35 @@ export function armOf(figure: Figure, i: number): Arm | null {
  * in arm D, because a suffix cannot change the first non-X digit. That is why
  * isolation and the depth-persistent plate compose without either knowing about
  * the other.
+ *
+ * ── ONE FUNCTION, BOTH RADICES ───────────────────────────────────────────
+ *
+ * The two radices answer this question with two different rules, and the rules
+ * agree that the answer is a property of the address's PREFIX rather than of the
+ * figure — which is the only thing anything downstream needs:
+ *
+ *   rep-4  the first NON-X digit. The skip exists because X is fixed by all of
+ *          D₃ and so belongs to no arm, and a leading run of X's is a run of
+ *          cells that have not chosen a side yet.
+ *   rep-9  the VERTEX of the first digit. No skip, because there is nothing to
+ *          skip: every one of the nine letters lies in exactly one mirror's
+ *          fixed set, so every letter names an arm.
+ *
+ * Dispatch is on the LETTER and nothing else, which is possible because the two
+ * alphabets are disjoint character sets — `[ABCX]` against `[a-cu-z]`; see
+ * `scale.REP9_LETTERS` for why that disjointness is forced rather than tidy.
+ * Every rep-4 address therefore takes exactly the path it took before, character
+ * for character, and `test/arms.test.ts` is unmodified.
+ *
+ * Stability under extension holds at both radices and for the same reason: a
+ * suffix cannot change a prefix.
  */
 export function armOfWord(word: string): Arm | null {
-  for (const ch of word) if (ch !== "X") return isArm(ch) ? ch : null;
+  for (const ch of word) {
+    const rep9 = REP9_BY_NAME.get(ch);
+    if (rep9 !== undefined) return rep9.vertex;
+    if (ch !== "X") return isArm(ch) ? ch : null;
+  }
   return null;
 }
 
@@ -228,5 +300,89 @@ export function armCensus(figure: Figure): ArmCensus {
     total: figure.cells.length,
     even: sizes.A === sizes.B && sizes.B === sizes.C,
     predicted: armCellsAtScale(figure.scale),
+  };
+}
+
+// ── rep-9 ────────────────────────────────────────────────────────────────
+//
+// The same three arms, the same isolation, the same mask — and one row of the
+// module header's cost table struck out, because there is no hub. See the header
+// section "AT REP-9 THE COST ABOVE IS NOT INCURRED".
+//
+// These are separate functions rather than a radix parameter for one reason:
+// `Figure` and `Rep9Figure` carry different cells (a V4 charge and an `ftype`
+// against a ℤ/3 grade and an `arm`), and a union-typed `armCells` would push a
+// narrowing into every caller to buy nothing. What IS shared is the part that
+// matters — `armOfWord` and `armMaskOver` are literally the same functions at
+// both radices, because both read an ADDRESS and neither reads a figure.
+
+/**
+ * Which arm a rep-9 cell is in.
+ *
+ * `null` only at the empty address, i.e. only on the depth-0 figure. That is the
+ * root, not a hub: it is in no arm because it has no first digit, exactly as
+ * rep-4's depth-0 cell is, and at every depth ≥ 1 the three arms cover.
+ */
+export function rep9ArmOf(figure: Rep9Figure, i: number): Arm | null {
+  const c = figure.cells[i];
+  if (c === undefined) throw new Error(`arms: cell ${i} is not on this rep-9 figure`);
+  return c.arm;
+}
+
+/** Every cell of a rep-9 arm, ascending. */
+export function rep9ArmCells(figure: Rep9Figure, arm: Arm): number[] {
+  const out: number[] = [];
+  for (const c of figure.cells) if (c.arm === arm) out.push(c.i);
+  return out;
+}
+
+/**
+ * The isolation predicate for a rep-9 figure.
+ *
+ * Delegates to `armMaskOver`, unchanged and unparameterised, because that
+ * function only ever needed an address list and `armOfWord` now answers at both
+ * radices. This is what "the two radices present one interface" means in
+ * practice: the shared code is shared, not duplicated with a 9 in it.
+ */
+export function rep9ArmMask(
+  figure: Rep9Figure,
+  isolation: Isolation
+): (i: number) => boolean {
+  return armMaskOver(figure.cells, isolation);
+}
+
+export interface Rep9ArmCensus {
+  /** Cells per arm, in `ARMS` order. */
+  sizes: Record<Arm, number>;
+  /**
+   * Cells in NO arm. Zero at every depth ≥ 1 — this is the field that replaces
+   * `ArmCensus.hub`, and it is COUNTED rather than asserted, so that the claim
+   * "rep-9 has no hub" is measured on the figure and not merely documented.
+   */
+  residual: number;
+  total: number;
+  even: boolean;
+  /** `scale²/3` — §D's rep-9 prediction. See `scale.rep9ArmCellsAtScale`. */
+  predicted: number;
+}
+
+/**
+ * The rep-9 partition, counted rather than assumed — the same discipline as
+ * `armCensus`, and for the same reason: if the figure ever stopped agreeing with
+ * `docs/rep9-charge.md`, the measurement is what should win.
+ */
+export function rep9ArmCensus(figure: Rep9Figure): Rep9ArmCensus {
+  const sizes: Record<Arm, number> = { A: 0, B: 0, C: 0 };
+  let residual = 0;
+  for (const c of figure.cells) {
+    if (c.arm === null) residual++;
+    else sizes[c.arm]++;
+  }
+  return {
+    sizes,
+    residual,
+    total: figure.cells.length,
+    even: sizes.A === sizes.B && sizes.B === sizes.C,
+    predicted: rep9ArmCellsAtScale(figure.scale),
   };
 }

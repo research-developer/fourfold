@@ -18,6 +18,33 @@
  * word, an ancestor is a prefix, and both are exact. There is no tolerance here
  * to get wrong.
  *
+ * ── TWO RADICES, ONE ALPHABET, AND WHY NOTHING ABOVE CHANGES ─────────────
+ *
+ * The word above is no longer over `{A,B,C,X}` alone: `A B C X` are the four
+ * rep-4 cuts and `a b c u v w x y z` are the nine rep-9 cuts, and the two sets
+ * are DISJOINT. That single fact is what keeps every sentence in this header
+ * true under mixed radix, and it is worth spelling out which sentence rests on
+ * which part of it:
+ *
+ *   ONE CHARACTER PER CUT, in both alphabets. `ancestorAt` truncates by
+ *   character count, so "the ancestor k cuts down" is `slice(0, stem + k)`. A
+ *   two-character rep-9 letter would land that slice mid-letter and prefix-
+ *   equals-ancestry would fail on the first mixed address.
+ *
+ *   THE LETTER STATES ITS OWN RADIX, so `scale.scaleOfWord` reads a scale off a
+ *   word with no tree in hand and `buildView`'s resolution comparison keeps
+ *   meaning what it meant. `docs/rep-tile-findings.md` Q2 names this as the
+ *   condition the plate rests on; the alphabet is how it is met, and no radix
+ *   field is carried anywhere.
+ *
+ *   `s` AND `:` ARE STILL OUTSIDE IT. The rep-9 letters are `a`–`c` and `u`–`z`,
+ *   so the sector tag argument below survives thirteen letters unchanged.
+ *
+ * WHAT IS GENUINELY NEW is in the WRITE path, not the read path: a node's
+ * siblings are the letters of the cut that made it, and under two radices there
+ * are two answers. `splitEdits` says where that is read from and why it cannot
+ * be read from the parent.
+ *
  * ── The address of a cell ────────────────────────────────────────────────
  *
  * On the TRIANGLE it is the cell's own `addr` — `"ABX"` — and nothing else.
@@ -87,12 +114,12 @@
 
 import type { Figure } from "./figure";
 import type { Hexagon } from "./hexagon";
-import type { ArtPayload } from "./artfile";
+import { REP4_LETTERS, lettersAt, type ArtPayload } from "./artfile";
 import type { CanvasKind } from "./orbit";
 import { type CellEdit, type EditDirection, applyEdits, mergeEdits } from "./strokes";
-import { refines, scaleOfWord } from "./scale";
+import { radixAt, refines, scaleOfWord } from "./scale";
 
-/** A word over `{A,B,C,X}`, with a sector tag on the hexagon. */
+/** A word over the cut alphabet, with a sector tag on the hexagon. */
 export type Address = string;
 
 /** Address → `#rrggbb`. Absent means "nothing said here", NOT "unpainted". */
@@ -102,13 +129,21 @@ export type AddressPlate = ReadonlyMap<Address, string>;
 export type PlateEdit = CellEdit<Address>;
 
 /**
- * The four cuts, in the order `buildFigure` takes them.
+ * The four rep-4 cuts, in the order `buildFigure` takes them.
  *
- * Written out rather than derived from `DIGIT_CHARGE`'s keys: the split in
- * `erasePlan` needs the digits as a LIST with a stable order, and key order of
- * a record is a fact about how it was written rather than a promise it makes.
+ * A LIST with a stable order, because the split in `erasePlan` enumerates
+ * siblings and the edits it emits have to come out the same way twice. That is
+ * why it is not derived from `DIGIT_CHARGE`'s keys: key order of a record is a
+ * fact about how it was written rather than a promise it makes. A STRING does
+ * promise its order, so it is now read from `artfile.REP4_LETTERS` — the file
+ * format's own statement of the four characters — rather than restated here,
+ * which is the rule `artfile`'s `CANVASES` and `MODES_FOR` already follow.
+ *
+ * NO LONGER THE ONLY ANSWER to "what are this node's siblings". See
+ * `splitEdits`: under two radices that question is about a particular cut, and
+ * this is the answer for one of them.
  */
-export const DIGITS: readonly string[] = ["A", "B", "C", "X"] as const;
+export const DIGITS: readonly string[] = [...REP4_LETTERS];
 
 /** `s0:` … `s5:`. Fixed width, so the stem below is a constant. */
 export const sectorTag = (s: number): string => `s${s}:`;
@@ -263,15 +298,32 @@ function buildView(plate: AddressPlate, book: AddressBook): PlateView {
      * 27, all at depth 3: there `18 ≤ 27` is true and `18 | 27` is false, and
      * `≤` would start quietly claiming one region contained another.
      *
-     * WHAT IS STILL A TWO-WAY BRANCH AND WILL NOT BE. Divisibility is partial,
-     * so a mixed tree admits a third answer — INCOMPARABLE, neither refining the
-     * other, as 18 and 27 — which lands in the `else` here and would be resolved
-     * against a parent that does not contain it. It cannot arise at one radix
-     * (any two powers of two are comparable), so nothing is done about it and
-     * nothing is invented; this comment is the marker for where the third branch
-     * goes. The companion is `ancestorAt` on the next line, which truncates by
-     * LEVEL COUNT: correct whenever the render scale is reachable along the
-     * address, which at fixed radix is always.
+     * THE THIRD ANSWER NOW ARRIVES, AND IT IS INERT — MEASURED, not designed.
+     * Divisibility is partial, so two scales can be INCOMPARABLE (12 and 27,
+     * neither refining the other), and with a second radix in the alphabet that
+     * is now reachable rather than hypothetical. This comment used to say the
+     * case could not arise and marked where a third branch would go. What
+     * measurement found is that the `else` already handles it correctly, for a
+     * reason worth writing down rather than a coincidence:
+     *
+     *   `ancestorAt` truncates by LEVEL COUNT, so the bucket key is the address's
+     *   own first `depth` letters. An address that genuinely refines a cell of
+     *   this book begins with that cell's word — one letter per cut, in either
+     *   alphabet — so it buckets under it exactly, whatever radices it used
+     *   further down. `s0:ABa` is scale 12 against a scale-4 book and lands under
+     *   `s0:AB`, which is right and is the whole point of mixed radix.
+     *
+     *   An address that DIVERGES — `s0:ab`, a rep-9 first cut where this canvas
+     *   cut rep-4 — buckets under a key no cell of this book has, so it
+     *   contributes to no cell's consensus and resolves nowhere. It is carried,
+     *   it is re-exported, and it is not drawn. That is the honest answer: there
+     *   is no cell of this canvas it is the paint of.
+     *
+     * The cost of inertness is stated where it bites: such an address is also
+     * not in any target's `below`, so a stroke that covers the region does not
+     * clear it. That is the "detail resurrects" case this module's header names,
+     * surviving across radices only. `test/rep9format.test.ts` pins the
+     * behaviour so it is a counted precondition and not a surprise.
      */
     if (refines(scaleOfWord(wordOf(a, stem)), scale)) continue;
     const parent = ancestorAt(a, stem, depth);
@@ -446,6 +498,34 @@ export function planPlateEdits(
  * A child that already carries paint of its own is SKIPPED: it was overriding
  * the ancestor before and must go on overriding it. That is the case where a
  * fine detail sits inside a coarse wash and the user erases beside it.
+ *
+ * ── THE ONE PLACE A SECOND RADIX CHANGES THE CODE AND NOT THE COMMENT ────
+ *
+ * "Every child hanging off that trie" was `DIGITS`, the four rep-4 cuts, and
+ * that is now a question with two answers. It is also the question a mixed
+ * alphabet makes genuinely hard, and it is worth being exact about why, because
+ * the obvious repair is wrong:
+ *
+ *   THE PARENT CANNOT ANSWER IT. A letter states the radix of its OWN cut, so an
+ *   address determines its own scale — that is the property everything here
+ *   rests on — but it says nothing about the cut BELOW it. `p + "A"` and
+ *   `p + "a"` are both admissible addresses, and they are not siblings: they are
+ *   the same corner of `p` divided two different ways, overlapping regions in two
+ *   different trees. Enumerating all thirteen letters would paint both, and the
+ *   rep-4 sibling would cover the hole the rep-9 path was cut to make.
+ *
+ *   THE HOLES ANSWER IT. A hole is an address in the tree that is actually on
+ *   screen, and the path from `anc` down to it names, one letter per level, the
+ *   cut that tree took at every level in between. So the radix of each on-path
+ *   node's cut is read off its own on-path child, and the siblings enumerated
+ *   are that cut's letters and no others. No book is needed, no figure, and no
+ *   new argument to this function.
+ *
+ * Two holes disagreeing at a level would be a node cut two ways at once. It is
+ * unreachable — the targets of a stroke come from one book, hence one tree — and
+ * it throws rather than picking one, on the same grounds as `addressBook`'s
+ * duplicate check: guessing would silently repaint overlapping regions, which is
+ * paint the user did not make on top of paint they did.
  */
 function splitEdits(
   plate: AddressPlate,
@@ -456,8 +536,19 @@ function splitEdits(
   const out: PlateEdit[] = [{ cell: anc, from: colour, to: null }];
 
   const onPath = new Set<Address>();
+  /** On-path node → the edge division of the cut immediately below it. */
+  const cutBelow = new Map<Address, number>();
   for (const h of holes) {
-    for (let n = anc.length + 1; n <= h.length; n++) onPath.add(h.slice(0, n));
+    for (let n = anc.length + 1; n <= h.length; n++) {
+      onPath.add(h.slice(0, n));
+      const parent = h.slice(0, n - 1);
+      const k = radixAt(h, n - 1);
+      const seen = cutBelow.get(parent);
+      if (seen === undefined) cutBelow.set(parent, k);
+      else if (seen !== k) {
+        throw new Error(`plate: ${parent} is cut ${seen} and ${k} in one stroke`);
+      }
+    }
   }
   // The holes are all at one depth, so a path node shorter than a hole is a
   // node whose children still have to be dealt with; a node as long as a hole IS
@@ -467,7 +558,10 @@ function splitEdits(
   for (const p of onPath) if (p.length < holeLength) parents.push(p);
 
   for (const p of parents) {
-    for (const g of DIGITS) {
+    // Every parent here has an on-path child by construction — `anc` from the
+    // first level of the walk above, and the rest by the length test — so the
+    // cut below it is known.
+    for (const g of lettersAt(cutBelow.get(p) as number)) {
       const child = p + g;
       if (onPath.has(child) || plate.has(child)) continue;
       out.push({ cell: child, from: null, to: colour });
@@ -559,6 +653,13 @@ export function plateEntries(
   // "At the exported resolution" is an equality of SCALE, not of depth. The two
   // agree at radix 4 and this decides whether the `plate` field is written at
   // all, so `test/byteidentity.test.ts`'s pins are the check that they agreed.
+  //
+  // They stop agreeing the moment an address uses a rep-9 letter — `s0:ABa` is
+  // three cuts and scale 12, where three rep-4 cuts are scale 8 — and the SCALE
+  // reading is the one that is right: an address at a different scale from the
+  // book is exactly an address `cells` cannot state, which is what this field
+  // exists to carry. A length comparison would have called those equal and
+  // dropped the field, losing the paint.
   let offDepth = false;
   for (const a of plate.keys()) {
     if (scaleOfWord(wordOf(a, book.stem)) !== book.scale) {
@@ -580,13 +681,19 @@ export function plateEntries(
  * split adds shallow entries the user never explicitly made. Both are correct
  * and neither is worth an invariant.
  *
- * STILL KEYED BY DEPTH, deliberately, and it is the one buffer in this pass that
- * was left that way. `docs/rep-tile-findings.md` names a depth-keyed buffer as
- * the thing that goes wrong under mixed radix — MIX-C's 354 leaves would all
- * land in one bucket — so this map's KEYS are what would have to become scales.
- * Rekeying it is a visible change to what the function returns, which this pass
- * is not allowed to make: the depth→scale refactor was required to move no
- * observable value. Recorded here as the follow-on, not done here.
+ * STILL KEYED BY DEPTH, deliberately, and it is the one buffer left that way.
+ * `docs/rep-tile-findings.md` names a depth-keyed buffer as the thing that goes
+ * wrong under mixed radix — MIX-C's 354 leaves would all land in one bucket — so
+ * this map's KEYS are what would have to become scales. Rekeying it is a visible
+ * change to what the function returns, which the depth→scale refactor was not
+ * allowed to make.
+ *
+ * THE HAZARD IS NO LONGER HYPOTHETICAL. With a second radix in the alphabet a
+ * plate really can hold `s0:ABC` and `s0:abc` — three cuts each, scale 8 and
+ * scale 27 — and this function reports them as one bucket of two at depth 3.
+ * That is a true statement about the number of CUTS, which is what the name
+ * says, and a useless one about resolution. Nothing here reads it for a
+ * resolution today. Recorded as the follow-on, and now with a witness.
  */
 export function depthCensus(
   plate: AddressPlate,
