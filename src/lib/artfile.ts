@@ -43,6 +43,7 @@ import { CONVENTIONS, type Convention, type Figure } from "./figure";
 import type { Hexagon } from "./hexagon";
 import { HEXAGON_MODES, TRIANGLE_MODES, type CanvasKind } from "./orbit";
 import { READINGS, type Reading } from "./relief";
+import { cellsAtScale, scaleOfDepth } from "./scale";
 import { swatchFromHex, type Swatch } from "./schemes";
 
 export const ART_MARKER = "fourfold:art";
@@ -368,9 +369,24 @@ export const MIN_DEPTH = 1;
  */
 export const MAX_DEPTH: Record<CanvasKind, number> = { triangle: 5, hexagon: 5 };
 
-/** Cells in a canvas: one wedge of 4^d, six of them on the hexagon. */
+/**
+ * Cells in a canvas: one wedge of scale², six of them on the hexagon.
+ *
+ * THE BOUNDARY, second of two — and the one that justifies there being two.
+ * `figure.ts` converts a depth the UI stated; this converts a depth THE FILE
+ * stated, and it has no figure to read a scale off because it is called while
+ * deciding whether the file is loadable at all.
+ *
+ * That is exactly where the depth→scale boundary belongs. `ArtPayload.depth`
+ * stays a depth and stays written as one — the format does not change here, and
+ * `test/byteidentity.test.ts` pins the bytes that say so — while everything past
+ * this line holds a scale. At radix 4 the file may state one and the model hold
+ * the other because `scale = 2^depth` is a bijection. What a second radix would
+ * need is a radix SCHEDULE in the payload, and that is a format change and a
+ * different piece of work.
+ */
 export const cellCount = (canvas: CanvasKind, depth: number): number =>
-  (canvas === "hexagon" ? 6 : 1) * 4 ** depth;
+  (canvas === "hexagon" ? 6 : 1) * cellsAtScale(scaleOfDepth(depth));
 
 /**
  * The largest file this program will read.

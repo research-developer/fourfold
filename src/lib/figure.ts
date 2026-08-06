@@ -19,6 +19,8 @@
  * there is no floating-point comparison anywhere in this module.
  */
 
+import { scaleOfDepth } from "./scale";
+
 /** V4 elements as 2-bit codes. Matches equilat_v4.py exactly. */
 export const ID = 0b00;
 export const S3 = 0b01;
@@ -123,7 +125,21 @@ export interface Cell {
 }
 
 export interface Figure {
+  /**
+   * How many cuts were taken. Still a depth, and still true — what it stopped
+   * being is a RESOLUTION; see `scale` below and `scale.ts`'s header.
+   */
   depth: number;
+  /**
+   * The edge division product — the denominator every `bary` is a numerator
+   * over, and the figure's resolution.
+   *
+   * CARRIED rather than derived. Six modules used to recompute `2 ** depth` from
+   * this figure's own depth; they now read this. At radix 4 the two are the same
+   * number, which is what makes the change checkable: `test/byteidentity.test.ts`
+   * pins the bytes of all three exports across it.
+   */
+  scale: number;
   convention: Convention;
   cells: Cell[];
   /** Index of the all-X hub, the unique cell on all three medians. */
@@ -249,7 +265,9 @@ export function buildFigure(
   depth: number,
   convention: Convention = "apex"
 ): Figure {
-  const scale = 2 ** depth;
+  // THE BOUNDARY, first of two. A depth comes in from the UI — a button — and
+  // becomes the scale everything downstream carries. See `scale.ts`.
+  const scale = scaleOfDepth(depth);
   const cells: Cell[] = [];
   /** Exact integer centroid key per cell, parallel to `cells`. */
   const keys: IVec[] = [];
@@ -322,6 +340,7 @@ export function buildFigure(
 
   return {
     depth,
+    scale,
     convention,
     cells,
     hub: cells.findIndex((c) => c.addr === "X".repeat(depth)),

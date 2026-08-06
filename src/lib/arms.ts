@@ -74,6 +74,7 @@
  */
 
 import { AXES, type Axis, type Figure } from "./figure";
+import { armCellsAtScale } from "./scale";
 import type { BrushStamp } from "./brush";
 
 /** An arm is named by the ftype it collects: the first non-X digit. */
@@ -202,7 +203,7 @@ export interface ArmCensus {
   total: number;
   /** True when the three arms are the same size — the §D congruence claim. */
   even: boolean;
-  /** `(4^d − 1)/3`, the size §D predicts. */
+  /** `(scale² − 1)/3`, the size §D predicts. See `scale.armCellsAtScale`. */
   predicted: number;
 }
 
@@ -226,6 +227,6 @@ export function armCensus(figure: Figure): ArmCensus {
     hub,
     total: figure.cells.length,
     even: sizes.A === sizes.B && sizes.B === sizes.C,
-    predicted: (4 ** figure.depth - 1) / 3,
+    predicted: armCellsAtScale(figure.scale),
   };
 }

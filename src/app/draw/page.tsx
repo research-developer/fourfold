@@ -56,6 +56,7 @@ import {
   MIN_DEPTH,
   payloadFromPaint,
 } from "@/lib/artfile";
+import { armCellsAtScale, cellsAtScale, gasketAtDepth } from "@/lib/scale";
 import {
   addressBook,
   planPlateEdits,
@@ -1940,8 +1941,14 @@ export default function DrawPage() {
     return new Set(held.filter((i) => canvas.inView(i)));
   }, [focus, resolvers, hex, canvas]);
 
-  /** `(4^d − 1)/3` — the size §D predicts for one arm of one sector. */
-  const armSize = (4 ** depth - 1) / 3;
+  /**
+   * `(scale² − 1)/3` — the size §D predicts for one arm of one sector.
+   *
+   * Through `scale.armCellsAtScale`, which `arms.ts` also calls. It used to be
+   * written out here AND there, in depth, which is two chances to disagree about
+   * one number; the depth→scale pass found them and joined them.
+   */
+  const armSize = armCellsAtScale(hex.scale);
 
   /**
    * Which sectors the axis overlay draws in.
@@ -2830,7 +2837,7 @@ export default function DrawPage() {
       reframe();
       setAnnounce(
         next === "sector"
-          ? `sector ${sector} framed — ${4 ** depth} of ${cellCount(
+          ? `sector ${sector} framed — ${cellCount("triangle", depth)} of ${cellCount(
               "hexagon",
               depth
             )} cells, apex at the plate's centre. Nothing was cleared; the other five sectors keep their paint${
@@ -2855,7 +2862,7 @@ export default function DrawPage() {
       if (mode === 12) setMode(6);
       reframe();
       setAnnounce(
-        `sector ${s} framed — ${4 ** depth} cells; the plate is whole and nothing was cleared`
+        `sector ${s} framed — ${cellCount("triangle", depth)} cells; the plate is whole and nothing was cleared`
       );
     },
     [sector, viewMode, mode, depth, reframe]
@@ -7069,7 +7076,7 @@ export default function DrawPage() {
                   aria-label={
                     v === "hexagon"
                       ? "frame the whole plate — all six sectors; nothing is cleared"
-                      : `frame one sector — the triangle, ${4 ** depth} cells; nothing is cleared`
+                      : `frame one sector — the triangle, ${cellCount("triangle", depth)} cells; nothing is cleared`
                   }
                   onClick={() => pickView(v)}
                 >
@@ -7087,7 +7094,7 @@ export default function DrawPage() {
               <SectorDial
                 sector={sector}
                 onPick={pickSector}
-                perSector={4 ** depth}
+                perSector={cellsAtScale(hex.scale)}
               />
             )}
             <p className={styles.viewMeta}>
@@ -7109,9 +7116,10 @@ export default function DrawPage() {
                   type="button"
                   className={`${styles.segBtn} ${styles.depthBtn}`}
                   aria-pressed={depth === d}
-                  aria-label={`depth ${d} — ${cellCount("hexagon", d)} cells on the plate, ${
-                    4 ** d
-                  } in a sector`}
+                  aria-label={`depth ${d} — ${cellCount("hexagon", d)} cells on the plate, ${cellCount(
+                    "triangle",
+                    d
+                  )} in a sector`}
                   onClick={() => pickDepth(d)}
                 >
                   {d}
@@ -7488,7 +7496,7 @@ export default function DrawPage() {
                 </div>
                 <p className={styles.hint}>
                   The six cells your brush corresponds to sit on one exact
-                  lattice ring — <b>ring {ring}</b> of {3 * 2 ** depth}. That
+                  lattice ring — <b>ring {ring}</b> of {3 * hex.scale}. That
                   ring is the <b>template</b>: it moves, and the whole plate
                   follows, six-fold symmetric in every frame because the remap is
                   a function of the ring alone. Height is the{" "}
@@ -7500,7 +7508,7 @@ export default function DrawPage() {
                       {" "}
                       The template ring is the <i>plate&rsquo;s</i>, so in a
                       framed sector it curves about the apex —{" "}
-                      <b>{2 ** (depth + 1) - 1} rings</b> cross this sector, where
+                      <b>{2 * hex.scale - 1} rings</b> cross this sector, where
                       a standalone triangle had a height field with two values in
                       it.
                     </>
@@ -7641,7 +7649,7 @@ export default function DrawPage() {
                 6·3<sup>{depth}</sup>
               </code>{" "}
               addresses with <i>no X</i> in the colour you are holding, and leaves
-              the other {modelTotal - 6 * 3 ** depth} bare. A preset fills{" "}
+              the other {modelTotal - 6 * gasketAtDepth(depth)} bare. A preset fills{" "}
               <i>every</i> sector, so a framed one then shows exactly{" "}
               <code>
                 3<sup>{depth}</sup>

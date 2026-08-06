@@ -90,6 +90,7 @@ import type { Hexagon } from "./hexagon";
 import type { ArtPayload } from "./artfile";
 import type { CanvasKind } from "./orbit";
 import { type CellEdit, type EditDirection, applyEdits, mergeEdits } from "./strokes";
+import { refines, scaleOfWord } from "./scale";
 
 /** A word over `{A,B,C,X}`, with a sector tag on the hexagon. */
 export type Address = string;
@@ -132,6 +133,14 @@ export const STEM: Readonly<Record<CanvasKind, number>> = {
 export interface AddressBook {
   kind: CanvasKind;
   depth: number;
+  /**
+   * The canvas's resolution. `depth` is still the address LENGTH this book
+   * indexes, which is what `ancestorAt` truncates to; `scale` is what the
+   * resolution comparisons in `buildView` and in `provenance.ts` are asked
+   * against. Under one radix they determine each other; the two fields are
+   * separate because under two radices they would not.
+   */
+  scale: number;
   /** Cell index → address. */
   addr: readonly Address[];
   /** Address → cell index. */
@@ -160,7 +169,18 @@ export function addressBook(canvas: Figure | Hexagon): AddressBook {
     // cannot recover from.
     throw new Error(`plate: ${kind} depth ${canvas.depth} has duplicate addresses`);
   }
-  return { kind, depth: canvas.depth, addr, index, stem, id: `${kind}:${canvas.depth}` };
+  return {
+    kind,
+    depth: canvas.depth,
+    scale: canvas.scale,
+    addr,
+    index,
+    stem,
+    // The cache key stays (kind, depth) because it identifies the ADDRESS LIST,
+    // and the list is fixed by how many cuts were taken, not by how far they
+    // refined. Adding the scale would be a second name for the same book.
+    id: `${kind}:${canvas.depth}`,
+  };
 }
 
 /** The word part — the cuts, without the sector tag. */
@@ -227,12 +247,33 @@ function viewOf(plate: AddressPlate, book: AddressBook): PlateView {
 const CONFLICT = Symbol("conflict");
 
 function buildView(plate: AddressPlate, book: AddressBook): PlateView {
-  const { stem, depth, addr } = book;
+  const { stem, depth, scale, addr } = book;
 
   const below = new Map<Address, Address[]>();
   const agreed = new Map<Address, string | typeof CONFLICT>();
   for (const [a, hex] of plate) {
-    if (addressDepth(a, stem) <= depth) continue;
+    /**
+     * IS THIS ADDRESS COARSER THAN, OR AT, THE RENDER RESOLUTION?
+     *
+     * Asked as DIVISIBILITY of scale and no longer as `≤` on depth. At radix 4
+     * both scales are powers of two, so `scale(a) | scale(book)` and `depth(a) ≤
+     * depth(book)` are the same predicate on every pair this program can build —
+     * which is why the change is a no-op today and why it had to be written
+     * today. `docs/rep-tile-findings.md` MIX-C has leaves at scales 12, 18 and
+     * 27, all at depth 3: there `18 ≤ 27` is true and `18 | 27` is false, and
+     * `≤` would start quietly claiming one region contained another.
+     *
+     * WHAT IS STILL A TWO-WAY BRANCH AND WILL NOT BE. Divisibility is partial,
+     * so a mixed tree admits a third answer — INCOMPARABLE, neither refining the
+     * other, as 18 and 27 — which lands in the `else` here and would be resolved
+     * against a parent that does not contain it. It cannot arise at one radix
+     * (any two powers of two are comparable), so nothing is done about it and
+     * nothing is invented; this comment is the marker for where the third branch
+     * goes. The companion is `ancestorAt` on the next line, which truncates by
+     * LEVEL COUNT: correct whenever the render scale is reachable along the
+     * address, which at fixed radix is always.
+     */
+    if (refines(scaleOfWord(wordOf(a, stem)), scale)) continue;
     const parent = ancestorAt(a, stem, depth);
     const list = below.get(parent);
     if (list === undefined) below.set(parent, [a]);
@@ -515,9 +556,12 @@ export function plateEntries(
   plate: AddressPlate,
   book: AddressBook
 ): [Address, string][] | undefined {
+  // "At the exported resolution" is an equality of SCALE, not of depth. The two
+  // agree at radix 4 and this decides whether the `plate` field is written at
+  // all, so `test/byteidentity.test.ts`'s pins are the check that they agreed.
   let offDepth = false;
   for (const a of plate.keys()) {
-    if (addressDepth(a, book.stem) !== book.depth) {
+    if (scaleOfWord(wordOf(a, book.stem)) !== book.scale) {
       offDepth = true;
       break;
     }
@@ -535,6 +579,14 @@ export function plateEntries(
  * here; a plate that has been zoomed and detailed has several, and the erase
  * split adds shallow entries the user never explicitly made. Both are correct
  * and neither is worth an invariant.
+ *
+ * STILL KEYED BY DEPTH, deliberately, and it is the one buffer in this pass that
+ * was left that way. `docs/rep-tile-findings.md` names a depth-keyed buffer as
+ * the thing that goes wrong under mixed radix — MIX-C's 354 leaves would all
+ * land in one bucket — so this map's KEYS are what would have to become scales.
+ * Rekeying it is a visible change to what the function returns, which this pass
+ * is not allowed to make: the depth→scale refactor was required to move no
+ * observable value. Recorded here as the follow-on, not done here.
  */
 export function depthCensus(
   plate: AddressPlate,

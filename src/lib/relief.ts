@@ -294,7 +294,10 @@ export function buildRelief(hex: Hexagon): ReliefSurface {
   });
   return {
     centre: hex.centre,
-    maxShell: 3 * 2 ** hex.depth,
+    // The rim's shell is three times the canvas's SCALE — the comment on the
+    // field has always said "the figure's scale", and it now reads it rather
+    // than recomputing it from a depth.
+    maxShell: 3 * hex.scale,
     cells,
     ringValues: [...rings].sort((a, b) => a - b),
   };

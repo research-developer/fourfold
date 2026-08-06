@@ -160,6 +160,12 @@ export interface HexCell {
 
 export interface Hexagon {
   depth: number;
+  /**
+   * The base figure's scale, carried up so the four modules that draw the
+   * hexagon read a resolution instead of deriving one. Always `base.scale`; the
+   * hexagon is six copies of the triangle and copying does not refine.
+   */
+  scale: number;
   convention: Convention;
   base: Figure;
   cells: HexCell[];
@@ -193,7 +199,11 @@ export function buildHexagon(
   convention: Convention = "apex"
 ): Hexagon {
   const base = buildFigure(depth, convention);
-  const scale = 2 ** depth;
+  // READ, not recomputed. The base figure already resolved the depth it was
+  // built at; deriving it a second time here is the drift `scale.ts` exists to
+  // remove — and under mixed radix the second derivation would be wrong, since
+  // a depth would no longer determine the scale the base actually cut to.
+  const scale = base.scale;
   const unit = RADIUS / scale;
   const width = 2 * RADIUS + 2 * PADDING;
   const height = SQRT3 * RADIUS + 2 * PADDING;
@@ -246,6 +256,7 @@ export function buildHexagon(
 
   return {
     depth,
+    scale,
     convention,
     base,
     cells,

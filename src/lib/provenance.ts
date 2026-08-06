@@ -72,18 +72,19 @@
 import { MAX_LAYERS, LAYER_ID } from "./artfile";
 import type { EmitAnimation, EmitLayer } from "./emit";
 import {
-  addressDepth,
   ancestorAt,
+  wordOf,
   type Address,
   type AddressBook,
 } from "./plate";
+import { refines, scaleOfWord } from "./scale";
 import { animationTiming, clampSpan, markLookup, spanSteps, type InOut } from "./replay";
 import type { History, Stroke } from "./strokes";
 
 /** What this module needs of an address book: the two directions, and the stem. */
 export type ProvenanceBook = Pick<
   AddressBook,
-  "addr" | "index" | "stem" | "depth"
+  "addr" | "index" | "stem" | "depth" | "scale"
 >;
 
 /**
@@ -264,12 +265,29 @@ function addressResolver(book: ProvenanceBook): (a: Address) => readonly number[
     return out;
   };
   return (a) => {
-    const d = addressDepth(a, book.stem);
-    if (d === book.depth) {
+    /**
+     * THE THREE-WAY RESOLUTION COMPARISON, in scale rather than in depth.
+     *
+     * same     scale(a) = scale(book)
+     * finer    scale(book) REFINES INTO scale(a) — a is the smaller cell, so its
+     *          scale is the multiple. Reads backwards until you remember that
+     *          scale is a denominator: finer cells have LARGER scale.
+     * coarser  everything else, which at one radix is exactly scale(a) refines
+     *          into scale(book).
+     *
+     * At radix 4 these are the same three branches `d === depth`, `d > depth`,
+     * else selected before, because every scale is a power of two and any two
+     * powers of two are comparable. The `else` is where a mixed tree would put
+     * INCOMPARABLE scales — 18 against 27, neither refining the other — which is
+     * a fourth case with no answer yet and no way to arise yet. Marked here for
+     * the same reason `plate.ts` marks its two-way version.
+     */
+    const s = scaleOfWord(wordOf(a, book.stem));
+    if (s === book.scale) {
       const i = book.index.get(a);
       return i === undefined ? [] : [i];
     }
-    if (d > book.depth) {
+    if (refines(book.scale, s)) {
       const i = book.index.get(ancestorAt(a, book.stem, book.depth));
       return i === undefined ? [] : [i];
     }

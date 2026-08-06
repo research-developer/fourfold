@@ -191,6 +191,14 @@ export type Radial = "out" | "in";
 export interface LatticeView {
   kind: CanvasKind;
   depth: number;
+  /**
+   * The canvas's resolution, carried so `functionals` below reads it instead of
+   * raising a depth. A BUFFER CARRYING SCALE, which is the half of the
+   * depth→scale change that is not about the figure: `docs/rep-tile-findings.md`
+   * names "a buffer keyed by depth would be comparing incomparable things" as
+   * where the work is, and a lattice view is one such buffer.
+   */
+  scale: number;
   cellCount: number;
   /** The cell's exact Eisenstein key — three times its centroid. */
   keyOf(i: number): Lat;
@@ -232,7 +240,7 @@ function div3(x: number): number {
 export function latticeView(canvas: Figure | Hexagon): LatticeView {
   const hex = isHexagon(canvas);
   const kind: CanvasKind = hex ? "hexagon" : "triangle";
-  const scale = 2 ** canvas.depth;
+  const scale = canvas.scale;
   const n = canvas.cells.length;
 
   const keys = new Array<Lat>(n);
@@ -285,6 +293,7 @@ export function latticeView(canvas: Figure | Hexagon): LatticeView {
   return {
     kind,
     depth: canvas.depth,
+    scale,
     cellCount: n,
     keyOf(i) {
       guard(i);
@@ -338,7 +347,10 @@ export function latticeView(canvas: Figure | Hexagon): LatticeView {
 function functionals(view: LatticeView, i: number): [number, number, number] {
   const [a, b] = view.keyOf(i);
   if (view.kind === "hexagon") return [-(a + b), a, b];
-  return [3 * 2 ** view.depth - a - b, a, b];
+  // The three sum to 3·scale on the triangle — a constant in the canvas's own
+  // resolution, which is what makes them one coordinate system. Read off the
+  // view rather than raised from its depth.
+  return [3 * view.scale - a - b, a, b];
 }
 
 const FAMILY_AT: Readonly<Record<BandFamily, 0 | 1 | 2>> = { A: 0, B: 1, C: 2 };
