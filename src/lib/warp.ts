@@ -1497,6 +1497,185 @@ export function apexHeight(cot: Z3, halfBase: Rat): Z3 {
 }
 
 // ═════════════════════════════════════════════════════════════════════════
+// SECTION L — THE RING-LNS FIT: WHICH AXIS DOES A SCALE BELONG ON?
+// ═════════════════════════════════════════════════════════════════════════
+//
+// `rationall-dev/demos/geometric-world-model/ring_lns/ring_lns.py` encodes a
+// real-quadratic ring element on TWO axes:
+//
+//     value = mantissa(RNS) · ε^exp
+//
+// — an integer `exp` on the unit group ⟨ε⟩ ≅ ℤ (their LOG-DEPTH axis, where `mul`
+// adds and repeated squaring reaches ε^(2^k) in k steps), and a mantissa held as
+// residues in fixed-width RNS channels (their parallel WIDTH axis). Both rings
+// they implement, ℤ[√3] and ℤ[φ], verify exact against a sympy oracle.
+//
+// THE QUESTION THIS SECTION DECIDES. Their exponent axis is UNIT POWERS. Our
+// descent scales by RATIONAL INTEGERS: `scale.radixAt` returns edge division 2 or
+// 3, so a scale is 2^a·3^b. Are those the same axis?
+//
+// THEY ARE NOT, and the separation is a norm fact rather than a matter of degree
+// [PROVEN in `test/warp.test.ts`]. A power of ε is a unit, so its norm is ±1;
+// N(2^a·3^b) = (2^a·3^b)², which is ±1 only at a = b = 0. So NO descent scale
+// above 1 is a power of ε, and putting the scale on their exponent axis is not
+// expensive — it is IMPOSSIBLE.
+//
+// What is left is the constructive question, and it has a clean answer: the scale
+// goes in the MANTISSA, where it is a rational integer with the √3 coordinate
+// idle, and the exponent axis is reserved for the unit composition ε̄^k — which is
+// where §R already measured the width actually growing, at 19 bits per 10 levels.
+// `epsAxisCost` prices the alternative and finds it strictly worse.
+//
+// ── THE ONE PLACE THE MANTISSA IS THE WRONG HOME ─────────────────────────
+//
+// `scale.refines(coarse, fine)` is DIVISIBILITY, and divisibility is the one
+// scale operation an RNS mantissa is bad at: it needs the integer back, which
+// means CRT out of the channels. Carried as the EXPONENT PAIR (a, b) instead, the
+// same test is componentwise ≤ and costs two integer comparisons — so the scale
+// wants an exponent-vector form for comparison and a mantissa form for
+// composition, and `smoothScaleOf`/`smoothRefines` are the two halves of that.
+
+/** A 3-smooth scale 2^a·3^b as its exponent pair — `scale.ts`'s scales, factored. */
+export interface SmoothScale {
+  readonly two: number;
+  readonly three: number;
+}
+
+/** 2^a·3^b, guarded. */
+export const smoothValue = (s: SmoothScale): number => {
+  let v = 1;
+  for (let i = 0; i < s.two; i++) v = safe(v * 2);
+  for (let i = 0; i < s.three; i++) v = safe(v * 3);
+  return v;
+};
+
+/**
+ * Factor a scale into (a, b), or null when it is not 3-smooth.
+ *
+ * Every scale `scaleOfWord` can produce IS 3-smooth, because `radixAt` returns
+ * only 2 or 3 — so the null branch is unreachable from an address and exists to
+ * keep the function total rather than to be exercised.
+ */
+export function smoothScaleOf(scale: number): SmoothScale | null {
+  if (!Number.isSafeInteger(scale) || scale < 1) return null;
+  let v = scale;
+  let two = 0;
+  let three = 0;
+  while (v % 2 === 0) {
+    v /= 2;
+    two++;
+  }
+  while (v % 3 === 0) {
+    v /= 3;
+    three++;
+  }
+  return v === 1 ? { two, three } : null;
+}
+
+/** Composition on the scale axis: exponents ADD, exactly as `mul` adds `exp`. */
+export const smoothCompose = (x: SmoothScale, y: SmoothScale): SmoothScale => ({
+  two: x.two + y.two,
+  three: x.three + y.three,
+});
+
+/**
+ * `scale.refines`, decided on the exponent pair: componentwise ≤.
+ *
+ * The point of the restatement is the COST, not the answer — this agrees with
+ * `refines` on every 3-smooth pair [PROVEN], and it does so without ever forming
+ * the scale, which is what an RNS mantissa would have to CRT out to do.
+ */
+export const smoothRefines = (coarse: SmoothScale, fine: SmoothScale): boolean =>
+  coarse.two <= fine.two && coarse.three <= fine.three;
+
+/**
+ * THE TWO-AXIS FORM of a fourfold cell, in their spelling.
+ *
+ * `mantissa` is the descent scale — a RATIONAL integer, so the √3 coordinate is
+ * zero and half the ring mantissa is idle; `exp` is the curvature power. This is
+ * the assignment the section header argues for, and `test/warp.test.ts` checks
+ * that it composes on both axes at once with no mixing between them.
+ */
+export interface LnsForm {
+  readonly mantissa: Z3;
+  readonly exp: number;
+}
+
+/** Their `mul`: mantissas multiply, exponents add. Carry-free on both axes. */
+export const lnsMul = (x: LnsForm, y: LnsForm): LnsForm => ({
+  mantissa: z3Mul(x.mantissa, y.mantissa),
+  exp: x.exp + y.exp,
+});
+
+/** The exact value of a two-axis form, as a ring element. */
+export const lnsValue = (f: LnsForm): Z3 =>
+  z3Mul(f.mantissa, z3Pow(f.exp < 0 ? EPS_BAR : EPS, Math.abs(f.exp)));
+
+/**
+ * THE LARGEST k WITH ε^k ≤ v, for a positive rational integer v — decided by
+ * EXACT INTEGER COMPARISON and no float.
+ *
+ * This is the k their `normalize` would pull onto the exponent axis (it divides
+ * by ε until the mantissa magnitude lands in [1, |ε|)). Their loop predicate is a
+ * float magnitude, documented there as "a comparison, never fed back into the
+ * pipeline"; ours cannot be, because this module has no float at all — so the
+ * same decision is taken on ℤ: with ε^k = A + B√3 and A, B > 0,
+ *
+ *     A + B√3 ≤ v   ⟺   v − A ≥ 0  and  3B² ≤ (v − A)².
+ */
+export function epsAxisDepth(v: number): number {
+  if (v < 1) throw new Error("warp: epsAxisDepth needs v ≥ 1");
+  let k = 0;
+  for (;;) {
+    const p = z3Pow(EPS, k + 1);
+    const d = safe(v - p.a.n);
+    if (d < 0) return k;
+    if (safe(3 * safe(p.b.n * p.b.n)) <= safe(d * d)) k++;
+    else return k;
+  }
+}
+
+export interface EpsAxisCost {
+  /** The rational-integer scale being priced. */
+  readonly scale: number;
+  /** Bits it needs as a mantissa: one coordinate, √3 lane idle. */
+  readonly bitsInMantissa: number;
+  /** Powers of ε their `normalize` would pull out of it. */
+  readonly k: number;
+  /** What is left in the mantissa after the pull: v·ε̄^k. */
+  readonly residue: Z3;
+  /** Bits the residue needs — the WIDER of its two coordinates. */
+  readonly bitsAfter: number;
+}
+
+/**
+ * PRICING THE SWAPPED ASSIGNMENT: what does moving a scale onto the ε axis cost?
+ *
+ * It cannot move there — a scale is not a unit — but their `normalize` will
+ * happily pull ε^k out of it, leaving v·ε̄^k in the mantissa and k on the
+ * exponent. The magnitude shrinks into [1, |ε|), which is what `normalize`
+ * promises. The WIDTH does not: ε̄^k = A_k − B_k√3 with A_k, B_k growing at
+ * log₂(2+√3) bits per level (§R's 19-bits-per-10), so
+ *
+ *     bits(v·ε̄^k) ≈ bits(v) + 1.9k        and     k ≈ bits(v)/1.9
+ *
+ * — the width roughly DOUBLES, and a one-coordinate rational integer becomes a
+ * two-coordinate ring element. That is the measurement that settles the axis
+ * question constructively rather than by the norm argument alone.
+ */
+export function epsAxisCost(scale: number): EpsAxisCost {
+  const k = epsAxisDepth(scale);
+  const residue = z3Mul(z3Int(scale, 0), z3Pow(EPS_BAR, k));
+  return {
+    scale,
+    bitsInMantissa: bitsOf(scale),
+    k,
+    residue,
+    bitsAfter: Math.max(bitsOf(residue.a.n), bitsOf(residue.b.n)),
+  };
+}
+
+// ═════════════════════════════════════════════════════════════════════════
 // SMALL HELPERS THE TESTS SHARE
 // ═════════════════════════════════════════════════════════════════════════
 

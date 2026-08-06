@@ -29,7 +29,12 @@
 import { describe, expect, it } from "vitest";
 import { buildFigure, buildRep9Figure } from "../src/lib/figure";
 import { buildHexagon, buildRep9Hexagon, type Lat } from "../src/lib/hexagon";
-import { scaleOfWord } from "../src/lib/scale";
+import {
+  EDGE_DIVISION,
+  REP9_EDGE_DIVISION,
+  refines,
+  scaleOfWord,
+} from "../src/lib/scale";
 import {
   ROOT,
   buildTree,
@@ -96,6 +101,16 @@ import {
   z3Pow,
   z3PtEq,
   z3TanDouble,
+  epsAxisCost,
+  epsAxisDepth,
+  lnsMul,
+  lnsValue,
+  smoothCompose,
+  smoothRefines,
+  smoothScaleOf,
+  smoothValue,
+  type LnsForm,
+  type SmoothScale,
   type Warp,
   type Weights,
 } from "../src/lib/warp";
@@ -1275,6 +1290,276 @@ describe("Q2 restated — dynamic range, not integer width", () => {
       `floang-core fixture (12 of their 128 rows): products ≤32 bits, all exact in one word;\n` +
         `   norms reach ${widestNormBits} bits and their a²/3b² intermediates ${widestIntermediateBits} bits;\n` +
         `   → 3 lanes × ${laneCount(widestIntermediateBits).laneBits} bits, which is why RingPair carries norm_i128`
+    );
+  });
+});
+
+// ═════════════════════════════════════════════════════════════════════════
+describe("L — the ring-LNS fit: which axis does a scale belong on?", () => {
+  /**
+   * ★ THE AXIS SEPARATION, AS A NORM FACT [PROVEN].
+   *
+   * `ring_lns.py`'s exponent axis is ⟨ε⟩, the unit group. A unit has norm ±1.
+   * A descent scale is 2^a·3^b and N(2^a·3^b) = (2^a·3^b)², which is ±1 only at
+   * a = b = 0. So the two "exponent axes" are not the same axis, and the reason
+   * is not that our scales are small — it is that they are NOT UNITS.
+   *
+   * This is the load-bearing claim of `docs/ring-lns-fit.md`, so it is decided by
+   * exhaustion over the whole shipped scale range rather than on examples.
+   */
+  it("★ no descent scale above 1 is a unit, hence none is a power of ε [PROVEN]", () => {
+    // Capped at 2^20 so that N = v² stays inside one exact word: the norm is
+    // the wide operation here too, which is §R's finding arriving early.
+    const scales: number[] = [];
+    for (let a = 0; a <= 12; a++) {
+      for (let b = 0; b <= 12; b++) {
+        const v = smoothValue({ two: a, three: b });
+        if (v <= 2 ** 20) scales.push(v);
+      }
+    }
+    expect(scales.length).toBeGreaterThan(100);
+
+    let units = 0;
+    for (const v of scales) {
+      const z = z3Int(v, 0);
+      // N(v) = v² exactly — the √3 coordinate is zero, so the norm is a square.
+      expect(z3Norm(z)).toEqual(rat(v * v, 1));
+      if (z3IsUnit(z)) units++;
+    }
+    // The ONLY unit among them is 1, which is the empty descent.
+    expect(units).toBe(1);
+    expect(z3IsUnit(z3Int(1, 0))).toBe(true);
+    expect(z3IsUnit(z3Int(EDGE_DIVISION, 0))).toBe(false);
+    expect(z3IsUnit(z3Int(REP9_EDGE_DIVISION, 0))).toBe(false);
+
+    // And the contrast that makes the point: ε and ε̄ ARE units, at every power.
+    // k ≤ 14 because `z3IsUnit` calls `z3Norm`, and §R's norm depth is 14 — the
+    // wall this section's last test is about, and it bites here first.
+    for (let k = 0; k <= 14; k++) {
+      expect(z3IsUnit(z3Pow(EPS, k))).toBe(true);
+      expect(z3IsUnit(z3Pow(EPS_BAR, k))).toBe(true);
+    }
+    expect(() => z3IsUnit(z3Pow(EPS_BAR, 15))).toThrow(/exact range exceeded/);
+
+    // GUARD-FIRE: no power of ε is ever a rational integer above 1, so the
+    // exponent axis cannot even accidentally land on a scale. k ≤ 28 is the
+    // depth the product composes to in one exact word (§R).
+    for (let k = 1; k <= 28; k++) {
+      expect(rSign(z3Pow(EPS, k).b)).not.toBe(0);
+      expect(rSign(z3Pow(EPS_BAR, k).b)).not.toBe(0);
+    }
+  });
+
+  /**
+   * ★ PRICING THE SWAPPED ASSIGNMENT [PROVEN].
+   *
+   * A scale cannot live on the ε axis, but `normalize` will still pull ε^k out of
+   * it. The magnitude lands in [1, |ε|) as promised; the WIDTH roughly doubles and
+   * a one-coordinate rational integer becomes a two-coordinate ring element.
+   *
+   * The rows are the ones `ring_lns.py`'s own `normalize` produces — checked
+   * against it by hand for scale 32 (mantissa (224, −128), exp 2), 243
+   * ((23571, −13608), exp 4) and 4 ((8, −4), exp 1).
+   */
+  it("★ moving a scale onto the ε axis roughly doubles its width [PROVEN]", () => {
+    // Their normalize's k, reproduced by exact integer comparison and no float.
+    expect(epsAxisDepth(2)).toBe(0);
+    expect(epsAxisDepth(4)).toBe(1);
+    expect(epsAxisDepth(32)).toBe(2);
+    expect(epsAxisDepth(243)).toBe(4);
+
+    // Their residues, to the coordinate.
+    expect(epsAxisCost(4).residue).toEqual({ a: rat(8, 1), b: rat(-4, 1) });
+    expect(epsAxisCost(32).residue).toEqual({ a: rat(224, 1), b: rat(-128, 1) });
+    expect(epsAxisCost(243).residue).toEqual({
+      a: rat(23571, 1),
+      b: rat(-13608, 1),
+    });
+
+    const rows = [4, 8, 32, 243, 7776].map(epsAxisCost);
+    for (const r of rows) {
+      // the value is preserved — this is a rewriting, not a rounding
+      expect(z3Eq(z3Mul(r.residue, z3Pow(EPS, r.k)), z3Int(r.scale, 0))).toBe(true);
+      // the mantissa stops being a rational integer: the √3 lane switches on
+      expect(rSign(r.residue.b)).toBe(-1);
+      // and the width strictly grows
+      expect(r.bitsAfter).toBeGreaterThan(r.bitsInMantissa);
+    }
+    // 32: 6 bits in one coordinate → 8 bits in two. 243: 8 → 15.
+    expect(epsAxisCost(32)).toMatchObject({ bitsInMantissa: 6, bitsAfter: 8, k: 2 });
+    expect(epsAxisCost(243)).toMatchObject({ bitsInMantissa: 8, bitsAfter: 15, k: 4 });
+
+    // The law behind the table: bits grow by ≈ log₂(2+√3) per pulled power, and
+    // k ≈ bits/1.9, so the total added width ≈ the original width.
+    const wide = epsAxisCost(7776);
+    expect(wide.bitsAfter).toBeGreaterThanOrEqual(2 * wide.bitsInMantissa - 3);
+    console.log(
+      `ε-axis cost: ` +
+        rows
+          .map((r) => `${r.scale}: ${r.bitsInMantissa}b→${r.bitsAfter}b (k=${r.k})`)
+          .join(", ")
+    );
+  });
+
+  /**
+   * ★ THE PROPOSED FIT, COMPOSED [PROVEN].
+   *
+   * value = (2^a·3^b) · ε^j — scale in the mantissa, curvature on the exponent.
+   * Their `mul` multiplies mantissas and adds exponents, so the two axes compose
+   * INDEPENDENTLY and neither leaks into the other: the mantissa of a product is
+   * still a rational integer (√3 lane still idle) and the exponent is still a
+   * plain sum.
+   */
+  it("★ scale-in-mantissa, curvature-on-exponent composes with no mixing [PROVEN]", () => {
+    const X: LnsForm = { mantissa: z3Int(72, 0), exp: -7 };
+    const Y: LnsForm = { mantissa: z3Int(12, 0), exp: -5 };
+    const Z = lnsMul(X, Y);
+    expect(Z.mantissa).toEqual({ a: rat(864, 1), b: R0 });
+    expect(Z.exp).toBe(-12);
+    // √3 lane still idle after the product — the axes did not mix.
+    expect(rSign(Z.mantissa.b)).toBe(0);
+    // and the two-axis value is the ring product of the two values
+    expect(z3Eq(lnsValue(Z), z3Mul(lnsValue(X), lnsValue(Y)))).toBe(true);
+
+    // Over a sweep of descent scales and curvature powers.
+    for (let a = 0; a <= 5; a++) {
+      for (let b = 0; b <= 4; b++) {
+        for (let j = -6; j <= 6; j++) {
+          const P: LnsForm = { mantissa: z3Int(smoothValue({ two: a, three: b }), 0), exp: j };
+          const Q: LnsForm = { mantissa: z3Int(smoothValue({ two: b, three: a }), 0), exp: -j };
+          const R = lnsMul(P, Q);
+          expect(rSign(R.mantissa.b)).toBe(0);
+          expect(R.exp).toBe(0);
+          expect(z3Eq(lnsValue(R), z3Mul(lnsValue(P), lnsValue(Q)))).toBe(true);
+        }
+      }
+    }
+  });
+
+  /**
+   * ★★ WHERE THE MANTISSA IS THE WRONG HOME [PROVEN].
+   *
+   * `scale.refines` is DIVISIBILITY. In an RNS mantissa that needs the integer
+   * back — CRT out of the channels — but on the exponent PAIR it is componentwise
+   * ≤, two comparisons and no reconstruction. The two agree on every 3-smooth
+   * pair, which is every scale `scaleOfWord` can produce.
+   *
+   * This is the one place the brief's "the scale fits in the mantissa" needs
+   * qualifying: it fits for COMPOSITION and not for COMPARISON.
+   */
+  it("★★ refinement is componentwise ≤ on exponents, not a mantissa op [PROVEN]", () => {
+    const pairs: SmoothScale[] = [];
+    for (let a = 0; a <= 8; a++)
+      for (let b = 0; b <= 8; b++) pairs.push({ two: a, three: b });
+
+    let checked = 0;
+    for (const x of pairs) {
+      for (const y of pairs) {
+        const vx = smoothValue(x);
+        const vy = smoothValue(y);
+        if (vx > 2 ** 24 || vy > 2 ** 24) continue;
+        // `scale.refines` on the values vs `smoothRefines` on the exponents.
+        expect(smoothRefines(x, y)).toBe(refines(vx, vy));
+        checked++;
+      }
+    }
+    expect(checked).toBeGreaterThan(2000);
+
+    // The incomparable case `scale.ts` exists to admit, in exponent form.
+    const s18 = smoothScaleOf(18)!;
+    const s27 = smoothScaleOf(27)!;
+    expect(s18).toEqual({ two: 1, three: 2 });
+    expect(s27).toEqual({ two: 0, three: 3 });
+    expect(smoothRefines(s18, s27)).toBe(false);
+    expect(smoothRefines(s27, s18)).toBe(false);
+    console.log(`refines ≡ componentwise ≤ on ${checked} 3-smooth pairs`);
+  });
+
+  /**
+   * THE SCALE AXIS AND THE ADDRESS AGREE [PROVEN].
+   *
+   * `smoothCompose` adds exponents; `scaleOfWord` multiplies edge divisions.
+   * They are the same operation in two spellings, which is what makes the
+   * exponent pair a legitimate carrier for a descent scale rather than a
+   * re-derivation of one.
+   */
+  it("the exponent pair tracks scaleOfWord along a real address [PROVEN]", () => {
+    const words = ["", "A", "AB", "ABX", "abc", "aAbB", "XXXXX", "uvwxyzabc"];
+    for (const w of words) {
+      const s = scaleOfWord(w);
+      const pair = smoothScaleOf(s)!;
+      expect(smoothValue(pair)).toBe(s);
+      // walk the address, composing one digit at a time
+      let acc = { two: 0, three: 0 };
+      for (let i = 0; i < w.length; i++) {
+        const k = scaleOfWord(w[i]);
+        acc = smoothCompose(acc, smoothScaleOf(k)!);
+      }
+      expect(acc).toEqual(pair);
+    }
+
+    // The shipped range, in bits — the number the fit turns on.
+    const maxRep4 = smoothValue({ two: 5, three: 0 });
+    const maxRep9 = smoothValue({ two: 0, three: 5 });
+    expect(maxRep4).toBe(32);
+    expect(maxRep9).toBe(243);
+    expect(laneCount(8)).toMatchObject({ lanes: 3, laneBits: 3 });
+    console.log(
+      `shipped scale range: rep-4 ≤ ${maxRep4} (6 bits), rep-9 ≤ ${maxRep9} (8 bits)` +
+        ` → 3 lanes × 3 bits covers the whole scale axis`
+    );
+  });
+
+  /**
+   * ★★ THE NORM-WIDTH WALL, AND WHY RNS DOES NOT HIT IT [PROVEN].
+   *
+   * §R found the norm needs 2·W where the product needs W, giving out at k = 14
+   * against the product's k = 28. That is a fact about SCHOOLBOOK arithmetic: a²
+   * and 3b² are each twice the width of a and b.
+   *
+   * It is NOT a fact about the norm's ANSWER. For a unit the norm is ±1 — one
+   * bit — at every power, however wide the element gets. So an arithmetic that
+   * computes N mod p per channel and reconstructs only the small result never
+   * forms the wide intermediate at all, and `ring_lns.py`'s channels are exactly
+   * that arithmetic. This test establishes the asymmetry the argument rests on;
+   * `docs/ring-lns-fit.md` records the in-channel computation run against their
+   * code, which returns +1 for k = 0..14 with a 13-bit widest intermediate.
+   */
+  it("★★ the norm's OUTPUT stays 1 bit while its intermediates blow up [PROVEN]", () => {
+    rangeReset();
+    // The shipped instrument already reports both boundaries: it breaks when the
+    // PRODUCT leaves range, and nulls `norm` when only the NORM does.
+    const rows = unitPowerWidths(EPS_BAR, 40);
+    const lastRow = rows[rows.length - 1];
+    const computable = rows.filter((r) => r.norm !== null);
+    const lastComputable = computable[computable.length - 1];
+
+    // §R's two depths, re-established rather than cited.
+    expect(lastRow.k).toBe(28); // the product composes to k = 28 in one word
+    expect(lastComputable.k).toBe(14); // the norm reaches 14 — EXACTLY half of 28
+    expect(rows[15].norm).toBeNull();
+    // NOTE: `docs/warp-findings.md:201` says `safeIntegerDepth(ε̄) = 29`. The
+    // shipped tests at lines 1045 and 1142 both assert 28, and 28 is what it
+    // returns. The doc is off by one; `docs/ring-lns-fit.md` records the
+    // correction.
+    expect(safeIntegerDepth(EPS_BAR)).toBe(28);
+
+    // THE ANSWER IS ALWAYS 1, everywhere it can be computed at all: N(ε̄^k) =
+    // N(ε̄)^k = 1. One bit, at every k, however wide the element gets.
+    for (const r of computable) expect(r.norm).toEqual(rat(1, 1));
+    expect(computable.length).toBe(15); // k = 0..14
+
+    // THE ASYMMETRY: at k = 28 the coordinates need 53 bits and the schoolbook a²
+    // needs 106 — but the value that computation produces is still exactly 1.
+    expect(lastRow.bitsA).toBe(53);
+    expect(lastRow.integral).toBe(true);
+    expect(lastRow.bitsDen).toBe(0);
+    expect(laneCount(1)).toMatchObject({ lanes: 3, laneBits: 1 });
+    expect(laneCount(2 * lastRow.bitsA)).toMatchObject({ lanes: 3, laneBits: 36 });
+    console.log(
+      `norm wall: ε̄^28 coordinates ${lastRow.bitsA} bits, schoolbook a² ` +
+        `${2 * lastRow.bitsA} bits (3×36 lanes), but N = 1 — 1 bit. ` +
+        `RNS pays the ANSWER's width, not the intermediate's.`
     );
   });
 });
