@@ -278,6 +278,7 @@
 
 import {
   applyMove,
+  at as layerAt,
   find,
   gestureOf,
   type Act,
@@ -529,24 +530,80 @@ export function rewriteFrames(
       comp = step.value.comp;
     }
   } catch (e) {
-    // `insertAt` and `removeAt` throw on a path that names no slot, which is
-    // reachable here and only here: a rewrite that adds or removes a STRUCTURAL
-    // act moves every later `place` path. The message is carried through so the
-    // live region says what actually happened.
-    return no(
-      "unknown-layer",
-      `that edit cannot be replayed onto the later frames — ${
-        e instanceof Error ? e.message : String(e)
-      }`
-    );
+    /**
+     * NARROWED, because the two things this used to catch are not one thing.
+     *
+     * `insertAt` and `removeAt` throw on a path that names no slot, which is
+     * reachable here: a rewrite that adds or removes a STRUCTURAL act moves every
+     * later `place` path. That is a fact about the journal, `"unknown-layer"` is
+     * the right word for it, and the message is carried through so the live
+     * region says what actually happened.
+     *
+     * A `TypeError` out of a defect in `applyMove` is not that. It used to arrive
+     * at the person wearing the same label and the same opening clause — a claim
+     * about THEIR drawing for a fault in THIS program — and `"unknown-layer"` is
+     * the counter a guard would fire on, so the lie was also arithmetic.
+     *
+     * TOLD APART BY THE PREFIX `layers.ts` puts on every throw it means. That is
+     * a string test and it is the honest one available: the alternative is a
+     * custom error class exported from `layers.ts` for one consumer, which is the
+     * widening that module already declined for `yes`/`no`. If the prefix is ever
+     * dropped the failure is loud in the safe direction — a real precondition
+     * reported as a defect, which is a sentence somebody reads and fixes.
+     */
+    const known = e instanceof Error && e.message.startsWith("layers: ");
+    const said = e instanceof Error ? e.message : String(e);
+    return known
+      ? no("unknown-layer", `that edit cannot be replayed onto the later frames — ${said}`)
+      : no(
+          "defect",
+          `the rewrite could not be completed and the drawing is untouched — this is a fault in the program, not in your drawing: ${said}`
+        );
   }
 
-  // `HISTORY_LIMIT` on the same terms `layers.act` keeps it: the oldest rung is
-  // dropped, never the newest. A rewrite can only exceed it by replacing n acts
-  // with more than n, which merging never does and splicing can.
-  const trimmed =
-    out.length > HISTORY_LIMIT ? out.slice(out.length - HISTORY_LIMIT) : out;
-  const journal: Journal = { past: trimmed, future: [] };
+  /**
+   * PAST `HISTORY_LIMIT` IS A REFUSAL, and it used to be a silent trim.
+   *
+   * ── What the trim actually cost, which was not the dropped rung ────────
+   *
+   * `out.slice(out.length - HISTORY_LIMIT)` drops m acts off the FRONT, so every
+   * act index moves by m. `remember`'s docstring hands a direct caller of this
+   * function the rule for keeping the timeline in step — "a delete takes the tree
+   * to `rebaseTree(tl, at, count, 0)`" — and that rule is stated in the index
+   * space of a journal that kept its front. Follow it after a trim and the tree
+   * is misaligned against the journal by exactly m: the same tree/journal desync
+   * `Revision` was built to close, arriving through a door nobody was watching.
+   *
+   * ── Refused rather than counted, and the choice is not close ───────────
+   *
+   * `RebaseReport` has a field for every other cost and a `trimmed` field would
+   * have been a seventh. But a count only NAMES the shift; the caller still has
+   * to correct for it, in a second rule it has to remember, at the one call site
+   * where getting it wrong is invisible. Refusing removes the shift instead of
+   * describing it, and it is the stance this function opens with: it "REFUSES an
+   * out-of-range splice rather than clamping it", because "a statement about
+   * which frames to replace" is not a slider being dragged off its track. A
+   * splice that overruns the journal's own limit is that same statement one level
+   * in, and it gets the same answer.
+   *
+   * THE LIMIT IS STILL KEPT, by never building the journal rather than by cutting
+   * one. `layers.act` still trims, on its own terms, where the front moving costs
+   * nothing because no tree is addressed against it.
+   *
+   * UNREACHABLE FROM THE UI TODAY, measured rather than assumed: this needs
+   * `past.length - count + plan.acts.length > HISTORY_LIMIT`, and `past.length`
+   * is already capped at `HISTORY_LIMIT` by `layers.act`, so it needs
+   * `plan.acts.length > count`. `editFrame` replaces one act with one and
+   * `mergeFrames` folds n into one — neither grows the journal. It is here
+   * because this is "THE ONE ENTRY POINT" and `acts` is a free-form array.
+   */
+  if (out.length > HISTORY_LIMIT) {
+    return no(
+      "empty",
+      `that rewrite would leave ${out.length} frames and a drawing holds ${HISTORY_LIMIT} — the oldest would be dropped and every later frame would be renumbered under the timeline. Merge frames first`
+    );
+  }
+  const journal: Journal = { past: out, future: [] };
 
   return yes({
     session: { composition: reseat(comp), journal },
@@ -661,6 +718,46 @@ function rebaseAct(
             return no(
               "unknown-layer",
               `frame "${act.note}" moves a layer the drawing no longer has`
+            );
+          }
+          /**
+           * THE PATH IS CHECKED, NOT ONLY THE ID — and the two are different
+           * questions.
+           *
+           * `find` asks "does this id exist ANYWHERE", and that guard passed
+           * while `applyMove` went on to use the RECORDED path `m.at`. A rewrite
+           * that changes the number of STRUCTURAL acts moves every later path by
+           * exactly the shift, so the recorded path names a different layer — and
+           * `removeAt` removed that one instead, silently.
+           *
+           * Measured before the fix: `rewriteFrames(s, { at: 3, count: 1, acts:
+           * [] })` on a journal ending in an `arrange` returned `ok: true` with
+           * `{rebased: 1, repaired: 0, refrozen: 0}` and a composition of `[L2,
+           * L2, L3]` — a DUPLICATE `LayerId` with `L1` gone. That is precisely
+           * the "drawing has come apart" state `layers.census.duplicateIds`
+           * exists to detect, produced by this module and reported as success.
+           *
+           * REFUSED rather than repaired, and the choice is not close. Repairing
+           * would mean re-deriving the path with `pathOf` and hoping the intent
+           * was "this layer" rather than "this slot" — but a `place` pair is
+           * `[remove, insert]` and the insert's path is recorded against the tree
+           * as it stood BETWEEN them, so re-deriving one and not the other builds
+           * a tree neither of them describes. `rewriteFrames` is documented as
+           * refusing an out-of-range splice rather than clamping it; a splice
+           * whose paths no longer name what they were recorded against is the
+           * same fact one level in, and it gets the same answer.
+           *
+           * Latent from the UI today — `editFrame` replaces one act with one and
+           * `mergeFrames` folds n into one, and neither changes how many
+           * structural acts precede the tail — so this fires for no gesture a
+           * person can currently make. It is here because `rewriteFrames` is
+           * "THE ONE ENTRY POINT" with a free-form `acts` array, and the failure
+           * it admits is unrecoverable and silent.
+           */
+          if (layerAt(out, m.at)?.id !== m.node.id) {
+            return no(
+              "unknown-layer",
+              `frame "${act.note}" moves a layer from a place the drawing no longer keeps it — the rewrite shifted the tree under it`
             );
           }
           if (live !== m.node) {
@@ -813,11 +910,37 @@ function washSource(
  * Absent stays absent: an empty `LayerGesture` is spelled by leaving `from` off,
  * exactly as `layers.NO_GESTURE` does, so a layer with no gesture yields a move
  * with no key rather than one holding an empty object.
+ *
+ * ── "NO GESTURE" HAS TWO SPELLINGS AND THEY MUST COMPARE EQUAL ─────────
+ *
+ * That paragraph above describes what this function PRODUCES, and the defect was
+ * that it did not describe what it CONSUMES. `page.tsx` writes every paint as
+ * `gesture: { from: gestureOf(into) }`, and `gestureOf` returns `{}` for an
+ * ordinary layer — so the journal this program actually produces holds `from:
+ * {}` where this function's own output would have held nothing at all.
+ * `sameGesture({}, undefined)` is false, so `repaired += 1` fired on EVERY PAINT
+ * FRAME OF EVERY REBASE, and `repaired` is the number `RebaseReport` exists to
+ * surface: "a number that is unexpectedly large is the signal that the edit did
+ * more than the person meant". It was unexpectedly large on every edit.
+ *
+ * The tests could not see it because `test/frames.test.ts` builds its moves with
+ * `NO_GESTURE`, which is `{ from: undefined }` — the shape this function emits,
+ * not the shape the app writes. So both sides agreed, and neither was the
+ * program.
+ *
+ * NORMALISED ON BOTH SIDES rather than fixed on one. `sameGesture` stays a plain
+ * structural equality — it is worth keeping something in this file that means
+ * exactly what it says — and `settled` is applied to the recorded side and the
+ * live side alike, so the comparison is between two canonical values. Fixing only
+ * the producer would have left every journal already in a `Revision` still
+ * miscounting.
  */
+const settled = (g: LayerGesture | undefined): LayerGesture | undefined =>
+  g === undefined || isEmptyGesture(g) ? undefined : g;
+
 function rebaseGesture(layer: Layer, was: MoveGesture, t: Tally): MoveGesture {
-  const live = gestureOf(layer);
-  const want: LayerGesture | undefined = isEmptyGesture(live) ? undefined : live;
-  if (sameGesture(was.from, want)) return was;
+  const want = settled(gestureOf(layer));
+  if (sameGesture(settled(was.from), want)) return was;
   t.repaired += 1;
   return was.to === undefined ? { from: want } : { from: want, to: was.to };
 }
@@ -1006,6 +1129,35 @@ export function mergeActs(
    * `marked` are facts about the MERGED ACT and are read off it afterwards.
    */
   const modes = new Set<number>();
+  /**
+   * WHICH SLOTS OF `moves` HAVE ALREADY GIVEN THE MARK UP — and why the set has
+   * to exist outside the stroke.
+   *
+   * `foldMarks` says "no honest mark" by answering `undefined`, and a stroke has
+   * no other spelling for it: `Stroke.mark` is present or absent, and absent also
+   * means "this gesture recorded no symmetry". So the deliberate discard, once
+   * written into a stroke, is indistinguishable from never having had one — and
+   * the very next fold read it as "unmarked" and ADOPTED THE NEXT MARK WHOLE.
+   *
+   * Measured: merging three frames at modes 6, 3, 6 gave `{mode: 6, groups: […one
+   * …]}` with `marked: true`, so `mergeSaid` printed "the merged mark keeps 1
+   * symmetry group at the 6-fold brush" while two of the three recorded marks had
+   * been destroyed — and because `marked` gates it, the MODES DISAGREE sentence,
+   * which exists for exactly this range, never fired. The two-frame case is
+   * correct, which is why it took a third frame agreeing with the first to see
+   * it. REACHABLE FROM THE MERGE BUTTON.
+   *
+   * A set of indices rather than a sentinel mark: the alternative is a
+   * distinguished `StrokeMark` value carried through `Stroke` and out into
+   * `layers.ts`, the file format and the undo stack, to say something that is only
+   * true for the length of this loop.
+   *
+   * STICKY, deliberately. Once two frames in one coalesced run disagree, no mode
+   * is a true statement about the run, and a later frame agreeing with one of them
+   * does not make it true again. That is the same judgement the two-frame case
+   * already makes; this only stops it being forgotten on the third.
+   */
+  const gaveUp = new Set<number>();
 
   for (const a of acts) {
     events += a.events;
@@ -1020,7 +1172,10 @@ export function mergeActs(
         prev.kind === "paint" &&
         prev.layer === m.layer
       ) {
-        moves[moves.length - 1] = foldPaint(prev, m);
+        const k = moves.length - 1;
+        const folded = foldPaint(prev, m, gaveUp.has(k));
+        moves[k] = folded.move;
+        if (folded.gaveUp) gaveUp.add(k);
         coalesced += 1;
         continue;
       }
@@ -1049,13 +1204,20 @@ export function mergeActs(
   };
 }
 
-/** Two consecutive paints on one layer, as one. See `mergeActs`. */
+/**
+ * Two consecutive paints on one layer, as one. See `mergeActs`.
+ *
+ * `gaveUp` in and `gaveUp` out because the mark fold is NOT associative on its
+ * own — `mergeActs` holds the flag and its header carries the measurement.
+ */
 function foldPaint(
   a: Extract<Move, { kind: "paint" }>,
-  b: Extract<Move, { kind: "paint" }>
-): Move {
+  b: Extract<Move, { kind: "paint" }>,
+  gaveUp: boolean
+): { move: Move; gaveUp: boolean } {
   const edits = mergeEdits<Address>(a.stroke.edits, b.stroke.edits);
-  const mark = foldMarks(a.stroke.mark, b.stroke.mark);
+  const folded = foldMarks(a.stroke.mark, b.stroke.mark, gaveUp);
+  const mark = folded.mark;
   const stroke: Stroke<Address> = mark === undefined ? { edits } : { edits, mark };
   // The SAME `{from, to}` composition `mergeEdits` performs on the cells, one
   // level up: the pair straddles the fold, so the merged move destroyed whatever
@@ -1066,18 +1228,33 @@ function foldPaint(
     ...(a.gesture.from === undefined ? {} : { from: a.gesture.from }),
     ...(b.gesture.to === undefined ? {} : { to: b.gesture.to }),
   };
-  return { kind: "paint", layer: a.layer, stroke, gesture };
+  return {
+    move: { kind: "paint", layer: a.layer, stroke, gesture },
+    gaveUp: folded.gaveUp,
+  };
 }
 
-/** Two marks as one, or none when they cannot honestly be one. See `mergeActs`. */
+/**
+ * Two marks as one, or none when they cannot honestly be one. See `mergeActs`.
+ *
+ * THREE ANSWERS AND NOT TWO, which is the whole of the fix. "No mark" and "a mark
+ * given up" are the same value in a `Stroke` and are different facts here: the
+ * first may absorb the next mark, the second may not, and the second must stay
+ * given up for the rest of the run. `given` carries the second state in, `gaveUp`
+ * carries it out, and `mergeActs` is the one place it is kept.
+ */
 function foldMarks(
   a: StrokeMark<Address> | undefined,
-  b: StrokeMark<Address> | undefined
-): StrokeMark<Address> | undefined {
-  if (a === undefined) return b;
-  if (b === undefined) return a;
-  if (a.mode !== b.mode) return undefined;
-  return { mode: a.mode, groups: [...a.groups, ...b.groups] };
+  b: StrokeMark<Address> | undefined,
+  given: boolean
+): { mark?: StrokeMark<Address>; gaveUp: boolean } {
+  // ALREADY GIVEN UP, and it stays that way. Reading `a.stroke.mark` here would
+  // read `undefined` and adopt `b` whole, which is the defect.
+  if (given) return { gaveUp: true };
+  if (a === undefined) return b === undefined ? { gaveUp: false } : { mark: b, gaveUp: false };
+  if (b === undefined) return { mark: a, gaveUp: false };
+  if (a.mode !== b.mode) return { gaveUp: true };
+  return { mark: { mode: a.mode, groups: [...a.groups, ...b.groups] }, gaveUp: false };
 }
 
 /**

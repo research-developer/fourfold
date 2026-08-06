@@ -13,8 +13,19 @@
  * everything a rewrite moves and this tree is one of those things. Measured: a
  * revision that remembered only the `Session` restored a six-rung journal beside
  * a four-beat tree and dropped two gestures from the animation with nothing
- * reporting it. That is the whole of the coupling; no function here is called by
- * the program.
+ * reporting it.
+ *
+ * AND THAT IS NO LONGER THE WHOLE OF THE COUPLING. This paragraph used to end
+ * "no function here is called by the program", which was true when it was written
+ * and stopped being true in this same branch: `page.tsx` imports `groupFor` and
+ * `rebaseTree` at runtime and calls both — `groupFor` from `rewriteFrame`, to put
+ * a wrapper round an edited step so a later hold cannot renumber the drawing, and
+ * `rebaseTree` from `mergeMarked`, because only it knows a splice's three numbers
+ * and can therefore keep a hold inside the merged range. `flatten` and `stepId`
+ * are called from `timeline.ts`, which the program calls throughout.
+ *
+ * A stale "nothing calls this" is the most expensive kind of wrong comment here,
+ * because it invites exactly the change nobody may safely make.
  *
  * ── THE SHAPE: NESTING IN THE MODEL, ONE FLAT CLOCK IN THE FILE ─────────
  *
@@ -369,6 +380,23 @@ export function wellOrdered(tl: Timeline): boolean {
  * THE JOURNAL IS NOT TOUCHED. A hold carries `act: null`, so `Journal.past` does
  * not grow and no index into it moves. That is the whole mechanism, and it is
  * why this composes with `frames.ts` rather than fighting it.
+ *
+ * ── IT CANNOT DECLINE, WHERE `group` AND `ungroup` BOTH CAN ────────────
+ *
+ * Named because the asymmetry is real and looks like an oversight. `into` naming
+ * no composition returns the tree UNCHANGED — `walk` simply matches nothing — and
+ * an out-of-range `at` is clamped by `splice`. So a caller cannot tell "the hold
+ * went in" from "the id was wrong" by the return value, and there is no `Outcome`
+ * here to say which.
+ *
+ * Left that way DELIBERATELY, because the two are not the same kind of operation:
+ * `group` and `ungroup` restructure and can produce a tree that is not a tree, so
+ * they have to be able to say no. A hold adds one leaf and every argument to it
+ * comes from a control that already knows the tree — `at` from a rail position,
+ * `into` from a step the panel is pointing at. There is no path today by which a
+ * bad `into` reaches here. If one is ever added, THIS is the function that needs
+ * an `Outcome` first, and the reason it did not have one is that nothing could
+ * have used it.
  */
 export function insertHold(
   tl: Timeline,
@@ -701,6 +729,15 @@ export function compile(
         // COMPRESSION, and the one place this module produces a non-integer
         // millisecond. See the header for why that is an argument against the
         // mode rather than a detail of it.
+        //
+        // ONE-SIDED, and the other side is named rather than left to be found: it
+        // only ever SHORTENS. A composition whose beats at their own tempo come
+        // to LESS than its slot keeps that tempo and the slot is under-filled —
+        // the children finish early and the remainder is dead time inside the
+        // group. Not fixed here: "stretch to fill" is a different intent from
+        // "fit inside", nothing in the program selects `"within"` yet, and
+        // inventing the stretch would be choosing for a mode with no caller. It
+        // is a real gap in the mode, recorded as one.
         if (beats > 0 && beats * own > slot) own = slot / beats;
       }
       lay(s.steps, at, own, false);

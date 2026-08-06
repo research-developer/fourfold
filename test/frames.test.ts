@@ -46,7 +46,9 @@ import {
   find,
   flatten,
   fromPlate,
+  gestureOf,
   layerId,
+  removeLayer,
   newSession,
   NO_GESTURE,
   select,
@@ -68,6 +70,7 @@ import { actStrokes, everyComposition, stepComposition } from "../src/lib/compos
 import { animationSteps } from "../src/lib/replay";
 import { beatsOf } from "../src/lib/timeline";
 import type { StrokeMark } from "../src/lib/strokes";
+import { HISTORY_LIMIT } from "../src/lib/strokes";
 import {
   editFrame,
   frameKinds,
@@ -926,5 +929,254 @@ describe("the report counts rather than describes", () => {
     expect(done.ok).toBe(true);
     if (!done.ok) return;
     expect(done.value.replaced.map((a: Act) => a.note)).toEqual(["two", "three"]);
+  });
+});
+
+// ── the review findings, each pinned by the failure it produced ──────────
+
+/**
+ * `place` USED TO VALIDATE THE ID AND APPLY THE STALE PATH.
+ *
+ * The guard was `find(out, m.node.id) === null` — "does this id exist SOMEWHERE"
+ * — and `applyMove` then got the RECORDED path `m.at`. Any rewrite that changes
+ * how many structural acts precede the tail shifts every later path, so the guard
+ * passed while `removeAt` deleted a different layer.
+ *
+ * Measured before the fix: this returned `ok: true` with a clean report and a
+ * composition of `[L2, L2, L3]` — a duplicate `LayerId`, `L1` gone. That is the
+ * "drawing has come apart" state `layers.census.duplicateIds` exists to detect,
+ * produced by the module whose job is to refuse it, and reported as success.
+ */
+describe("a rewrite that shifts the tree refuses rather than moving the wrong layer", () => {
+  /**
+   * A journal whose LAST act is an `arrange` recording a path, and whose middle
+   * holds a layer REMOVAL. Deleting the removal puts a layer back, so every path
+   * recorded after it names one slot too low — IN RANGE, and a different layer.
+   *
+   * The in-range part is what makes it the interesting case. A shift that pushed
+   * a path off the end already threw out of `removeAt` and was already caught;
+   * this one passed every check the module made and produced a wrong drawing.
+   */
+  const shifted = (): { session: Session; at: number } => {
+    let s = fresh();
+    s = addLayer(s); // L2
+    s = addLayer(s); // L3
+    s = addLayer(s); // L4  →  [L1, L2, L3, L4]
+    s = { ...s, composition: select(s.composition, L2) };
+    const gone = removeLayer(s); //  →  [L1, L3, L4]
+    if (!gone.ok) throw new Error(gone.said);
+    s = gone.value;
+    const at = s.journal.past.length - 1; // the removal
+    s = { ...s, composition: select(s.composition, layerId(4)) };
+    // `[remove [2] L4, insert [1] L4]`, recorded against the three-layer stack.
+    const moved = arrange(s, "down");
+    if (!moved.ok) throw new Error(moved.said);
+    return { session: moved.value, at };
+  };
+
+  it("refuses the splice, and the drawing is untouched", () => {
+    const { session, at } = shifted();
+    const before = session.composition;
+    const done = rewriteFrames(session, { at, count: 1, acts: [] });
+    expect(done.ok).toBe(false);
+    if (done.ok) return;
+    expect(done.why).toBe("unknown-layer");
+    expect(session.composition).toBe(before);
+  });
+
+  it("whatever it returns, no layer may appear twice", () => {
+    // MEASURED WITH THE GUARD REMOVED, which is why this test exists: the call
+    // above returned `ok: true` with `[L1, L4, L2, L4]` — L4 twice and L3 gone —
+    // and a clean report. Written as the invariant rather than as the old value
+    // so it keeps meaning something if the refusal ever becomes a repair.
+    const { session, at } = shifted();
+    const done = rewriteFrames(session, { at, count: 1, acts: [] });
+    if (!done.ok) return;
+    const ids = [...walkIds(done.value.session.composition)];
+    expect(new Set(ids).size).toBe(ids.length);
+  });
+});
+
+function* walkIds(comp: Composition): Generator<string> {
+  const go = function* (list: Composition["layers"]): Generator<string> {
+    for (const l of list) {
+      yield l.id;
+      yield* go(l.children);
+    }
+  };
+  yield* go(comp.layers);
+}
+
+/**
+ * `foldMarks` IS NOT ASSOCIATIVE, and the third frame is where it shows.
+ *
+ * It answers `undefined` for a deliberate discard, and the next fold reads that
+ * as "unmarked" and adopts the next mark WHOLE. Two frames are correct; three,
+ * where the first and last agree, are not.
+ */
+describe("merging three frames whose modes disagree keeps no mark at all", () => {
+  const mark = (mode: number, cells: Address[]): StrokeMark<Address> => ({
+    mode,
+    groups: [cells],
+  });
+
+  it("6, 3, 6 gives no mark and reports the disagreement", () => {
+    let s = fresh();
+    s = drew(s, ["s0:AA"], [GOLD], "one", mark(6, ["s0:AA"]));
+    s = drew(s, ["s0:AB"], [INK], "two", mark(3, ["s0:AB"]));
+    s = drew(s, ["s0:AC"], [RED], "three", mark(6, ["s0:AC"]));
+    const done = mergeFrames(s, 0, 3);
+    expect(done.ok).toBe(true);
+    if (!done.ok) return;
+    // BEFORE THE FIX: marked true, groups 1, modes [3, 6] — so `mergeSaid` printed
+    // "the merged mark keeps 1 symmetry group at the 6-fold brush" and the MODES
+    // DISAGREE sentence, which `marked` gates, never fired.
+    expect(done.value.merge.marked).toBe(false);
+    expect(done.value.merge.groups).toBe(0);
+    expect(done.value.merge.modes).toEqual([3, 6]);
+  });
+
+  it("and 6, 6 still keeps both groups — the fix does not over-refuse", () => {
+    let s = fresh();
+    s = drew(s, ["s0:AA"], [GOLD], "one", mark(6, ["s0:AA"]));
+    s = drew(s, ["s0:AB"], [INK], "two", mark(6, ["s0:AB"]));
+    const done = mergeFrames(s, 0, 2);
+    expect(done.ok).toBe(true);
+    if (!done.ok) return;
+    expect(done.value.merge.marked).toBe(true);
+    expect(done.value.merge.groups).toBe(2);
+  });
+});
+
+/**
+ * `repaired` FIRED ON EVERY PAINT FRAME OF EVERY REBASE.
+ *
+ * `page.tsx` writes `gesture: { from: gestureOf(layer) }` and `gestureOf` returns
+ * `{}` for an ordinary layer. `sameGesture({}, undefined)` was false, so the
+ * counter `RebaseReport` exists to surface counted a repair every time. The suite
+ * missed it because its own helper uses `NO_GESTURE`, which is `{ from: undefined
+ * }` — the shape `frames.ts` EMITS, not the shape the app WRITES.
+ */
+describe("an empty recorded gesture is not a repair", () => {
+  /** A paint move in the shape `page.tsx` actually commits. */
+  const appPaint = (comp: Composition, targets: Address[], colours: string[]): Move => {
+    const l = find(comp, L1);
+    if (l === null) throw new Error("no layer");
+    return {
+      kind: "paint",
+      layer: L1,
+      stroke: { edits: planPlateEdits(l.plate, book, targets, colours) },
+      // THE PRODUCTION SHAPE: `gestureOf` of a layer with no reveal/mode/orbit.
+      gesture: { from: gestureOf(l) },
+    };
+  };
+
+  it("rebasing a journal written the way the app writes it repairs nothing", () => {
+    let s = fresh();
+    s = act(s, [appPaint(s.composition, ["s0:AA"], [GOLD])], "one");
+    s = act(s, [appPaint(s.composition, ["s0:AB"], [INK])], "two");
+    s = act(s, [appPaint(s.composition, ["s0:AC"], [RED])], "three");
+    const done = editFrame(s, 0, (a) => recolourAct(a, () => BLUE));
+    expect(done.ok).toBe(true);
+    if (!done.ok) return;
+    expect(done.value.report.repaired).toBe(0);
+  });
+});
+
+/**
+ * A SPLICE PAST `HISTORY_LIMIT` IS REFUSED, WHERE IT USED TO TRIM SILENTLY.
+ *
+ * The trim dropped acts off the FRONT, so every act index moved by the number
+ * dropped — and `remember`'s docstring hands a direct caller of `rewriteFrames`
+ * the rule `rebaseTree(tl, at, count, plan.acts.length)`, stated in the index
+ * space of a journal that kept its front. Follow it after a trim and the tree is
+ * misaligned against the journal by exactly that number: the tree/journal desync
+ * `Revision` exists to close, through another door.
+ *
+ * Counting it would only have NAMED the shift; the caller would still have had to
+ * correct for it. Refusing removes it, and matches the stance this function opens
+ * with — it "REFUSES an out-of-range splice rather than clamping it".
+ */
+describe("a rewrite that would overrun the journal's limit refuses", () => {
+  it("declines rather than dropping the oldest frames", () => {
+    let s = fresh();
+    s = drew(s, ["s0:AA"], [GOLD], "one");
+    s = drew(s, ["s0:AB"], [INK], "two");
+    // One act out, HISTORY_LIMIT + 1 in. Nothing in the UI can ask for this —
+    // `editFrame` replaces one with one and `mergeFrames` folds n into one — but
+    // `rewriteFrames` is the one entry point and `acts` is a free-form array.
+    const many: Act[] = Array.from({ length: HISTORY_LIMIT + 1 }, (_, k) => ({
+      moves: [],
+      note: `filler ${k}`,
+      events: 0,
+    }));
+    const done = rewriteFrames(s, { at: 0, count: 1, acts: many });
+    expect(done.ok).toBe(false);
+    if (done.ok) return;
+    expect(done.said).toMatch(/would leave/);
+    // UNTOUCHED, which is the half a trim could not promise.
+    expect(s.journal.past).toHaveLength(2);
+  });
+
+  it("a splice that fits is unaffected", () => {
+    let s = fresh();
+    s = drew(s, ["s0:AA"], [GOLD], "one");
+    s = drew(s, ["s0:AB"], [INK], "two");
+    const done = rewriteFrames(s, { at: 0, count: 1, acts: [s.journal.past[0]] });
+    expect(done.ok).toBe(true);
+    if (!done.ok) return;
+    expect(done.value.session.journal.past).toHaveLength(2);
+  });
+});
+
+/**
+ * A DEFECT IS NOT A PRECONDITION ABOUT THE PERSON'S JOURNAL.
+ *
+ * The catch around the replay was unfiltered, so a `TypeError` out of a fault in
+ * `applyMove` reached the person labelled `"unknown-layer"` and wearing the
+ * sentence "that edit cannot be replayed onto the later frames" — a claim about
+ * THEIR drawing for a fault in THIS program, and a false increment of the one
+ * counter a guard would fire on.
+ */
+describe("a thrown defect is told apart from a thrown precondition", () => {
+  it("a `layers:` throw is still `unknown-layer`", () => {
+    // The reachable case: a rewrite that shifts a recorded `place` path far
+    // enough that `removeAt` cannot find the slot at all.
+    let s = fresh();
+    s = addLayer(s); // L2
+    s = addLayer(s); // L3
+    s = { ...s, composition: select(s.composition, layerId(3)) };
+    const moved = arrange(s, "down");
+    if (!moved.ok) throw new Error(moved.said);
+    s = moved.value;
+    const done = rewriteFrames(s, { at: 0, count: 1, acts: [] });
+    expect(done.ok).toBe(false);
+    if (done.ok) return;
+    expect(done.why).toBe("unknown-layer");
+  });
+
+  it("a malformed move throws a TypeError, and that is a `defect`", () => {
+    let s = fresh();
+    s = drew(s, ["s0:AA"], [GOLD], "one");
+    // A `place` whose node is not a layer. Not reachable from the UI — it is a
+    // shape only a defect in this program could produce — which is exactly why
+    // the label matters: the person must not be told it is about their drawing.
+    //
+    // A move of an UNKNOWN KIND was tried first and is not usable here:
+    // `applyMove` ignores it and the rewrite succeeds, so the branch is never
+    // entered and the test would have passed without measuring anything.
+    const bogus: Act = {
+      moves: [{ kind: "place", op: "insert", at: [0], node: null } as unknown as Move],
+      note: "x",
+      events: 0,
+    };
+    const done = rewriteFrames(s, { at: 0, count: 1, acts: [bogus] });
+    expect(done.ok).toBe(false);
+    if (done.ok) return;
+    expect(done.why).toBe("defect");
+    expect(done.why).not.toBe("unknown-layer");
+    expect(done.said).toMatch(/fault in the program/);
+    // AND THE DRAWING IS UNTOUCHED, same as every other way out.
+    expect(s.journal.past).toHaveLength(1);
   });
 });

@@ -25,14 +25,19 @@ import {
   findLayer,
   flatten,
   idsOf,
+  opaquelyCovered,
   parse,
+  parseWhy,
+  refusalSaid,
   rekey,
   serialise,
   type EmitDoc,
   type EmitLayer,
+  type EmitRefusal,
 } from "../src/lib/emit";
 import { buildHexagon } from "../src/lib/hexagon";
 import { plateFrame } from "../src/lib/view";
+import { artworkSvg } from "../src/lib/strokes";
 
 // ── fixtures ─────────────────────────────────────────────────────────────
 
@@ -504,5 +509,199 @@ describe("a malformed or hostile file is refused rather than half-read", () => {
       expect(() => parse(r as string)).not.toThrow();
       expect(parse(r as string)).toBeNull();
     }
+  });
+});
+
+// ── the review findings ──────────────────────────────────────────────────
+
+/**
+ * A REFUSED COMPOSITION MUST BE TOLD APART FROM AN OLD DRAWING.
+ *
+ * `parse` had fifteen ways to answer `null` and its caller treated all fifteen as
+ * the one that means "no layer tree" — so a file that DID carry a history and was
+ * refused arrived as a single flat layer holding the finished plate, announced as
+ * a successful paste. `parseWhy` is the split, and `"no-composition"` is the only
+ * member a caller may fall back on.
+ */
+describe("a refusal names its reason", () => {
+  it("a file with a composition the reader will not vouch for is not `no-composition`", () => {
+    // The Inkscape round trip in miniature: the markup's tiling no longer agrees
+    // with what the payload leaves unpainted, which is one of the count checks a
+    // foreign editor trips by rewriting the <defs>/<use> structure.
+    const text = serialise(docOf(nested()));
+    const broken = text.replace(/<g id="tiling"[\s\S]*?<\/g>/, '<g id="tiling"></g>');
+    const got = parseWhy(broken);
+    expect(got.ok).toBe(false);
+    if (got.ok) return;
+    // THE WHOLE POINT: not the one reason the legacy fallback is allowed for.
+    expect(got.why).not.toBe("no-composition");
+    expect(got.why).toBe("tiling-count");
+    // And it is a sentence a person can act on rather than a field name.
+    expect(refusalSaid(got.why)).toMatch(/tiles/);
+  });
+
+  it("a payload with no composition IS `no-composition`, and that one may fall back", () => {
+    // What every drawing written before layers existed looks like: one flat
+    // polygon document with a payload that states cells and no `comp`.
+    const n = Math.max(...frame.shown) + 1;
+    const flat = Array.from({ length: n }, (_, i) => GEOMETRY.get(i) ?? { verts: [] });
+    const text = artworkSvg({
+      width: frame.width,
+      height: frame.height,
+      cells: flat,
+      shown: frame.shown,
+      paint: new Map([[frame.shown[0], "#c0392b"]]),
+      background: "#0a0908",
+      unpainted: "#141110",
+      tileSeam: "rgba(236,230,220,.16)",
+      paintSeam: "rgba(0,0,0,.3)",
+      weldPaint: false,
+      seamWidth: 0.7,
+      title: "FOURFOLD",
+      payload: {
+        version: 1,
+        canvas: "hexagon",
+        depth: DEPTH,
+        convention: "apex",
+        cells: [[frame.shown[0], "#c0392b"]],
+      },
+    });
+    const got = parseWhy(text);
+    expect(got.ok).toBe(false);
+    if (got.ok) return;
+    expect(got.why).toBe("no-composition");
+  });
+
+  it("`parse` still answers exactly what it always did", () => {
+    const text = serialise(docOf(nested()));
+    expect(parse(text)).not.toBeNull();
+    const broken = text.replace(/<g id="tiling"[\s\S]*?<\/g>/, '<g id="tiling"></g>');
+    expect(parse(broken)).toBeNull();
+    expect(parse("")).toBeNull();
+  });
+
+  it("every refusal has a sentence, and none of them names a field", () => {
+    const every: EmitRefusal[] = [
+      "not-text", "no-payload", "no-composition", "not-svg", "prototypes",
+      "style", "shown", "reveal-order", "markup", "tiling-count", "tile-rule",
+      "shape", "layer-shapes", "overlay", "threw",
+    ];
+    for (const why of every) {
+      const said = refusalSaid(why);
+      expect(said.length).toBeGreaterThan(10);
+      expect(said).not.toMatch(/undefined|null/);
+    }
+  });
+});
+
+/**
+ * A TILE GOES BEHIND A FADED CELL, because the board puts one there.
+ *
+ * `serialise` asked `flatten` which cells the stack covered, and `flatten` has
+ * never read `opacity`. So a cell under a half-transparent layer counted as
+ * covered, got no tile, and composited onto the page background in the file where
+ * it composites onto the tile on screen.
+ */
+describe("a faded layer does not eat the tile under it", () => {
+  const cell = 0;
+  const clear = (): EmitLayer[] => [{ id: "a", paint: new Map([[cell, "#c0392b"]]) }];
+  const faded = (): EmitLayer[] => [
+    { id: "a", opacity: 0.5, paint: new Map([[cell, "#c0392b"]]) },
+  ];
+
+  const tiles = (text: string): number =>
+    (/<g id="tiling"[^>]*>([\s\S]*?)<\/g>/.exec(text)?.[1].match(/<use|<polygon/g) ?? [])
+      .length;
+
+  it("an opaque layer covers its cell and a faded one does not", () => {
+    const opaque = tiles(serialise(docOf(clear())));
+    const dim = tiles(serialise(docOf(faded())));
+    // One more tile: the cell the faded layer paints now gets one too.
+    expect(dim).toBe(opaque + 1);
+    expect(dim).toBe(frame.shown.length);
+  });
+
+  it("the faded file still reads back, so writer and reader ask one question", () => {
+    const text = serialise(docOf(faded()));
+    const back = parse(text);
+    expect(back).not.toBeNull();
+    expect(serialise(back as EmitDoc)).toBe(text);
+  });
+
+  it("a fade on a PARENT reaches its children — alpha is inherited", () => {
+    const two = [
+      {
+        id: "p",
+        opacity: 0.5,
+        children: [{ id: "c", paint: new Map([[cell, "#c0392b"]]) }],
+      },
+    ];
+    // The child is opaque in itself and faded on the page, so it covers nothing.
+    expect(opaquelyCovered(two).size).toBe(0);
+    expect(tiles(serialise(docOf(two)))).toBe(frame.shown.length);
+  });
+
+  it("with no alpha anywhere it is `flatten`'s answer, key for key", () => {
+    const layers = nested().map((l) => strip(l));
+    expect([...opaquelyCovered(layers)].sort((a, b) => a - b)).toEqual(
+      [...flatten(layers).keys()].sort((a, b) => a - b)
+    );
+  });
+
+  /** The same tree with every alpha and every `hidden` taken off. */
+  function strip(l: EmitLayer): EmitLayer {
+    const out: EmitLayer = { ...l };
+    delete out.opacity;
+    delete out.hidden;
+    if (l.children !== undefined) out.children = l.children.map(strip);
+    return out;
+  }
+});
+
+/**
+ * A FADED LAYER'S ALPHA MUST NOT BE ON THE PROPERTY THE ANIMATION ANIMATES.
+ *
+ * `opacity="…"` is a presentation attribute and `#root [data-reveal] { opacity: 0
+ * }` is a CSS declaration on the same element, so the alpha was overridden for
+ * the whole animation and left there by `animation-fill-mode: both`.
+ */
+describe("a layer alpha survives an animated document", () => {
+  it("is written as fill-opacity, which the reveal rule does not touch", () => {
+    const text = serialise(docOf(nested()));
+    expect(text).toMatch(/fill-opacity="0\.42"/);
+    // The one element carrying the alpha also carries a reveal — which is the
+    // whole hazard — and no `opacity="…"` attribute is written on a layer at all.
+    expect(/<g id="kid"[^>]*data-reveal/.test(text)).toBe(true);
+    expect(/<g id="kid"[^>]*\sopacity=/.test(text)).toBe(false);
+    // The stylesheet does animate `opacity`, which is why the two must differ.
+    expect(text).toMatch(/\[data-reveal\] \{ opacity: 0;/);
+  });
+});
+
+/**
+ * LOAD → SAVE MUST NOT REWRITE A LEGAL ALPHA.
+ *
+ * The validator range-checked and never quantised, while the markup writer
+ * rounded to three decimals — one file, two alphas — and the model canonicalises
+ * on load, so the re-saved file differed from the one that was opened.
+ */
+describe("an alpha is quantised on the way in, not on the way back out", () => {
+  const withAlpha = (a: number): EmitLayer[] => [
+    { id: "a", opacity: a, paint: new Map([[0, "#c0392b"]]) },
+  ];
+
+  it("the payload and the markup state the same number", () => {
+    const text = serialise(docOf(withAlpha(0.1234567)));
+    expect(text).toMatch(/fill-opacity="0\.123"/);
+    // The payload used to carry the unrounded value beside that attribute.
+    expect(text).not.toMatch(/0\.1234567/);
+  });
+
+  it("a file that survives the reader re-serialises to itself", () => {
+    const text = serialise(docOf(withAlpha(0.1234567)));
+    const back = parse(text) as EmitDoc;
+    expect(back).not.toBeNull();
+    expect(serialise(back)).toBe(text);
+    expect(findLayer(back.layers, "a")?.opacity).toBe(0.123);
   });
 });

@@ -89,6 +89,7 @@ import {
   compMark,
   compTrail,
   compTrails,
+  cutForFrame,
   GROUND,
   lostSaid,
   markIn,
@@ -115,6 +116,7 @@ import {
   treeFromTrails,
   undoSaid,
   wholeSpan,
+  type NamedSpan,
 } from "../src/lib/timeline";
 
 const BOOK: AddressBook = addressBook(buildHexagon(2, "apex"));
@@ -1042,5 +1044,100 @@ describe("the timeline in a file", () => {
     // so nothing in the tree is ambiguous and nothing dangles.
     expect(back[0].id).not.toBe(back[2].id);
     expect(beatCount(back)).toBe(3);
+  });
+});
+
+// ── the cut, resolved against the frame it is about to be written into ───
+
+/**
+ * A MARK IS A NAME, AND A NAME IS ONLY WORTH ITS INDEX ONCE THE TREE IS IN STEP.
+ *
+ * `resolveSpan` answers in the step space of the tree it is handed. A tree names
+ * ONE frame's beat list, so resolving live marks against a tree stood up in a
+ * different frame yields indices of the old list used as indices of the new one.
+ * Nothing catches it: the names still resolve, `lost` stays `"none"`, `lostSaid`
+ * never fires, and `replay.clampSpan` pulls the pair inside the new length
+ * WITHOUT REMAPPING IT. Six marked gestures become one, silently, in every replay
+ * the program writes.
+ *
+ * `cutForFrame` is sync-then-resolve as one call, so the two steps cannot be
+ * spelled in the wrong order at two call sites.
+ */
+describe("cutForFrame resolves the marks against the beats being written", () => {
+  /** A flat tree over `acts`, named from `mint`. */
+  const treeOver = (acts: number[], from = 100): Timeline => {
+    const mint = minter(from);
+    return acts.map((act) => ({ kind: "beat", id: mint(), act }));
+  };
+
+  it("a reframe that drops beats moves the cut WITH the gestures it names", () => {
+    // The hexagon's beat list: six gestures, acts 0…5.
+    const wide = treeOver([0, 1, 2, 3, 4, 5]);
+    // Marks on the gestures that painted acts 1 and 4 — steps 1 and 4 here.
+    const span = nameSpan(wide, { in: 1, out: 4 }) as NamedSpan;
+    expect(span).not.toBeNull();
+
+    // Frame a sector: acts 0, 2 and 3 landed elsewhere and have no beat here.
+    const narrow = [1, 4, 5];
+    const cut = cutForFrame(wide, span, narrow, minter(900));
+
+    // THE NUMBERS FOLLOW THE GESTURES. Acts 1 and 4 are steps 0 and 1 of this
+    // frame, so the cut is 0…1 and not the stale 1…4.
+    expect(cut.span).toEqual({ in: 0, out: 1 });
+    expect(cut.lost).toBe("none");
+
+    // WHAT IT USED TO ANSWER, asserted so the difference is on the record rather
+    // than in a comment: resolving against the un-synced tree gives 1…4, which
+    // over a three-step frame is a cut nobody set.
+    expect(resolveSpan(wide, span).span).toEqual({ in: 1, out: 4 });
+  });
+
+  it("a mark whose gesture left the frame dangles, and says so", () => {
+    const wide = treeOver([0, 1, 2, 3]);
+    const span = nameSpan(wide, { in: 1, out: 2 }) as NamedSpan;
+    // Act 1 is not in this frame at all.
+    const cut = cutForFrame(wide, span, [0, 2, 3], minter(900));
+    expect(cut.span).toBeNull();
+    expect(cut.lost).toBe("in");
+    expect(lostSaid(cut.lost)).not.toBeNull();
+  });
+
+  it("the ordinary case costs nothing and keeps the tree it was given", () => {
+    const tree = treeOver([0, 1, 2]);
+    const span = nameSpan(tree, { in: 0, out: 2 }) as NamedSpan;
+    const cut = cutForFrame(tree, span, [0, 1, 2], minter(900));
+    expect(cut.span).toEqual({ in: 0, out: 2 });
+    expect(cut.sync.rebuilt).toBe(false);
+    // SAME OBJECT: an export that changed nothing has nothing to keep.
+    expect(cut.sync.tree).toBe(tree);
+  });
+
+  it("IT KEEPS NOTHING — the sync is returned, never applied", () => {
+    // The whole reason this returns a `Synced` rather than a `Timeline`: a read
+    // must be able to resolve honestly and still write nothing back. The tree
+    // handed in is unchanged whatever the answer, so a caller that declines
+    // AFTER calling this has mutated nothing.
+    const wide = treeOver([0, 1, 2, 3]);
+    const before = [...wide];
+    const span = nameSpan(wide, { in: 1, out: 2 }) as NamedSpan;
+    const cut = cutForFrame(wide, span, [3], minter(900));
+    expect(cut.sync.rebuilt).toBe(true);
+    expect(cut.sync.tree).not.toBe(wide);
+    expect(wide).toEqual(before);
+  });
+
+  it("a composition is dropped by the rebuild, and `syncSaid` is the sentence", () => {
+    // The other half of the same guarantee: a rebuild is a REAL cost, so a caller
+    // that keeps the tree owes the person a sentence. `gestureDoc` keeps it only
+    // once the bytes exist, and `exportGestureSvg` says this.
+    const grouped: Timeline = [
+      { kind: "comp", id: stepId(9), steps: treeOver([0, 1], 100) },
+      ...treeOver([2], 200),
+    ];
+    const cut = cutForFrame(grouped, null, [1, 2], minter(900));
+    expect(cut.sync.rebuilt).toBe(true);
+    expect(syncSaid(cut.sync)).toMatch(/grouping was dropped/);
+    // And the tree handed in still holds its composition.
+    expect(grouped[0].kind).toBe("comp");
   });
 });

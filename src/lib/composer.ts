@@ -471,9 +471,22 @@ export interface PanelRow {
   /** 0 for a top-level layer. How far the row is indented. */
   readonly depth: number;
   /**
-   * This layer's OWN switches and its own alpha — what the row's controls show
-   * and set. `own.opacity` is absent for a layer nobody faded and means 1;
-   * `layers.alphaOf` is the reader that says so once.
+   * This layer's OWN switches and its own alpha.
+   *
+   * `own.visible` and `own.locked` ARE what the row's controls show and set — the
+   * eye and the padlock. `own.opacity` IS NOT, and this used to say it was: there
+   * is no alpha control in `LayersPanel`, and `layers.setOpacity` has no caller
+   * anywhere in `src/`. The only way an alpha enters a `Composition` is
+   * `stackFromEmit` below, reading one out of a file. So a fade that arrives in an
+   * imported drawing is, today, PERMANENT AND UNCLEARABLE from the panel.
+   *
+   * It is carried here anyway and that is right rather than aspirational: the row
+   * is what the panel READS, the value is real, it must survive a round trip, and
+   * a row that dropped it would make the panel a second opinion about the
+   * document. What was wrong was the sentence promising a control.
+   *
+   * `own.opacity` is absent for a layer nobody faded and means 1; `layers.alphaOf`
+   * is the reader that says so once.
    *
    * Different from `effective`, which is the inherited answer: a visible layer
    * inside a hidden parent has `own.visible` true and `effective.shown` false,

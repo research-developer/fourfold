@@ -75,10 +75,22 @@
  * `replay.boundAnimation` before this file ever sees the list — see `GifSpec`.
  *
  * The delays are the same numbers the SVG uses. GIF counts in CENTISECONDS,
- * which would normally be a rounding problem; it is not one here, because every
- * value the interval control offers — 80, 150, 250, 400, 700, 1200 ms — is a
- * whole number of centiseconds. The GIF's cycle and the SVG's, written from one
- * drawing, are equal to the millisecond.
+ * which is a rounding problem, and the paragraph here used to say it was not:
+ * every value the interval control offers — 80, 150, 250, 400, 700, 1200 ms — is
+ * a whole number of centiseconds, so the STEPS round exactly. What that argument
+ * left out is the HOLD. `replay.animationTiming` makes it `Math.round(draw / 3)`,
+ * which is not generally a whole number of centiseconds, and it lands on the LAST
+ * frame's delay — where it is rounded together with that frame's step rather than
+ * on its own.
+ *
+ * MEASURED rather than argued, over every offered `stepMs` against every step
+ * count to 400: 2343 of 2400 pairs are equal to the millisecond and 57 differ,
+ * always by ±3 ms — one centisecond's worth of rounding, on one frame of the
+ * loop. That is inaudible and it is not the reason this is written down.
+ * `GifResult.cycleMs` used to be computed FROM the SVG's formula rather than
+ * summed from the delays this file wrote, so the one number that could have
+ * reported the disagreement was derived from the claim it was checking. It is
+ * summed now; see `GifResult.cycleMs`.
  *
  * ── Frames are DIFFERENCES ───────────────────────────────────────────────
  *
@@ -353,7 +365,24 @@ export interface GifResult {
   exact: boolean;
   /** How many distinct colours the drawing actually contained. */
   distinct: number;
-  /** The cycle in milliseconds. Equal to the animated SVG's, exactly. */
+  /**
+   * THE CYCLE THIS FILE ACTUALLY LOOPS AT, summed from the delays it wrote.
+   *
+   * It used to be `steps · stepMs + holdMs` — the SVG's number, restated. So the
+   * one place the two encodings could be weighed against each other computed the
+   * answer it was supposed to be checking, and a test comparing it with
+   * `replay.animationTiming` was a check that could not fail. What it hid: the
+   * delays are CENTISECONDS, rounded, and floored at `MIN_DELAY_CS`, so the real
+   * loop is a sum of rounded numbers and not a rounded sum. Swept over the whole
+   * control range — every offered `stepMs` against every step count to 400 —
+   * 57 of 2400 pairs disagree, always by ±3 ms, and every one of them came from
+   * `holdMs = Math.round(draw / 3)` landing on the LAST frame's delay, where it
+   * is rounded together with that frame's own step rather than on its own.
+   *
+   * ±3 ms is not the point. A number derived from its own premise cannot report
+   * that the premise is wrong, and this one was the only thing standing between
+   * "the GIF and the SVG loop together" and nobody finding out.
+   */
   cycleMs: number;
 }
 
@@ -369,9 +398,13 @@ const MIN_DELAY_CS = 2;
  * How long each frame is held, in centiseconds, in order.
  *
  * The last frame carries the hold as well as its own step, so the cycle is
- * `steps · stepMs + holdMs` — the number `replay.animatedSvg` writes into
- * `animation-duration`. Exported so a test can weigh the two against each other
- * rather than trust this paragraph.
+ * `steps · stepMs + holdMs` MILLISECONDS ROUNDED PER FRAME, which is not the same
+ * number as that expression rounded once — the hold is rounded together with the
+ * last frame's step rather than on its own, and that is where the whole of the
+ * ±3 ms disagreement with `replay.animatedSvg`'s `animation-duration` comes from.
+ * See the module header for the sweep. Exported so a test can weigh the two
+ * against each other rather than trust this paragraph — and `GifResult.cycleMs`
+ * is now summed from what this returns, so the weighing is against the file.
  *
  * NO STEPS IS NO FRAMES, and it is left that way. A drawing with nothing to
  * animate produces a header and a trailer with no image descriptor, which is a
@@ -899,7 +932,11 @@ export function* gifSteps(spec: GifSpec): Generator<GifProgress, GifResult> {
     palette: palette.colours.length,
     exact: palette.exact,
     distinct: palette.distinct,
-    cycleMs: steps.length * spec.stepMs + spec.holdMs,
+    // SUMMED FROM `delays`, which is what the file holds — see `GifResult.
+    // cycleMs`. `delays` is the same array written into every graphic control
+    // extension above, in centiseconds, so this is the loop a browser will
+    // actually run and not the loop this module intended.
+    cycleMs: delays.reduce((n, cs) => n + cs * 10, 0),
   };
 }
 

@@ -441,6 +441,27 @@ function beatsIn(tree: Timeline): Beat[] {
  *   ordinary case and it must not rebuild, or a group would evaporate the second
  *   time the playhead was stood up.
  *
+ *   WHAT "EXACTLY THESE ACTS" LEAVES OUT, named rather than left latent: the
+ *   comparison is over BEATS THAT NAME AN ACT, because `acts` filters `act !==
+ *   null` — and a HOLD names none. So a tree carrying h holds passes this test
+ *   against a beat list of the same acts, is returned unchanged, and `flatten`
+ *   over it runs h entries LONGER than the beat list it was just declared in step
+ *   with. Every index derived from it past the first hold is therefore h too far
+ *   along: `nameAtStep`, `resolveSpan`, and any mark resolved through them.
+ *
+ *   That is a real defect and it is deliberately NOT fixed in this pass. The
+ *   filter is right — a hold IS a step with no act, and demanding it match a beat
+ *   list would make every held timeline rebuild itself and lose the holds, which
+ *   is the failure this case exists to prevent. The fix is on the OTHER side: the
+ *   consumers have to agree on whether they are indexing STEP space (holds
+ *   included, which is what a rail position is) or BEAT space (holds excluded,
+ *   which is what a beat list is), and today they quietly assume the two are the
+ *   same list. Nothing in the program can insert a hold yet — `nested.insertHold`
+ *   has no caller — so h is 0 for every tree this build can construct, which is
+ *   what makes recording it honest rather than negligent. The first caller of
+ *   `insertHold` is the change that makes this reachable, and it must not land
+ *   before the two spaces are told apart.
+ *
  *   APPENDED. The tree's acts are a strict PREFIX of the beat list, which is
  *   what committing new gestures produces. The new beats are added at the ROOT
  *   end and nothing that already exists is touched — so every existing name
@@ -630,6 +651,59 @@ export function resolveSpan(
     };
   }
   return { span: { in: a, out: b }, lost: "none" };
+}
+
+/**
+ * THE CUT AS THE FRAME BEING WRITTEN SEES IT — sync first, resolve second.
+ *
+ * ── The failure this exists to close, measured ──────────────────────────
+ *
+ * `resolveSpan` answers in the STEP SPACE OF THE TREE IT IS HANDED, and a tree is
+ * a naming of ONE frame's beat list. So resolving a live pair of marks against a
+ * tree that was stood up in a different frame gives indices that are numbers of
+ * the old frame and are then used as numbers of the new one. Nothing detects it:
+ * the names still resolve, so `lost` is `"none"` and `lostSaid` never fires, and
+ * `replay.clampSpan` brings the pair inside the new length WITHOUT REMAPPING IT —
+ * a six-step cut over the hexagon becomes a one-step cut over a sector, silently,
+ * in every replay this program writes.
+ *
+ * That is the exact failure `NamedSpan`'s header says the naming scheme exists to
+ * prevent ("index 5 of the hexagon's beat list and index 5 of a sector's are
+ * different gestures"), arriving through the one door the naming does not close
+ * by itself: a name is only worth its index once the tree has been brought into
+ * step with the list the index is about to be read against.
+ *
+ * ── Why this is a function and not a second call to `resolveSpan` ───────
+ *
+ * `resolveSpan`'s own header hands its callers a rule — "every caller that
+ * resolves is expected to say `lostSaid`" — and the two-step version has a second
+ * rule on top of it: SYNC FIRST, AGAINST THE BEATS YOU ARE ABOUT TO WRITE. A pair
+ * of call sites that each spelled the two steps by hand would be two chances to
+ * spell them in the other order, and the wrong order is undetectable by
+ * inspection because it still returns a plausible pair of numbers.
+ *
+ * ── It COMMITS NOTHING, and that is the point of returning the sync ─────
+ *
+ * `syncTree` is pure; `page.tsx`'s `standTree` is the wrapper that also keeps the
+ * result. This returns the `Synced` rather than keeping it so an EXPORT can
+ * resolve honestly without a read mutating the document — a decline after this
+ * point must be able to write nothing and change nothing. A caller that does want
+ * to keep the tree has `sync.tree` and `syncSaid` in hand and commits on its own
+ * success path.
+ */
+export interface FrameCut extends ResolvedSpan {
+  /** The tree brought into step with the beats. NOT kept; see the header. */
+  readonly sync: Synced;
+}
+
+export function cutForFrame(
+  tree: Timeline | null,
+  named: NamedSpan | null,
+  beats: Beats,
+  mint: () => StepId
+): FrameCut {
+  const sync = syncTree(tree, beats, mint);
+  return { ...resolveSpan(sync.tree, named), sync };
 }
 
 /** What a dangling mark cost, in words. `null` when nothing was lost. */

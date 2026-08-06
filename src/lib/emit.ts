@@ -261,6 +261,7 @@ import {
   formatRanges,
   parseRanges,
   cellCount,
+  ALPHA_QUANTUM,
   LAYER_ID,
   MAX_ART_BYTES,
   MAX_LAYER_DEPTH,
@@ -327,11 +328,28 @@ export interface EmitLayer {
    * before this existed. `test/artfile.test.ts` pins that on the exact payload
    * rather than on a re-encode, which would agree if both sides gained a key.
    *
-   * A TRAIL RATHER THAN A PARENT POINTER, because the file is read without a
+   * A TRAIL RATHER THAN A PARENT POINTER, because a trail CAN be read without a
    * journal: `timeline.treeFromTrails` rebuilds the whole tree from the trails
    * alone, where a parent id would need a second pass to discover which layer
    * each id belonged to and would have no answer for a composition whose own
    * beats were all merged away.
+   *
+   * THE READER IS NOT WIRED, and this used to describe it as though it were.
+   * Nothing in `src/` calls `treeFromTrails` — only `test/timeline.test.ts` and
+   * `test/gestureexport.test.ts` — and `composer.stackFromEmit`, which is the one
+   * path a file's layers take into a `Composition`, does not carry `nest` onto a
+   * `Layer` at all. So `nest` is WRITE-ONLY today: this program states a drawing's
+   * timeline grouping in every gesture file it writes, and drops it on the way
+   * back in.
+   *
+   * Recorded rather than fixed here, because the two halves are not the same
+   * size. Writing it is an assignment; reading it back means deciding where a
+   * rebuilt tree lands relative to the timeline the session already holds — a
+   * loaded file resets the journal, so the tree it rebuilds has to replace one,
+   * and "replace the timeline on import" is a decision about the document rather
+   * than a wiring job. The field is the durable half and it is correct, which is
+   * what makes leaving the reader for a later pass safe rather than lossy: the
+   * grouping is IN the file, and a future reader gets it.
    *
    * WRITTEN BY THE GESTURE PATH ONLY, which is the whole of what a trail can
    * honestly be about. `provenance.gestureLayers` takes the trails as
@@ -887,6 +905,59 @@ export function flatten(layers: readonly EmitLayer[]): Map<number, string> {
 }
 
 /**
+ * The cells the visible stack paints OPAQUELY — the ones nothing needs to be
+ * drawn behind.
+ *
+ * ── Not the same question as `flatten`, and the difference was a wrong file ──
+ *
+ * `serialise` writes a background tile for every shown cell the stack does not
+ * cover, and it asked `flatten` which those were. `flatten` reads `hidden` and
+ * has never read `opacity` — deliberately; `layers.ts` argues at length that the
+ * composite must stay an OCCLUSION returning colours some layer verbatim holds,
+ * and a faded layer still holds its colour. So a cell under a HALF-TRANSPARENT
+ * layer counted as covered and got no tile, and the exported file composited that
+ * paint straight onto the page background while the editor composited it onto the
+ * tile. Measured on a depth-1 hexagon, 24 shown cells, one painted: 23 tiles in
+ * the file where the board draws 24, and the one cell reads ≈`#702a22` on screen
+ * against ≈`#652119` in the file. `DrawBoard`'s `TileLayer` draws every shown cell
+ * unconditionally, which is why the board is the one that is right.
+ *
+ * That refutes `layers.ts`'s "Both renderers show it the same way, because it is
+ * the same mechanism" — the mechanism is the same, the thing UNDER it was not —
+ * and the sentence there has been corrected rather than left standing.
+ *
+ * ── Alpha is INHERITED, so the whole chain has to be opaque ─────────────
+ *
+ * A group's `opacity`/`fill-opacity` multiplies down its subtree, so a fully
+ * opaque layer inside a faded parent is not opaque on the page. This walks with
+ * the ancestors' answer in hand for that reason; asking each layer about itself
+ * would have written the same wrong file one level down.
+ *
+ * ── One function, both directions ──────────────────────────────────────
+ *
+ * `read` counts the tiling shapes against exactly this set, so writer and reader
+ * ask one question. Two spellings of "which cells need a tile" would be a file
+ * this module writes and refuses to read.
+ *
+ * COSTS NOTHING ON AN ORDINARY DRAWING: with no alpha anywhere this returns what
+ * `flatten` returned, key for key, so every existing file's bytes are unchanged —
+ * which `test/byteidentity.test.ts` is the check on.
+ */
+export function opaquelyCovered(layers: readonly EmitLayer[]): Set<number> {
+  const out = new Set<number>();
+  const rec = (list: readonly EmitLayer[], clear: boolean) => {
+    for (const l of list) {
+      if (l.hidden === true) continue;
+      const here = clear && (l.opacity === undefined || l.opacity === 1);
+      if (here && l.paint !== undefined) for (const i of l.paint.keys()) out.add(i);
+      if (l.children !== undefined) rec(l.children, here);
+    }
+  };
+  rec(layers, true);
+  return out;
+}
+
+/**
  * The composition, or one layer of it, as an SVG document.
  *
  * Throws only for a caller error the program itself can make — an unknown layer
@@ -938,7 +1009,9 @@ export function serialise(doc: EmitDoc, scope?: EmitScope): string {
   }
 
   const shownSet = new Set(scoped.shown);
-  const composite = flatten(scoped.layers);
+  // OPAQUE cover and not `flatten`'s cover: a tile goes behind a faded cell,
+  // because the board puts one there. See `opaquelyCovered`.
+  const composite = opaquelyCovered(scoped.layers);
 
   // Everything the document will draw, so the prototypes and the palette are
   // read off what is actually emitted and a scoped export carries neither a
@@ -1126,8 +1199,44 @@ function emitLayers(
     // layer states its own. This is how the file DRAWS.
     if (l.hidden === true) attrs.push(`display="none"`);
     if (l.locked === true) attrs.push(`data-locked="1"`);
+    /**
+     * `fill-opacity` AND NOT `opacity`, and it was a real defect before it was a
+     * comment — the same one `DrawBoard`'s dim scrim already carries the fix for,
+     * in the same words, in the same pull request.
+     *
+     * `animationRules` writes `#root [data-reveal] { opacity: 0; animation: … }`
+     * and this is a presentation attribute on that very `<g>`. A CSS declaration
+     * beats an SVG presentation attribute of the same name, so any layer carrying
+     * BOTH an alpha and a `reveal` had its alpha silently discarded: overridden to
+     * the keyframe's value for the whole animation and left there by
+     * `animation-fill-mode: both`. Not "wrong in a corner" — DEAD, whenever the
+     * document is a replay, which is what this build's gesture export writes.
+     *
+     * A rule of higher specificity would not have fixed it either: a running
+     * animation's value beats every normal declaration in the cascade, whatever
+     * its specificity. Only a different property or a different element can carry
+     * the alpha, and a wrapper `<g>` is not free here — `matchLayers` pairs the
+     * payload's tree with the markup's `<g>` tree position for position, so an
+     * extra group is a reader change and a format change for a presentational
+     * fix. `fill-opacity` is neither, and the two properties MULTIPLY rather than
+     * fight, so a faded layer that also reveals now does both.
+     *
+     * WHAT IT COSTS, stated: the cells of a layer are a tiling and do not
+     * overlap, so per-fill alpha and group alpha are the same picture — that is
+     * `DrawBoard`'s measurement and it holds here. Where they differ is the WELD:
+     * a `.k…` rule in weld mode also sets `stroke`, and a stroke is not a fill, so
+     * a welded seam no longer fades with the paint it welds. `stroke-opacity`
+     * beside it would fade the seam too and would then double-darken where
+     * adjacent cells' strokes overlap, which group `opacity` does not do. Neither
+     * is exact; this one is the one already argued in this codebase, and the
+     * alternative it is being compared against is an alpha that does not work at
+     * all.
+     *
+     * Nothing reads it back: `parse` takes `opacity` from the payload, where the
+     * layer states its own. This is how the file DRAWS.
+     */
     if (l.opacity !== undefined && l.opacity !== 1) {
-      attrs.push(`opacity="${fmtAlpha(l.opacity)}"`);
+      attrs.push(`fill-opacity="${fmtAlpha(l.opacity)}"`);
     }
     // The gesture, for a reader that is not this program. See the header.
     //
@@ -1397,7 +1506,13 @@ function toArtLayer(l: EmitLayer): ArtLayer {
   if (l.name !== undefined) out.name = l.name;
   if (l.hidden === true) out.hidden = true;
   if (l.locked === true) out.locked = true;
-  if (l.opacity !== undefined && l.opacity !== 1) out.opacity = l.opacity;
+  // ROUNDED TO THE FORMAT'S QUANTUM, the same one `fmtAlpha` writes into the
+  // markup a few lines away. Written raw, this stated `0.1234567` in the payload
+  // beside `fill-opacity="0.123"` in the picture — one file, two alphas. See
+  // `artfile.ALPHA_QUANTUM`, which is where the number lives.
+  if (l.opacity !== undefined && l.opacity !== 1) {
+    out.opacity = Math.round(l.opacity * ALPHA_QUANTUM) / ALPHA_QUANTUM;
+  }
   if (l.reveal !== undefined) out.reveal = l.reveal;
   if (l.mode !== undefined) out.mode = l.mode;
   if (l.orbit !== undefined) out.orbit = l.orbit;
@@ -1451,39 +1566,150 @@ const withoutComments = (text: string): string =>
   text.replace(/<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>/g, (m) => " ".repeat(m.length));
 
 /**
- * An SVG document this module wrote, back as the value it was written from.
+ * WHY A DOCUMENT WAS NOT VOUCHED FOR — and why this is an enum and not a bare
+ * `null`.
  *
- * `null` for: anything that is not a string, anything past `MAX_ART_BYTES`, a
- * document with no payload or a payload this build will not vouch for, a
- * document with no layer composition in that payload, markup that nests past
- * `MAX_LAYER_DEPTH`, a `<use>` naming a prototype the file does not define, a
- * layer whose drawn cells do not line up with what the payload says it paints,
- * a layer that reveals before something it sits inside (`revealBreak`), and
- * anything that makes the reader throw. It throws for nothing.
+ * `parse` had FIFTEEN distinct ways to answer `null` and exactly one of them —
+ * `"no-composition"` — means "an old drawing from before layers existed". Its
+ * caller could not tell them apart, so it treated all fifteen as that one: a file
+ * that DID carry a composition and was refused arrived as a single flat layer
+ * holding the finished plate, announced as a successful paste. The picture
+ * survived, so the loss was invisible until somebody went looking for their
+ * history — by which time the flattened version was the one they had saved.
+ *
+ * It is reachable by the route this build's keystone feature invites: EXPORT
+ * GESTURES, open the file in Inkscape (`page.tsx` says to), save, re-import.
+ * Inkscape rewrites the `<defs>`/`<use>` structure, a count check disagrees, and
+ * several hundred gesture layers become one.
+ *
+ * ONE CASE IS ORDINARY AND THE REST ARE FAULTS, so the split has to be in the
+ * type rather than in a caller's memory of which is which. `"no-composition"` is
+ * the only member a caller may quietly fall back on.
+ */
+export type EmitRefusal =
+  /** Not a string, empty, or past `MAX_ART_BYTES`. */
+  | "not-text"
+  /** No FOURFOLD payload, or one `artfile` will not vouch for. */
+  | "no-payload"
+  /** A payload with NO LAYER TREE. The one ordinary answer: see the header. */
+  | "no-composition"
+  /** No `<svg>` root, or a root with no readable width and height. */
+  | "not-svg"
+  /** `<defs>` names one id twice, or a prototype's points do not read. */
+  | "prototypes"
+  /** A `.tile` or `.k…` rule whose stroke width is not a number this writes. */
+  | "style"
+  /** The payload's shown-cell ranges do not read against its own canvas. */
+  | "shown"
+  /** A layer reveals before one it sits inside. See `revealBreak`. */
+  | "reveal-order"
+  /** The `<g>` tree does not balance, nests too deep, or holds too many. */
+  | "markup"
+  /** The tiling shapes disagree with the cells the payload leaves unpainted. */
+  | "tiling-count"
+  /** A `.tile` rule with no tiling group to apply it to. */
+  | "tile-rule"
+  /** A shape that does not resolve — typically a `<use>` naming no prototype. */
+  | "shape"
+  /** A layer's drawn cells do not line up with what the payload says it paints. */
+  | "layer-shapes"
+  /** A wash shape whose points do not read. */
+  | "overlay"
+  /** Unreachable by construction; kept because the promise is total. */
+  | "threw";
+
+/** What a refusal is, in the words a person reads. Never names a field. */
+export function refusalSaid(why: EmitRefusal): string {
+  switch (why) {
+    case "not-text":
+      return "there is nothing to read, or the file is larger than this program will open";
+    case "no-payload":
+      return "it carries no FOURFOLD payload this build can vouch for";
+    case "no-composition":
+      return "it carries no layer composition — a drawing from before layers existed";
+    case "not-svg":
+      return "its root is not an SVG with a width and a height";
+    case "prototypes":
+      return "its shape definitions are ambiguous — one id is defined twice, or one does not read";
+    case "style":
+      return "its stylesheet states a width that is not a number";
+    case "shown":
+      return "its list of shown cells does not read against the canvas it declares";
+    case "reveal-order":
+      return "a layer in it is revealed before the group that gates it, so it would draw out of order";
+    case "markup":
+      return "its groups do not balance, or nest deeper or wider than a FOURFOLD file may";
+    case "tiling-count":
+      return "its background tiles do not line up with the cells its payload leaves unpainted";
+    case "tile-rule":
+      return "it styles a background tiling it does not contain";
+    case "shape":
+      return "one of its shapes does not resolve — a placed shape naming a definition the file does not have";
+    case "layer-shapes":
+      return "a layer's drawn cells disagree with the cells its payload says that layer paints";
+    case "overlay":
+      return "one of its overlay shapes has points that do not read";
+    case "threw":
+      return "the reader could not finish it";
+  }
+}
+
+/** A document read, or the reason it was not. */
+export type Parsed =
+  | { readonly ok: true; readonly doc: EmitDoc }
+  | { readonly ok: false; readonly why: EmitRefusal };
+
+/**
+ * An SVG document this module wrote, back as the value it was written from,
+ * WITH THE REASON when it is not.
  *
  * The payload is the AUTHORITY for which cells and which layers. The markup
  * supplies the picture: the shapes, the colours, the seams and the frame. So a
  * file whose markup has been tampered with either fails the count checks and is
  * refused, or differs only in pixels the payload does not claim.
+ *
+ * Every refusal below is a NAMED one — see `EmitRefusal` for the measured reason
+ * that is worth the enum. It throws for nothing.
  */
-export function parse(text: string): EmitDoc | null {
+export function parseWhy(text: string): Parsed {
   try {
     return read(text);
   } catch {
     // Unreachable by construction — every branch below returns rather than
-    // throws — and kept because "returns null for hostile input" is a promise
-    // this module makes to a drop handler, and a promise with an exception
-    // escaping through it is not one.
-    return null;
+    // throws — and kept because "answers rather than throws, for hostile input"
+    // is a promise this module makes to a drop handler, and a promise with an
+    // exception escaping through it is not one.
+    return no("threw");
   }
 }
 
-function read(text: string): EmitDoc | null {
-  if (typeof text !== "string") return null;
-  if (text.length === 0 || text.length > MAX_ART_BYTES) return null;
+/**
+ * The same read, as the nullable every existing caller and test already takes.
+ *
+ * KEPT rather than migrated. `parse` is what the byte-identity round trip is
+ * written against — `serialise(parse(t)) === t` — and changing its shape would
+ * have rewritten a great many assertions to prove nothing about this defect. The
+ * two callers that need the REASON call `parseWhy`; everything else is untouched,
+ * byte for byte.
+ */
+export function parse(text: string): EmitDoc | null {
+  const got = parseWhy(text);
+  return got.ok ? got.doc : null;
+}
+
+const no = (why: EmitRefusal): Parsed => ({ ok: false, why });
+
+function read(text: string): Parsed {
+  if (typeof text !== "string") return no("not-text");
+  if (text.length === 0 || text.length > MAX_ART_BYTES) return no("not-text");
 
   const payload = extractArt(text);
-  if (payload === null || payload.comp === undefined) return null;
+  if (payload === null) return no("no-payload");
+  // THE ONE SPLIT THE CALLER LIVES OR DIES BY. A payload with no `comp` is an
+  // old drawing and its caller may fall back to reading it as one flat layer; a
+  // payload WITH a `comp` that anything below refuses is a drawing whose history
+  // exists and would be destroyed by that same fallback.
+  if (payload.comp === undefined) return no("no-composition");
   const comp = payload.comp;
   // The composition is lifted OUT of the payload and into `layers`, so there is
   // one place a layer lives and the two cannot drift.
@@ -1504,10 +1730,10 @@ function read(text: string): EmitDoc | null {
   // inside the payload — in a layer's name, say — has already been blanked, so
   // the first one found is the real root and not one somebody smuggled.
   const head = /<svg(?=[\s/>])([^>]*?)\/?>/.exec(markup);
-  if (head === null) return null;
+  if (head === null) return no("not-svg");
   const width = num(attrOf(head[1], "width"));
   const height = num(attrOf(head[1], "height"));
-  if (width === null || height === null) return null;
+  if (width === null || height === null) return no("not-svg");
 
   // `<title>` now carries an id, for `aria-labelledby`.
   const titleAt = /<title(?=[\s>])[^>]*>([\s\S]{0,4096}?)<\/title>/.exec(markup);
@@ -1515,7 +1741,7 @@ function read(text: string): EmitDoc | null {
 
   // ── prototypes ──
   const protos = readProtos(markup);
-  if (protos === null) return null;
+  if (protos === null) return no("prototypes");
 
   // ── style ──
   const styleAt = /<style(?=[\s>])[^>]*>([\s\S]{0,1048576}?)<\/style>/.exec(markup);
@@ -1529,7 +1755,7 @@ function read(text: string): EmitDoc | null {
     if (tile[2] !== undefined) {
       tileSeam = tile[2];
       const w = num(tile[3]);
-      if (w === null) return null;
+      if (w === null) return no("style");
       seamWidth = w;
     }
   }
@@ -1541,7 +1767,7 @@ function read(text: string): EmitDoc | null {
     if (m[3] !== undefined) {
       weldPaint = true;
       const w = num(m[4]);
-      if (w === null) return null;
+      if (w === null) return no("style");
       if (tile === null || tile[2] === undefined) seamWidth = w / WELD;
     }
   }
@@ -1552,13 +1778,13 @@ function read(text: string): EmitDoc | null {
 
   // ── the drawing ──
   const body = readBody(markup);
-  if (body === null) return null;
+  if (body === null) return no("markup");
 
   const shown =
     comp.shown === undefined
       ? Array.from({ length: cellCount(payload.canvas, payload.depth) }, (_, i) => i)
       : parseRanges(comp.shown, cellCount(payload.canvas, payload.depth));
-  if (shown === null) return null;
+  if (shown === null) return no("shown");
   const shownSet = new Set(shown);
 
   const layers = fromArtLayers(comp.layers);
@@ -1570,8 +1796,11 @@ function read(text: string): EmitDoc | null {
   // layers and the validator walks one at a time. So it is checked here, where
   // the tree exists. `serialise` refuses the same document; see `revealBreak`
   // for the browser measurement that makes it a refusal rather than a clamp.
-  if (revealBreak(layers) !== null) return null;
-  const composite = flatten(layers);
+  if (revealBreak(layers) !== null) return no("reveal-order");
+  // THE SAME QUESTION `serialise` ASKED when it wrote the tiling, and it has to
+  // be the same function: this counts the tiling shapes against it. See
+  // `opaquelyCovered`.
+  const composite = opaquelyCovered(layers);
 
   const cells = new Map<number, ArtCell>();
   const place = (i: number, s: Shape): boolean => {
@@ -1586,26 +1815,28 @@ function read(text: string): EmitDoc | null {
   if (body.tiling !== null) {
     const want: number[] = [];
     for (const i of shown) if (!composite.has(i)) want.push(i);
-    if (want.length !== body.tiling.length) return null;
-    for (let k = 0; k < want.length; k++) if (!place(want[k], body.tiling[k])) return null;
+    if (want.length !== body.tiling.length) return no("tiling-count");
+    for (let k = 0; k < want.length; k++) {
+      if (!place(want[k], body.tiling[k])) return no("shape");
+    }
   } else if (unpainted !== null) {
     // A `.tile` rule with nothing to apply it to. Harmless in a renderer and a
     // disagreement here, so it is refused rather than half-believed.
-    return null;
+    return no("tile-rule");
   }
 
   const paintSeam = body.paintSeam;
   if (body.paintSeamWidth !== null && !weldPaint) seamWidth = body.paintSeamWidth;
 
-  if (!matchLayers(layers, body.layers, shownSet, place)) return null;
+  if (!matchLayers(layers, body.layers, shownSet, place)) return no("layer-shapes");
 
   const overlay: ArtOverlayGroup[] = [];
   for (const g of body.overlay) {
     const shapes: [number, number][][] = [];
     for (const s of g.shapes) {
-      if (s.points === null) return null;
+      if (s.points === null) return no("overlay");
       const verts = readPoints(s.points);
-      if (verts === null) return null;
+      if (verts === null) return no("overlay");
       shapes.push(verts);
     }
     overlay.push({ fill: g.fill, opacity: g.opacity, shapes });
@@ -1627,21 +1858,24 @@ function read(text: string): EmitDoc | null {
         };
 
   return {
-    width,
-    height,
-    cells,
-    shown,
-    background,
-    unpainted,
-    tileSeam,
-    paintSeam,
-    seamWidth,
-    weldPaint,
-    title,
-    layers,
-    overlay,
-    animation,
-    payload: rest,
+    ok: true,
+    doc: {
+      width,
+      height,
+      cells,
+      shown,
+      background,
+      unpainted,
+      tileSeam,
+      paintSeam,
+      seamWidth,
+      weldPaint,
+      title,
+      layers,
+      overlay,
+      animation,
+      payload: rest,
+    },
   };
 }
 

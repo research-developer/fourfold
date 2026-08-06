@@ -64,6 +64,7 @@ import {
   plateFromArtPayload,
   plateIntoSector,
   resolvePlate,
+  strandedCount,
   type Address,
   type AddressBook,
   type PlateEdit,
@@ -172,6 +173,7 @@ import {
   actAtStep,
   beatsOf,
   compTrails,
+  cutForFrame,
   GROUND,
   lostSaid,
   markIn,
@@ -194,6 +196,8 @@ import {
   undoSaid,
   type Beats,
   type NamedSpan,
+  type ResolvedSpan,
+  type Synced,
 } from "@/lib/timeline";
 /**
  * THE THREE MODEL FILES THIS PASS WIRED, and nothing here is new work.
@@ -255,6 +259,7 @@ import {
   toggleLocked,
   toggleVisible,
   undo as undoSession,
+  walk as walkLayers,
   type Act,
   type Composition,
   type Layer,
@@ -275,7 +280,8 @@ import {
   stepComposition,
 } from "@/lib/composer";
 import {
-  parse as parseEmit,
+  parseWhy as parseEmitWhy,
+  refusalSaid,
   serialise as serialiseEmit,
   type EmitDoc,
 } from "@/lib/emit";
@@ -1774,6 +1780,41 @@ export default function DrawPage() {
    * what "empty" means without any of them counting for itself.
    */
   const docCensus = useMemo(() => census(comp), [comp]);
+  /**
+   * HOW MANY OF THOSE ADDRESSES THIS CANVAS CANNOT DRAW.
+   *
+   * `census.addresses` counts every entry of every plate, and it has to: it knows
+   * about layers and nothing about resolution, and adding a book to it would make
+   * a tree measurement depend on which canvas happened to be on screen. But an
+   * address whose scale neither refines nor is refined by this book's — `s0:ab`,
+   * a rep-9 first cut, in a rep-4 book — buckets under a key no cell has and
+   * resolves nowhere. `plate.buildView` argues why carrying it unchanged is
+   * right; this is the number that stops the export sentence claiming it as paint.
+   *
+   * Reachable from a FILE and not only from a mixed-radix experiment:
+   * `artfile.validatePlate` deliberately does not cross-check an address against
+   * the payload's depth, so such an entry loads, survives a full-sector wash, and
+   * is re-exported forever.
+   *
+   * Summed over the tree with `plate.strandedCount`, which is memoised on the
+   * same (plate, book) pair `resolvePlate` already caches — so on the ordinary
+   * drawing this is a walk of the layer tree and a map lookup per layer, and the
+   * answer is 0.
+   */
+  const strandedAddresses = useMemo(() => {
+    let n = 0;
+    for (const v of walkLayers(comp)) n += strandedCount(v.layer.plate, book);
+    return n;
+  }, [comp, book]);
+  /** " · 3 addresses this canvas cannot draw are carried through unchanged". */
+  const strandedSaid =
+    strandedAddresses === 0
+      ? ""
+      : ` · ${strandedAddresses} address${
+          strandedAddresses === 1 ? "" : "es"
+        } this canvas cannot draw ${
+          strandedAddresses === 1 ? "is" : "are"
+        } carried through unchanged`;
   /**
    * Standing at a state the drawing is no longer in.
    *
@@ -3522,13 +3563,42 @@ export default function DrawPage() {
   );
 
   /**
-   * THE CUT IN FORCE, in step space — the named marks resolved against the tree.
+   * THE CUT IN FORCE FOR THE PLAYHEAD THAT IS STANDING, in step space.
    *
-   * ONE PLACE RESOLVES, and everything downstream reads the number. The strip
-   * draws from it, the seam names it, `boundAnimation` cuts both exports with it,
-   * and the merge takes its range from it. Two resolutions would be two chances
-   * to be off by one, which is the argument `replay.boundAnimation` already makes
-   * about there being one reader of the marks.
+   * ── This used to claim to be the only resolution. It cannot be ─────────
+   *
+   * The comment here said "ONE PLACE RESOLVES, and everything downstream reads
+   * the number", and every export did read this number. That was WRONG, and
+   * silently so. `timeline.resolveSpan` answers in the step space of the tree it
+   * is handed, `timeline` is a naming of ONE frame's beat list, and `reframe`
+   * moves the frame while leaving both the tree and the marks alone. So a person
+   * who marked six steps over the hexagon and then framed a sector exported a cut
+   * whose two numbers were positions in a list that is no longer there —
+   * `clampSpan` pulled them inside the new length without remapping them, `lost`
+   * stayed `"none"` because the names still resolved in the stale tree, and
+   * `lostSaid` never fired. Six marked gestures became one, in the animated SVG,
+   * the GIF and the gesture document alike.
+   *
+   * ── So the division of labour is now stated, and it is not "one place" ──
+   *
+   * THIS memo serves the PLAYHEAD: the strip, the seam, `setMark` and the merge.
+   * Every one of them is gated on `playFresh` or on `rewind`, and a fresh preview
+   * is precisely the state in which `standTree` has already brought `timeline`
+   * into step with `rewind.beats` in the same breath as counting them — so here
+   * the tree and the frame agree by construction and resolving against it is
+   * right.
+   *
+   * THE EXPORTS serve a FRAME, and they may be pressed with no preview open at
+   * all. They call `timeline.cutForFrame` instead, which brings the tree into step
+   * with the beat list it is about to write and THEN resolves — one function, so
+   * the two steps cannot be spelled in the wrong order at two call sites. It
+   * costs nothing extra: both export paths have already walked the journal, so
+   * the beat list is in hand.
+   *
+   * What is NOT done here, deliberately: resolving this memo against a synced
+   * tree. That would need `frameBeats()` on every render that touches the
+   * journal — ~205 ms on the largest drawing this program holds, per stroke, for
+   * a number only a standing playhead reads. See `openRewind` for the measurement.
    *
    * `lost` IS NOT AN ERROR STATE. A name dangles when the beat it named has left
    * this frame — merged away, undone, or dropped by a reframe — and
@@ -5769,7 +5839,17 @@ export default function DrawPage() {
     return null;
   }, []);
 
-  const svgText = useCallback(() => {
+  /**
+   * ANNOTATED, and the annotation is load bearing rather than decorative.
+   *
+   * The `string | null` these two answer with was INFERRED, and it survived only
+   * because `refuseEmit` is annotated `: null`. Delete that one annotation and
+   * TypeScript infers `string` for both — every `=== null` guard at every call
+   * site goes dead at the type level, with no compile error anywhere, and a
+   * refused export becomes a download of the string `"null"`. A contract four
+   * callers depend on must not rest on an annotation in a fifth function.
+   */
+  const svgText = useCallback((): string | null => {
     const sole = soleLayer(comp);
     if (sole === null) {
       try {
@@ -5846,8 +5926,9 @@ export default function DrawPage() {
    */
   const svgOfScope = useCallback(
     // The try mirrors `svgText`'s and the argument lives there: the refusal is
-    // announced, never thrown at a button.
-    (layer?: LayerId) => {
+    // announced, never thrown at a button. The return type is written out for
+    // the reason `svgText`'s header gives.
+    (layer?: LayerId): string | null => {
       try {
         return serialiseEmit(emitDoc(), layer === undefined ? undefined : { layer });
       } catch (err) {
@@ -5870,6 +5951,18 @@ export default function DrawPage() {
    * A file with no layer tree — every drawing this program wrote before layers
    * existed — is read by `artfile` instead and arrives as a single layer, so
    * IMPORT accepts an old drawing rather than refusing it on a technicality.
+   *
+   * ── A REFUSED COMPOSITION IS NOT AN OLD DRAWING ────────────────────────
+   *
+   * That fallback used to run on ANY `null` from the reader, and the reader has
+   * fifteen ways to say it. Exactly one of them — `"no-composition"` — means "no
+   * layer tree". The other fourteen mean "this file HAS a history and I would not
+   * vouch for it", and running the legacy path on those flattened the whole
+   * history into one layer holding the finished plate and announced it as a
+   * successful paste. `emit.parseWhy` returns the reason so the two can be told
+   * apart, and the sentence names which check disagreed rather than just saying
+   * no — a person who round-tripped a gesture file through another editor needs
+   * to know it was the tiling count and not their drawing.
    */
   const nodeFromSvg = useCallback(
     (
@@ -5879,9 +5972,13 @@ export default function DrawPage() {
       // minted, because a `Layer` does not carry them — see `layers.Switches`.
       // `pasteInto` takes this map and `reid` re-keys it onto the fresh ids, so
       // a hidden layer imported arrives hidden.
-    ): { node: Layer; switches: ReadonlyMap<LayerId, Switches> } | null => {
-      const doc = parseEmit(text);
-      if (doc !== null && doc.layers.length > 0) {
+    ): {
+      node: Layer;
+      switches: ReadonlyMap<LayerId, Switches>;
+    } | { node: null; said: string } => {
+      const got = parseEmitWhy(text);
+      if (got.ok && got.doc.layers.length > 0) {
+        const doc = got.doc;
         // The FILE'S own book: a layer names cells by index, and an index means
         // nothing without the depth that issued it.
         const fileBook = addressBook(
@@ -5896,8 +5993,19 @@ export default function DrawPage() {
           switches: built.switches,
         };
       }
+      // THE ONE REFUSAL THE LEGACY PATH MAY ANSWER. Everything else carried a
+      // composition, and reading it flat would destroy exactly the thing the
+      // person imported the file for.
+      if (!got.ok && got.why !== "no-composition") {
+        return {
+          node: null,
+          said: `${label} was not pasted — ${refusalSaid(got.why)}. Its layers would have been flattened into one, so nothing was taken from it`,
+        };
+      }
       const legacy = extractArt(text);
-      if (legacy === null) return null;
+      if (legacy === null) {
+        return { node: null, said: `${label} is not a drawing this program can read` };
+      }
       const plate =
         legacy.canvas === "triangle"
           ? plateIntoSector(
@@ -5939,8 +6047,12 @@ export default function DrawPage() {
       let refused: string | null = null;
       for (const { text, label } of texts) {
         const arriving = nodeFromSvg(text, label);
-        if (arriving === null) {
-          refused = refused ?? `${label} is not a drawing this program can read`;
+        // THE SENTENCE COMES FROM THE READER NOW. It used to be written here —
+        // one string for every way a file could be declined — which is why a
+        // refused composition and a file that is not a drawing at all read the
+        // same. See `nodeFromSvg`.
+        if (arriving.node === null) {
+          refused = refused ?? arriving.said;
           continue;
         }
         // Re-seated on the ORIGINAL target before each graft. `pasteInto`
@@ -6124,13 +6236,16 @@ export default function DrawPage() {
       name
     );
     setAnnounce(
+      // `docCensus.addresses` is every entry of every plate and `strandedSaid` is
+      // the part of it this canvas cannot draw. Said together because the first
+      // number alone overstates the drawing — see `strandedAddresses`.
       `exported ${name} — ${docCensus.total} layer${
         docCensus.total === 1 ? "" : "s"
       }, ${docCensus.addresses} address${
         docCensus.addresses === 1 ? "" : "es"
-      }; import it back or drop it on the canvas`
+      }${strandedSaid}; import it back or drop it on the canvas`
     );
-  }, [nameFor, svgOfScope, docCensus]);
+  }, [nameFor, svgOfScope, docCensus, strandedSaid]);
 
   /** IMPORT is PASTE with files for a source. Several at once, one journal. */
   const importFiles = useCallback(
@@ -6213,6 +6328,30 @@ export default function DrawPage() {
     );
     if (frames.length === 0) return null;
     /**
+     * THE MARKS RESOLVED AGAINST THIS FRAME, NOT AGAINST THE LAST ONE STOOD UP.
+     *
+     * `beatsOf(states, shown)` is free here: the expensive half is the journal
+     * walk, `states` above already is it, and `beatsOf`'s own header measures the
+     * remainder at ~16 ms against ~170 ms for the walk. It is index-aligned with
+     * `frames` by construction — `animationSteps` drops exactly the acts that
+     * changed no shown cell and `beatsOf` restates that rule — so a step index
+     * resolved against a tree named for THESE beats is a step index into
+     * `frames`, which is what `boundAnimation` is about to cut.
+     *
+     * Before this, `playCut` was read here: the marks resolved against whatever
+     * frame the playhead was last stood up in. See `playCut`'s header for the
+     * measured failure. The sync is NOT kept — an export is a read, and
+     * `cutForFrame` returns the tree rather than keeping it for exactly that
+     * reason — so this cannot rebuild the document's timeline behind a person
+     * who only pressed SAVE.
+     */
+    const marks = cutForFrame(
+      timeline,
+      playSpan,
+      beatsOf(states, shown),
+      mintStep.current
+    );
+    /**
      * THE CUT, APPLIED ONCE, HERE.
      *
      * `boundAnimation` is the one place the marks are read — its header says so
@@ -6227,7 +6366,7 @@ export default function DrawPage() {
      * left over from a longer drawing or a wider frame lands inside this one
      * rather than being refused — the UI-facing rule, see `clampSpan`.
      */
-    const cut = boundAnimation(states[0], frames, playCut.span);
+    const cut = boundAnimation(states[0], frames, marks.span);
     return {
       baked,
       cells,
@@ -6237,8 +6376,14 @@ export default function DrawPage() {
       /** Every beat the drawing has. What the census and the timing count. */
       frames,
       cut,
+      /**
+       * A mark that no longer names a beat OF THIS FRAME, for the sentence.
+       * `resolveSpan`'s header makes saying it the caller's obligation, and the
+       * caller of a file writer is the export button.
+       */
+      lost: marks.lost,
     };
-  }, [comp, past, bakedFrame, canvas, book, showTiling, playCut]);
+  }, [comp, past, bakedFrame, canvas, book, showTiling, timeline, playSpan]);
 
   /**
    * THE SAME REPLAY AS A FOURFOLD DOCUMENT, with one layer per gesture.
@@ -6303,8 +6448,38 @@ export default function DrawPage() {
    * by the caller: gesture layers put the reveal on the gesture and leave the
    * orbits under it with no time at all, which is exactly the shape
    * `emit.revealBreak` can never fault.
+   *
+   * ── THIS FUNCTION KEEPS NOTHING. It used to, and it was a half-write ────
+   *
+   * It called `standTree`, which is `syncTree` AND `setTimeline`, and it called it
+   * ABOVE the budget check. So a decline whose whole sentence is "nothing written"
+   * had already rewritten the document's timeline — and `syncTree`'s third case
+   * REBUILDS, flattening the tree and discarding every composition and every hold.
+   * Reachable without contrivance: recolour a past frame, which mints a
+   * composition and says so; frame a sector, so the beat list becomes a
+   * subsequence; press EXPORT GESTURES. The composition was destroyed, no `nest`
+   * was written, the sentence reported the layers as though nothing had gone, and
+   * a frame edit is a `Revision` while this was not — so ⌘Z could not get it back.
+   *
+   * The sync is therefore HOISTED OUT of the decision: `timeline.cutForFrame`
+   * computes it purely and hands it back, every decline below returns before
+   * anything is kept, and `exportGestureSvg` keeps it only once the bytes exist.
+   * The pair `{ doc, sync }` is what the caller needs to do that, so the pair is
+   * what this returns.
+   *
+   * ── ONE sync serves the trails AND the cut, which it did not before ────
+   *
+   * The trails were read off the freshly synced tree and the cut off the memo,
+   * which is the PRE-sync resolution — `setTimeline` cannot land inside the render
+   * that called it — so one file could carry reveals and `nest` from the new tree
+   * and `in`/`out` from the old one. `cutForFrame` does both from one `Synced`,
+   * and there is no longer a second tree in the function to get it from.
    */
-  const gestureDoc = useCallback((): EmitDoc | null => {
+  const gestureDoc = useCallback((): {
+    doc: EmitDoc;
+    sync: Synced;
+    lost: ResolvedSpan["lost"];
+  } | null => {
     if (past.length === 0) {
       setAnnounce("nothing to animate — no committed gesture changed a cell in this frame");
       return null;
@@ -6314,12 +6489,14 @@ export default function DrawPage() {
       setAnnounce("nothing to animate — no committed gesture changed a cell in this frame");
       return null;
     }
-    // The tree is brought into step with the beat list HERE, by the one function
-    // that does it anywhere — a tree naming beats this frame does not have would
-    // hand `compTrails` a list of the wrong length and silently shift every
-    // composition boundary by the difference. `standTree` returns the same object
-    // when nothing moved, so the ordinary export sets no state.
-    const trails = compTrails(standTree(beats).tree);
+    // The tree is brought into step with the beat list HERE — a tree naming beats
+    // this frame does not have would hand `compTrails` a list of the wrong length
+    // and silently shift every composition boundary by the difference — and the
+    // marks are resolved against THAT tree, so the reveals, the `nest` trails and
+    // the in and out points of one file are all read off one naming of one frame.
+    // Nothing is kept: see the header.
+    const marks = cutForFrame(timeline, playSpan, beats, mintStep.current);
+    const trails = compTrails(marks.sync.tree);
     const strokes = actStrokes(past);
     const layers = gestureLayers(
       beats.map((a) => strokes[a]),
@@ -6341,31 +6518,39 @@ export default function DrawPage() {
       return null;
     }
     return {
-      ...emitDoc(),
-      layers,
-      animation: gestureAnimation(beats.length, stepMs, playCut.span),
+      doc: {
+        ...emitDoc(),
+        layers,
+        animation: gestureAnimation(beats.length, stepMs, marks.span),
+      },
+      sync: marks.sync,
+      lost: marks.lost,
     };
   }, [
     past,
     frameBeats,
-    standTree,
+    timeline,
+    playSpan,
     book,
     showTiling,
     emitDoc,
     stepMs,
-    playCut,
   ]);
 
   const animationText = useCallback(
     (grouping: "orbit" | "cell") => {
       const model = animationModel();
       if (model === null) return null;
-      const { baked, cells, overlay, shown, states, cut } = model;
+      const { baked, cells, overlay, shown, states, cut, lost } = model;
       // THE CENSUS COUNTS WHAT THE FILE HOLDS, so it counts the CUT steps and
       // not the drawing's. It is what the announcement reports as "23 gestures,
       // one CSS rule per gesture", and a rule is written per step that plays.
       return {
         census: animationCensus(cut.steps),
+        // Carried out to the button rather than said here, because this builds
+        // two files and the sentence belongs to whichever one was written.
+        // `resolveSpan` makes saying it the caller's obligation.
+        lost,
         text: animatedSvg({
           width: canvas.geom.width,
           height: canvas.geom.height,
@@ -6446,12 +6631,14 @@ export default function DrawPage() {
     });
     download(bytes, name);
     const { steps: n, groups, cells, orbitGroups } = built.census;
+    const dangled = lostSaid(built.lost);
     setAnnounce(
       `exported ${name} — ${n} gesture${n === 1 ? "" : "s"}, ${groups} symmetry group${
         groups === 1 ? "" : "s"
       } (${orbitGroups} recorded orbits) over ${cells} cell${
         cells === 1 ? "" : "s"
-      }, one CSS rule per gesture; ${Math.round(bytes.size / 1024)} kB`
+      }, one CSS rule per gesture; ${Math.round(bytes.size / 1024)} kB` +
+        (dangled === null ? "" : `. ${dangled}`)
     );
   };
 
@@ -6476,22 +6663,34 @@ export default function DrawPage() {
    * be, so the announcement reports what a reader will find in it.
    */
   const exportGestureSvg = () => {
-    const doc = gestureDoc();
-    // Both refusals are announced by `gestureDoc`, which is where the reason is
+    const built = gestureDoc();
+    // Every refusal is announced by `gestureDoc`, which is where the reason is
     // known. Nothing further to say here.
-    if (doc === null) return;
+    if (built === null) return;
+    const { doc, sync, lost } = built;
     let text: string;
     try {
       text = serialiseEmit(doc);
     } catch (err) {
       // Unreachable for a gesture tree — see `gestureDoc` — and caught on the
       // same rule `svgText` keeps: a refusal is a sentence, never a dead click.
+      // NOTHING IS KEPT ON THIS PATH EITHER: `setTimeline` is below the write,
+      // so the third way out of this function is as clean as the other two.
       refuseEmit(err);
       return;
     }
     const name = nameFor("svg", "-gestures");
     const bytes = new Blob([text], { type: "image/svg+xml;charset=utf-8" });
     download(bytes, name);
+    // KEPT HERE AND NOWHERE EARLIER. The bytes exist, so the tree this file was
+    // written from is now the document's tree — the same order `rewriteFrame` and
+    // `mergeMarked` keep, and the reason `gestureDoc` hands the sync back instead
+    // of keeping it. A rebuild costs the timeline its groups and its holds, so it
+    // is SAID rather than assumed harmless; `syncSaid` is silent when nothing
+    // moved, which is every ordinary export.
+    setTimeline(sync.tree);
+    const resync = syncSaid(sync);
+    const dangled = lostSaid(lost);
     const c = provenanceCensus(doc.layers);
     const anim = doc.animation;
     setAnnounce(
@@ -6501,7 +6700,9 @@ export default function DrawPage() {
         (anim === null || anim.in === undefined || anim.out === undefined
           ? ""
           : `; cut to in ${anim.in}, out ${anim.out} of ${anim.steps}`) +
-        `; ${Math.round(bytes.size / 1024)} kB`
+        `; ${Math.round(bytes.size / 1024)} kB` +
+        (dangled === null ? "" : `. ${dangled}`) +
+        (resync === null ? "" : `. ${resync}`)
     );
   };
 
@@ -6529,7 +6730,7 @@ export default function DrawPage() {
       setAnnounce("nothing to animate — no committed gesture changed a cell in this frame");
       return;
     }
-    const { cells, overlay, shown, cut } = model;
+    const { cells, overlay, shown, cut, lost } = model;
     const run = gifSteps({
       viewWidth: canvas.geom.width,
       viewHeight: canvas.geom.height,
@@ -6578,13 +6779,15 @@ export default function DrawPage() {
           setGifAt(1);
           const name = nameFor("gif", "-replay");
           download(new Blob([r.bytes], { type: "image/gif" }), name);
+          const dangled = lostSaid(lost);
           setAnnounce(
             `exported ${name} — ${r.frames} frame${r.frames === 1 ? "" : "s"}, ` +
               `${r.width}×${r.height}, ${(r.cycleMs / 1000).toFixed(1)} s a loop, ` +
               (r.exact
                 ? `${r.palette} colour${r.palette === 1 ? "" : "s"}, exact — no quantisation; `
                 : `${r.distinct} colours reduced to ${r.palette}, the most a GIF can hold; `) +
-              `${Math.round(r.bytes.length / 1024)} kB`
+              `${Math.round(r.bytes.length / 1024)} kB` +
+              (dangled === null ? "" : `. ${dangled}`)
           );
           return;
         }
@@ -6733,17 +6936,36 @@ export default function DrawPage() {
 
         // THE LAYERS, when the file states any.
         //
-        // Read back through the same `emit.parse` the panel's IMPORT uses —
-        // there is one reader, and a dropped file and a pasted clipboard take
-        // the identical path through it. A file with no layer tree, which is
-        // every file written before this one, becomes the single layer
-        // `fromPlate` has always made of it, so nothing about loading an old
-        // drawing changed.
-        const parsed = payload.comp === undefined ? null : parseEmit(text);
+        // Read back through the same reader the panel's IMPORT uses — there is
+        // one reader, and a dropped file and a pasted clipboard take the
+        // identical path through it. A file with no layer tree, which is every
+        // file written before this one, becomes the single layer `fromPlate` has
+        // always made of it, so nothing about loading an old drawing changed.
+        //
+        // ── A REFUSED COMPOSITION IS SAID, not silently flattened ──────────
+        //
+        // The same conflation `nodeFromSvg` carried lived here in a shorter
+        // spelling: `payload.comp === undefined ? null : parse(text)` asks the
+        // right question and then throws the answer away, so a file that DID
+        // carry a composition the reader would not vouch for landed as one flat
+        // layer and the sentence merely omitted its "across N layers" clause.
+        //
+        // THE PICTURE IS STILL LOADED and that is deliberate. The payload's
+        // `cells` are the finished plate and they are not in doubt — only the
+        // history is — so refusing the whole file would cost the person their
+        // drawing to protect its structure. What was missing is the WARNING, and
+        // that is what is added: the reason is named, and it is named before they
+        // save over the file and make the flattening permanent.
+        const parsed = payload.comp === undefined ? null : parseEmitWhy(text);
+        const refusedComp =
+          parsed !== null && !parsed.ok ? refusalSaid(parsed.why) : null;
         const stack =
-          parsed === null || fileBook === null || parsed.layers.length === 0
+          parsed === null ||
+          !parsed.ok ||
+          fileBook === null ||
+          parsed.doc.layers.length === 0
             ? null
-            : stackFromEmit(parsed.layers, fileBook, 1);
+            : stackFromEmit(parsed.doc.layers, fileBook, 1);
         const restored: Composition =
           stack === null
             ? fromPlate(loaded)
@@ -6784,7 +7006,25 @@ export default function DrawPage() {
               : `sector ${framed} framed`
           }, depth ${payload.depth}, ${payload.convention}${
             payload.plate === undefined ? "" : ", addressed"
-          } · history reset to the loaded drawing`
+          }${
+            // COUNTED OFF THE LOADED PLATE AND NOT OFF `strandedAddresses`,
+            // because that memo reads `comp` and `comp` is still the OLD drawing
+            // in this closure — `reset` has not rendered yet. `fileBook` is the
+            // file's own canvas, which is the book these addresses were written
+            // against and therefore the only one that can say whether this
+            // program can draw them. A triangle file has no hexagon book here and
+            // is migrated by rename rather than by resolution, so it is skipped:
+            // its addresses are this model's addresses with a tag missing.
+            fileBook === null || strandedCount(loaded, fileBook) === 0
+              ? ""
+              : ` · ${strandedCount(loaded, fileBook)} address${
+                  strandedCount(loaded, fileBook) === 1 ? "" : "es"
+                } this canvas cannot draw, carried through unchanged`
+          } · history reset to the loaded drawing${
+            refusedComp === null
+              ? ""
+              : `. ITS LAYERS WERE NOT READ — ${refusedComp} — so the picture opened as one flat layer and its layer structure is not in this session. Saving now would write the flattened drawing`
+          }`
         );
         return;
       }

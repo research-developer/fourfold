@@ -15,6 +15,7 @@ import {
   plateFromArtPayload,
   resolvePlate,
   sectorTag,
+  strandedCount,
   type AddressBook,
   type AddressPlate,
 } from "../src/lib/plate";
@@ -568,5 +569,72 @@ describe("resolution cost", () => {
 
     console.log(`resolvePlate, warm: ${(per * 1000).toFixed(3)} µs`);
     expect(per).toBeLessThan(0.01);
+  });
+});
+
+/**
+ * THE PHANTOMS, COUNTED — because a comment claimed they already were.
+ *
+ * `buildView`'s header used to end "`test/rep9format.test.ts` pins the behaviour
+ * so it is a counted precondition and not a surprise". A vitest assertion pins a
+ * behaviour; it is not a count and it does not reach words. Every other decline
+ * in this program reaches `setAnnounce` and this one reached nothing, while
+ * `layers.census.addresses` went on counting such an address beside drawable
+ * paint and inflating the export sentence with it.
+ *
+ * Reachable from a FILE: `artfile.validatePlate` deliberately does not cross-check
+ * an address against the payload depth, so a rep-9 word loads into a rep-4 book,
+ * resolves nowhere, survives a full-sector wash, and is re-exported forever.
+ */
+describe("addresses this canvas cannot draw are counted", () => {
+  const book: AddressBook = addressBook(buildHexagon(2, "apex"));
+
+  it("an ordinary plate strands nothing", () => {
+    const plate: AddressPlate = new Map([
+      ["s0:AA", "#c0392b"],
+      ["s0:AB", "#2e86c1"],
+      ["s1:A", "#1e8449"], // coarser than the book: resolves by inheritance
+    ]);
+    expect(strandedCount(plate, book)).toBe(0);
+    // And every one of them reaches a cell.
+    expect(resolvePlate(plate, book).size).toBeGreaterThan(0);
+  });
+
+  it("a rep-9 first cut in a rep-4 book is stranded, and is still carried", () => {
+    const plate: AddressPlate = new Map([
+      ["s0:AA", "#c0392b"],
+      ["s0:ab", "#7d3c98"], // rep-9 cuts where this canvas cut rep-4
+    ]);
+    expect(strandedCount(plate, book)).toBe(1);
+    // NOT DRAWN — which is `buildView`'s own answer and is unchanged.
+    const drawn = resolvePlate(plate, book);
+    expect([...drawn.values()]).not.toContain("#7d3c98");
+    // AND NOT LOST: it is still in the plate and `plateEntries` re-exports it.
+    expect(plate.get("s0:ab")).toBe("#7d3c98");
+    expect(plateEntries(plate, book)?.map(([a]) => a)).toContain("s0:ab");
+  });
+
+  it("counts every stranded entry, not every stranded bucket", () => {
+    const plate: AddressPlate = new Map([
+      ["s0:ab", "#7d3c98"],
+      ["s0:abc", "#1e8449"], // same bucket key prefix, a second entry
+      ["s0:ba", "#c0392b"],
+    ]);
+    expect(strandedCount(plate, book)).toBe(3);
+  });
+
+  it("a finer address that genuinely refines a cell is NOT stranded", () => {
+    // `s0:ABa` is a rep-9 cut UNDER a rep-4 cell — mixed radix downwards, which
+    // buckets under `s0:AB` exactly and is the whole point of the alphabet.
+    const plate: AddressPlate = new Map([["s0:ABa", "#7d3c98"]]);
+    expect(strandedCount(plate, book)).toBe(0);
+  });
+
+  it("is memoised with the resolution it is built beside", () => {
+    const plate: AddressPlate = new Map([["s0:ab", "#7d3c98"]]);
+    resolvePlate(plate, book);
+    // Same plate identity, same book: the second call is a map lookup, and it
+    // must give the same answer or the cache is lying.
+    expect(strandedCount(plate, book)).toBe(strandedCount(plate, book));
   });
 });

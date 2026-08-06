@@ -79,9 +79,32 @@
  * what the drawing LOOKS LIKE without changing what any layer HOLDS. `flatten`
  * ignores it — including `opacity: 0`, which is deliberately NOT a second
  * spelling of hidden — so the board is bit-for-bit the board it was before this
- * existed and the adjust tool is untouched. Both renderers show it the same
- * way, because it is the same mechanism: an SVG group opacity, which is the
- * multiply the machine already does for free.
+ * existed and the adjust tool is untouched.
+ *
+ * THIS USED TO CLAIM "Both renderers show it the same way, because it is the same
+ * mechanism", AND THEY DID NOT. The mechanism was the same and what sat UNDER it
+ * was not: `DrawBoard`'s `TileLayer` draws a background tile for every shown cell
+ * unconditionally, while `emit.serialise` wrote one only for cells the stack did
+ * not cover — and it asked `flatten`, which by the paragraph above cannot see an
+ * alpha. So a faded cell composited onto the tile on screen and onto the page
+ * behind it in the file. Measured on a depth-1 hexagon, one painted cell: 23
+ * tiles written where the board draws 24, ≈`#702a22` on screen against ≈`#652119`
+ * in the exported file. `emit.opaquelyCovered` is the fix and carries the
+ * argument; both renderers now genuinely agree, and there is a check on it rather
+ * than a sentence.
+ *
+ * A SECOND CLAIM ON THE SAME LINE WAS ALSO WRONG and is fixed rather than
+ * restated: "an SVG group opacity" is what `emit.emitLayers` wrote, as a
+ * presentation attribute, on the very element the animation stylesheet targets
+ * with `opacity` — so on any animated document the alpha was overridden to the
+ * keyframe's value and lost. It is `fill-opacity` now, for the reason
+ * `DrawBoard`'s dim scrim already gives.
+ *
+ * AND A THIRD THING TO KNOW BEFORE BELIEVING ANY OF IT: nothing in this program
+ * WRITES a layer alpha. `setOpacity` and `opacityOf` below have no caller in
+ * `src/`, and the panel renders lock and eye and no alpha control, so the only
+ * way one enters a `Composition` is `composer.stackFromEmit` — an import. See
+ * `setOpacity`.
  *
  * WHAT "THE COLOUR A CELL IS DISPLAYING" NOW MEANS, since the old sentence
  * above said exactly that and alpha makes it false: the brush reads the MODEL
@@ -1612,7 +1635,24 @@ export type Refusal =
   | "into-itself"
   | "unknown-layer"
   | "blank-name"
-  | "too-deep";
+  | "too-deep"
+  /**
+   * A FAULT IN THIS PROGRAM, not a fact about the drawing — and it is a member of
+   * this union precisely so it cannot be reported as one of the others.
+   *
+   * Every entry above says something about what the person did or about the state
+   * they did it in, and a caller may aggregate them, phrase them, or act on them
+   * on that basis. `frames.rewriteFrames` used to catch EVERY throw out of a
+   * replay and label it `"unknown-layer"`, so a `TypeError` from a defect in
+   * `applyMove` reached the person as a claim about their journal. Same value,
+   * two utterly different facts, and no way to tell them apart afterwards.
+   *
+   * A refusal and not a rethrow, because the alternative at the one site that
+   * produces it is a dead click in the middle of an edit. The drawing is untouched
+   * either way — `rewriteFrames` is atomic by construction — so what is left to
+   * choose is only what the person is told, and "this is ours" is the true answer.
+   */
+  | "defect";
 
 export interface Refused {
   readonly ok: false;
@@ -2083,6 +2123,24 @@ export function canonicalAlpha(a: number): number {
  * `1` clears the entry rather than storing it, which is `setSwitches`'s
  * canonical rule and is what keeps a document that was faded and un-faded
  * byte-identical to one that never was.
+ *
+ * ── IT HAS NO CALLER, AND THAT IS RECORDED RATHER THAN LEFT TO BE FOUND ──
+ *
+ * Nothing in `src/` calls this or `opacityOf`. `LayersPanel` renders an eye and a
+ * padlock and no alpha control, so the one path that puts an alpha into a
+ * `Composition` is `composer.stackFromEmit` — an import. The consequence for a
+ * person: a fade that arrives in a file is permanent and cannot be cleared.
+ *
+ * The model half is finished and correct — the switch, the canonicalisation, the
+ * inheritance, the export, the round trip — and it is the CONTROL that is
+ * missing. That is a deliberate stop rather than an oversight to fix in passing:
+ * a per-row slider is a decision about the densest surface in this program (see
+ * `Timeline`'s header on what fits at 390px), and guessing at it here would be
+ * the kind of unasked-for design this codebase declines elsewhere.
+ *
+ * Kept rather than deleted for the same reason `nested.ts`'s functions were kept
+ * before `page.tsx` reached them: the model is the part that is hard to get
+ * right, it is tested, and deleting it would mean writing it again.
  */
 export function setOpacity(
   comp: Composition,

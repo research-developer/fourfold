@@ -244,6 +244,13 @@ export const covers = (a: Address, b: Address): boolean => b.startsWith(a);
 interface PlateView {
   resolved: Map<number, string>;
   below: Map<Address, Address[]>;
+  /**
+   * Painted addresses this book has no cell for, at any resolution.
+   *
+   * Built in the same sweep because it is a by-product of the bucketing rather
+   * than a second walk. See `buildView` and `strandedCount`.
+   */
+  stranded: number;
 }
 
 /**
@@ -322,8 +329,26 @@ function buildView(plate: AddressPlate, book: AddressBook): PlateView {
      * The cost of inertness is stated where it bites: such an address is also
      * not in any target's `below`, so a stroke that covers the region does not
      * clear it. That is the "detail resurrects" case this module's header names,
-     * surviving across radices only. `test/rep9format.test.ts` pins the
-     * behaviour so it is a counted precondition and not a surprise.
+     * surviving across radices only.
+     *
+     * ── AND IT IS NOW ACTUALLY COUNTED, which is what this said before ─────
+     *
+     * This paragraph used to end "`test/rep9format.test.ts` pins the behaviour so
+     * it is a counted precondition and not a surprise", and that was two claims
+     * of which only the first was true. A vitest assertion pins a behaviour; it
+     * is not a count and it does not reach words. Every other decline in this
+     * program reaches `setAnnounce`; this one reached nothing — and it is
+     * reachable from a FILE, because `validatePlate` deliberately does not
+     * cross-check an address against the payload depth. So `s0:ab` is admitted
+     * into a rep-4 book, buckets under a key no cell has, resolves nowhere,
+     * survives a full-sector wash, and is re-exported forever, while
+     * `layers.census.addresses` counts it beside drawable paint and inflates the
+     * export sentence with phantoms.
+     *
+     * `stranded` below is the count, `strandedCount` is how a caller reads it,
+     * and `page.tsx` names it in the export and load sentences. Nothing about
+     * what is DRAWN changed — the inertness is still the honest answer — only
+     * that the drawing now says how much of itself it cannot draw.
      */
     if (refines(scaleOfWord(wordOf(a, stem)), scale)) continue;
     const parent = ancestorAt(a, stem, depth);
@@ -358,7 +383,39 @@ function buildView(plate: AddressPlate, book: AddressBook): PlateView {
     if (consensus !== undefined && consensus !== CONFLICT) resolved.set(i, consensus);
   }
 
-  return { resolved, below };
+  /**
+   * THE PHANTOMS, counted off the buckets rather than by a second sweep.
+   *
+   * `below` is keyed by `ancestorAt(a, stem, depth)` — the address's own first
+   * `depth` letters — so a bucket whose key is a cell of this book holds paint
+   * that reaches that cell, and a bucket whose key is NOT is paint that reaches
+   * nothing. One pass over the buckets, and there are at most as many as there
+   * are painted addresses.
+   *
+   * ── Why the `continue`d addresses need no check, for THIS program ──────
+   *
+   * The branch above skips an address whose scale DIVIDES the book's, and those
+   * resolve through the ancestor walk rather than through a bucket — so they are
+   * not in `below` and are not counted here. That is complete for every book this
+   * program can build, and the reason is arithmetic rather than luck: a book is
+   * homogeneous (`buildHexagon` cuts rep-4 throughout, `buildRep9Figure` rep-9),
+   * so its scale is r^d, and a word whose scale divides r^d can only be a word of
+   * that same radix and no longer than d — which is a prefix of some cell of the
+   * book, because the words of length ≤ d in one alphabet enumerate exactly the
+   * book's cells and their ancestors.
+   *
+   * A MIXED-RADIX BOOK WOULD BREAK THAT and would need the check widened — a
+   * scale-12 book cut `a`,`A`,`B` admits the coarse address `s0:A`, whose scale 2
+   * divides 12 and which is a prefix of nothing. `docs/rep-tile-findings.md` is
+   * where such a book is described and nothing here can build one yet, so this is
+   * recorded as the follow-on rather than guessed at: an under-count in a case
+   * that cannot arise is better than a check whose behaviour nobody has measured.
+   */
+  const cells = new Set<Address>(addr);
+  let stranded = 0;
+  for (const [key, list] of below) if (!cells.has(key)) stranded += list.length;
+
+  return { resolved, below, stranded };
 }
 
 /**
@@ -373,6 +430,24 @@ export function resolvePlate(
   book: AddressBook
 ): ReadonlyMap<number, string> {
   return viewOf(plate, book).resolved;
+}
+
+/**
+ * How many painted addresses THIS BOOK CANNOT DRAW, at any resolution.
+ *
+ * Not an error and not a repair — see `buildView`, which argues at length that
+ * carrying such an address unchanged is the honest answer. This is the number
+ * that makes the honesty legible: an export sentence reporting "878 addresses"
+ * where three of them are phantoms is a sentence that overstates the drawing, and
+ * the person who painted at a resolution this canvas does not cut has no other
+ * way to find out.
+ *
+ * Free on the ordinary drawing: it is memoised with `resolvePlate` on the same
+ * (plate identity, book id) pair, and every plate a caller asks about has already
+ * been resolved for the board.
+ */
+export function strandedCount(plate: AddressPlate, book: AddressBook): number {
+  return viewOf(plate, book).stranded;
 }
 
 /** The painted addresses strictly below `a`, or an empty list. */
@@ -558,9 +633,27 @@ function splitEdits(
   for (const p of onPath) if (p.length < holeLength) parents.push(p);
 
   for (const p of parents) {
-    // Every parent here has an on-path child by construction — `anc` from the
-    // first level of the walk above, and the rest by the length test — so the
-    // cut below it is known.
+    /**
+     * Every parent here has an on-path child by construction — `anc` from the
+     * first level of the walk above, and the rest by the length test — so the cut
+     * below it is known.
+     *
+     * AND IF IT WERE NOT, THIS GOES QUIET, two lines below a deliberate throw.
+     * `cutBelow.get(p)` would be `undefined`, `lettersAt` answers the empty list
+     * for an edge division the alphabet does not spell — it says so at its own
+     * definition — and this parent would contribute NO repaint. The ancestor is
+     * deleted either way, so the outcome is paint silently lost from a region
+     * nobody erased. The conflicting-cut case a few lines up throws for a
+     * strictly smaller problem.
+     *
+     * Not converted to a throw here, and the reason is the precondition rather
+     * than the severity: `parents` is built in this function, from `onPath`, in
+     * this function, so the two cannot disagree without the loop above being
+     * wrong — and a throw guarding a local invariant against itself is a check
+     * that cannot fail, which this codebase counts as worse than none. What was
+     * missing was the sentence, and this is it: if `splitEdits` is ever handed
+     * its path set from outside, this is the line that needs the guard.
+     */
     for (const g of lettersAt(cutBelow.get(p) as number)) {
       const child = p + g;
       if (onPath.has(child) || plate.has(child)) continue;

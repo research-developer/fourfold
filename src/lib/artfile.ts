@@ -357,6 +357,16 @@ export const MAX_LAYER_DEPTH = 32;
 export const MAX_LAYERS = 8192;
 
 /**
+ * THE FORMAT'S OWN RESOLUTION FOR AN ALPHA: three decimals.
+ *
+ * Stated HERE, in the file format, because that is what it is a property of.
+ * `layers.ALPHA_STEP` is the model's copy of the same number and `emit.fmtAlpha`
+ * is the markup's; all three have to agree or one file says two things, and this
+ * is the one a payload is validated against on the way in. See `validateLayer`.
+ */
+export const ALPHA_QUANTUM = 1000;
+
+/**
  * The depths a plate may declare.
  *
  * Not a limit of the format — `buildFigure` will happily cut deeper — but a
@@ -809,11 +819,40 @@ function validateLayers(
       // carrying it round trips to the same bytes either way.
       if (v) layer[flag] = true;
     }
+    /**
+     * RANGE-CHECKED AND THEN QUANTISED, and the second half was missing.
+     *
+     * This format has a quantum for an alpha — three decimals — and three places
+     * agree on it: `emit.fmtAlpha` rounds to it before writing the markup
+     * attribute, `layers.ALPHA_STEP` rounds to it before the model holds one, and
+     * `layers.canonicalAlpha` is the one writer. The validator did not, so a
+     * payload could state `0.1234567` while the markup of the SAME FILE said
+     * `0.123` — one file, two alphas, and no reader with a rule for choosing.
+     *
+     * The consequence was not the two digits, it was the ROUND TRIP: on load
+     * `composer.stackFromEmit` canonicalises, so `0.1234567` became `0.123` and
+     * the re-saved file was a different file from the one that was opened. Worse
+     * at the top of the range, where `0.9995` canonicalises to exactly 1 — and 1
+     * is the absent case, so the field disappeared and the re-saved file stated no
+     * alpha at all. Accepted, then changed, and nothing counted the change.
+     *
+     * QUANTISED HERE rather than refused, which is the one place in this file
+     * that goes that way, so the reason is written down: everything else this
+     * validator refuses is a statement the format cannot express — a mode that is
+     * not a symmetry, an orbit larger than its plate, a half-stated in/out pair.
+     * An alpha of `0.1234567` is not that; it is the same alpha this format
+     * already writes, spelled with digits below its own resolution. 1/1000 of
+     * alpha is a quarter of one 8-bit level and no screen shows it. Refusing the
+     * file over it would decline a drawing for a difference nobody can see.
+     *
+     * What it buys is that load → save is now a FIXED POINT for this field: the
+     * value the model canonicalises to is the value the payload already held.
+     */
     if (l.opacity !== undefined) {
       if (typeof l.opacity !== "number" || !(l.opacity >= 0 && l.opacity <= 1)) {
         return REJECT;
       }
-      layer.opacity = l.opacity;
+      layer.opacity = Math.round(l.opacity * ALPHA_QUANTUM) / ALPHA_QUANTUM;
     }
     // THREE FIELDS, THREE BOUNDS, and they were one. All three used to be
     // checked against `MAX_LAYERS`, which is the layer-NODE budget: the right
