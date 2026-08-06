@@ -11,6 +11,12 @@
  *   Q3  does the rep-9 alphabet carry a charge group the way Σ₄ carries V₄?
  *   Q4  does rep-9 drag in a new ring?
  *
+ * and then two the answer to Q3 forced, decided in the section at the bottom of
+ * this file and reported in `docs/rep9-charge.md`:
+ *
+ *   A   Q3 left Σ₉ a torsor with no basepoint. Is any charge canonical anyway?
+ *   B   Q3 left the arms needing a transversal. Does anything pick one?
+ *
  * ── The subdivision, stated once ─────────────────────────────────────────
  *
  * A triangle with vertices P₀ P₁ P₂ (integer barycentrics over `den`) has, for
@@ -634,4 +640,545 @@ export function wordCharge(
   let c = 0;
   for (const d of word) c = g[c][label[d]];
   return c;
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// THE REP-9 COORDINATES — the basepoint question, and the arms with no hub
+// ═════════════════════════════════════════════════════════════════════════
+//
+// `docs/rep-tile-findings.md` Q3 left rep-9 with a torsor and two holes: no
+// canonical charge basepoint, and "the split needs a transversal of the three
+// first-digit orbits (27 choices), and none is distinguished".
+//
+// Everything below exists to decide whether those holes are real. The short
+// version, which `test/reptile.test.ts` measures and `docs/rep9-charge.md`
+// states: Σ₉ carries TWO canonical parallel classes, not one, and they do
+// DIFFERENT JOBS.
+//
+//   P₁  the rotation's orbits            — every line D₃-INVARIANT  → the CHARGE
+//   P₂  the mirrors' fixed sets          — lines permuted like the
+//                                          triangle's own vertices   → the ARMS
+//
+// Both are defined from the geometry alone: no group, no labelling, no search.
+// Together they coordinatise the alphabet, Σ₉ ≅ P₁ × P₂, which is why nothing
+// below needs to pick a torsor basepoint to say anything.
+//
+// WHY THIS IS REP-9 STRUCTURE AND NOT GENERAL. P₂ is a partition of the
+// alphabet iff the three mirrors' fixed sets are disjoint and cover: each has k
+// letters, there are three of them, and 3k = k² only at k = 3. At k = 2 they
+// are CONCURRENT — all three contain X — and that common point is exactly the
+// hub `arms.ts` excludes. So the hub's disappearance and the arm partition's
+// appearance are the same fact about the same three sets, and `armLetterMaps`
+// below turns "exclude the hub" from a design choice into a count.
+
+/** Orbits of a permutation of the alphabet: each ascending, ordered by least. */
+function orbitsOf(perm: readonly number[]): number[][] {
+  const seen = new Array<boolean>(perm.length).fill(false);
+  const out: number[][] = [];
+  for (let d = 0; d < perm.length; d++) {
+    if (seen[d]) continue;
+    const orbit: number[] = [];
+    let x = d;
+    do {
+      seen[x] = true;
+      orbit.push(x);
+      x = perm[x];
+    } while (x !== d);
+    out.push(orbit.sort((a, b) => a - b));
+  }
+  return out;
+}
+
+/**
+ * P₁ — the rotation's orbits on the alphabet.
+ *
+ * DERIVED from `childPermutation`, so it inherits that function's guarantee:
+ * the permutation is found by transforming each child and LOOKING IT UP by
+ * canonical key, never by a formula that could agree with the subdivision by
+ * construction.
+ */
+export function rotationOrbits(k: number): number[][] {
+  return orbitsOf(childPermutation(k, S3[1].perm));
+}
+
+/** P₂ — the fixed sets of the three mirrors, in m_A, m_B, m_C order. */
+export function mirrorFixedSets(k: number): number[][] {
+  return [3, 4, 5].map((i) => fixedLetters(k, S3[i].perm));
+}
+
+/** Do these sets partition 0..n−1? Every element in exactly one. */
+export function isPartition(
+  parts: readonly (readonly number[])[],
+  n: number
+): boolean {
+  const count = new Array<number>(n).fill(0);
+  for (const part of parts) for (const x of part) count[x]++;
+  return count.every((c) => c === 1);
+}
+
+/**
+ * Letters that share a vertex with the parent — the CORNER children.
+ *
+ * Decided geometrically (does any child vertex coincide with a parent vertex
+ * restated over the child's denominator) rather than by reading the index
+ * triple, so that the three grade classes below are named by a property of the
+ * TRIANGLE and not by a property of the alphabet's ordering convention.
+ */
+export function cornerLetters(k: number): number[] {
+  const corners = [
+    [k, 0, 0],
+    [0, k, 0],
+    [0, 0, k],
+  ];
+  return subdivide(ROOT, k)
+    .map((t, d) =>
+      t.v.some((p) => corners.some((c) => c[0] === p[0] && c[1] === p[1] && c[2] === p[2]))
+        ? d
+        : -1
+    )
+    .filter((d) => d >= 0);
+}
+
+export interface CanonicalCoords {
+  /**
+   * GRADE, per letter. 0 on the inverted class; ±1 on the two upright classes,
+   * with `+1` on the CORNER class by the sign convention named in
+   * `docs/rep9-charge.md`. The classes are P₁; only the numbering is chosen.
+   */
+  readonly grade: readonly number[];
+  /** VERTEX, per letter: the c with the letter in Fix(m_c). A = 0, B = 1, C = 2. */
+  readonly vertex: readonly number[];
+  /** P₁ as [inverted, corner, other]. */
+  readonly gradeClasses: readonly (readonly number[])[];
+  /** P₂ as [Fix(m_A), Fix(m_B), Fix(m_C)]. */
+  readonly vertexClasses: readonly (readonly number[])[];
+}
+
+/**
+ * The two coordinates, built from geometry with no group and no search.
+ *
+ * THROWS unless both families partition the alphabet and P₁'s classes are
+ * cleanly named — which is the case at k = 3 and, as `test/reptile.test.ts`
+ * measures over k = 2..9, at no other radix. The throw is the point: this is
+ * not a general construction wearing a rep-9 hat.
+ */
+export function canonicalCoords(k: number): CanonicalCoords {
+  const n = k * k;
+  const rot = rotationOrbits(k);
+  const mir = mirrorFixedSets(k);
+  if (rot.length !== 3 || !isPartition(rot, n)) {
+    throw new Error(`reptile: k=${k} has ${rot.length} rotation orbits, not 3`);
+  }
+  if (!isPartition(mir, n)) {
+    throw new Error(`reptile: k=${k} mirror fixed sets do not partition Σ`);
+  }
+  const inverted = new Set(
+    alphabet(k)
+      .filter((d) => d.inverted)
+      .map((d) => d.index)
+  );
+  const corner = new Set(cornerLetters(k));
+  const invClass = rot.filter((o) => o.every((d) => inverted.has(d)));
+  const cornerClass = rot.filter((o) => o.every((d) => corner.has(d)));
+  if (invClass.length !== 1 || cornerClass.length !== 1) {
+    throw new Error(`reptile: k=${k} rotation orbits are not orientation-pure`);
+  }
+  const other = rot.filter((o) => o !== invClass[0] && o !== cornerClass[0]);
+  if (other.length !== 1) throw new Error(`reptile: k=${k} class naming failed`);
+  const grade = new Array<number>(n).fill(-1);
+  invClass[0].forEach((d) => (grade[d] = 0));
+  cornerClass[0].forEach((d) => (grade[d] = 1));
+  other[0].forEach((d) => (grade[d] = 2));
+  const vertex = new Array<number>(n).fill(-1);
+  mir.forEach((set, c) => set.forEach((d) => (vertex[d] = c)));
+  return {
+    grade,
+    vertex,
+    gradeClasses: [invClass[0], cornerClass[0], other[0]],
+    vertexClasses: mir,
+  };
+}
+
+/**
+ * The letter ↦ (grade, vertex) labelling as an element of (ℤ/3)².
+ *
+ * `GROUPS.Z3xZ3` encodes the element (a, b) as a + 3b, so this writes the grade
+ * in the first component and the vertex in the second. WRITTEN DOWN, not found:
+ * the exhaustive search in `searchLabellings` is then used to confirm it is one
+ * of the 1,296 affine labellings rather than to discover it, which is what
+ * makes "the structure is forced" a statement and not a lucky pick out of a hat.
+ *
+ * `sign` is the ONE choice this construction contains: which of the two upright
+ * classes counts as +1. Both values are affine; they differ by the unique
+ * non-trivial automorphism of ℤ/3 on the grade axis and by nothing else.
+ */
+export function coordLabelling(k: number, sign: 1 | 2): number[] {
+  const { grade, vertex } = canonicalCoords(k);
+  return grade.map((g, d) => (g === 0 ? 0 : ((g * sign) % 3)) + 3 * vertex[d]);
+}
+
+/** The map a symmetry induces on the group, through a labelling. φ∘π∘φ⁻¹. */
+export function inducedMap(
+  label: readonly number[],
+  childPerm: readonly number[]
+): number[] {
+  const inv = new Array<number>(label.length);
+  label.forEach((v, d) => (inv[v] = d));
+  return Array.from({ length: label.length }, (_, x) => label[childPerm[inv[x]]]);
+}
+
+/** The translation part of an induced map: its value at the identity. */
+export const translationPart = (induced: readonly number[]): number => induced[0];
+
+/**
+ * The linear part of an induced affine map: x ↦ f(x) − f(0).
+ *
+ * Equal to the identity permutation exactly when f is a pure TRANSLATION, which
+ * is the property `docs/rep-tile-findings.md` measured on one witness and which
+ * `test/reptile.test.ts` now measures on all three affine structures — where it
+ * turns out to hold on exactly one of them.
+ */
+export function linearPart(g: GroupTable, induced: readonly number[]): number[] {
+  const inv = g.map((row) => row.indexOf(0));
+  return induced.map((x) => g[x][inv[induced[0]]]);
+}
+
+/**
+ * EVERY affine labelling, not just how many.
+ *
+ * `searchLabellings` counts and keeps one witness, which was enough to say a
+ * torsor exists. Deciding WHICH torsor, and how many inequivalent ones there
+ * are, needs the labellings themselves. The sweep is the same 9! and the tests
+ * cross-check the two counts against each other, so this cannot silently drift
+ * from the function it duplicates.
+ */
+export function collectAffineLabellings(k: number, groupName: string): number[][] {
+  const g = GROUPS[groupName];
+  const n = k * k;
+  if (g.length !== n) throw new Error(`reptile: ${groupName} is not of order ${n}`);
+  const gens = [childPermutation(k, S3[1].perm), childPermutation(k, S3[3].perm)];
+  const out: number[][] = [];
+  eachPermutation(n, (phi) => {
+    for (const pi of gens) {
+      if (!isAffine(g, inducedMap(phi, pi))) return;
+    }
+    out.push([...phi]);
+  });
+  return out;
+}
+
+/**
+ * The 12 lines of AG(2,3), pulled back to letters.
+ *
+ * A triple is a line iff its three labels sum to the identity: the line through
+ * a and b is {a, b, 2b−a}, and a + b + (2b−a) = 3b = 0. So this needs no
+ * geometry of the plane, only the group table — and it is exactly the invariant
+ * that decides when two labellings describe the SAME affine structure, because
+ * two labellings share a line set iff they differ by a collineation, and for a
+ * prime field the collineations are precisely AGL.
+ */
+export function planeLines(g: GroupTable, label: readonly number[]): number[][] {
+  const n = label.length;
+  const out: number[][] = [];
+  for (let a = 0; a < n; a++) {
+    for (let b = a + 1; b < n; b++) {
+      for (let c = b + 1; c < n; c++) {
+        if (g[g[label[a]][label[b]]][label[c]] === 0) out.push([a, b, c]);
+      }
+    }
+  }
+  return out;
+}
+
+export interface PlaneStructure {
+  /** Canonical key: the sorted line set. Two labellings agree iff keys agree. */
+  readonly key: string;
+  readonly lines: number[][];
+  /** How many of the affine labellings realise this structure. */
+  readonly labellings: number;
+  /** The rotation's linear part is the identity — i.e. it is a translation. */
+  readonly rotationIsTranslation: boolean;
+  /** Is the set of inverted letters a line here? (Q1(a), per structure.) */
+  readonly invertedIsLine: boolean;
+  /** Is every rotation orbit a line here? (Q1(b), per structure.) */
+  readonly rotationOrbitsAreLines: boolean;
+  /** Are the three mirror fixed sets lines here? Forced, and checked anyway. */
+  readonly mirrorSetsAreLines: boolean;
+  /** One labelling realising it, for downstream measurement. */
+  readonly witness: number[];
+}
+
+/**
+ * Group affine labellings into affine PLANE STRUCTURES.
+ *
+ * This is the number the alphabet question turns on. A charge basepoint is
+ * derived from an address and can be revised; a letter ↦ child-position
+ * assignment written into a file cannot. So what matters is not how many
+ * labellings there are (1,296) but how many are genuinely INEQUIVALENT under
+ * recolouring — and recolouring is post-composition with AGL(2,3), whose orbits
+ * are exactly the classes of equal line set.
+ */
+export function groupIntoStructures(
+  g: GroupTable,
+  labellings: readonly (readonly number[])[],
+  k: number
+): PlaneStructure[] {
+  const rot = rotationOrbits(k);
+  const mir = mirrorFixedSets(k);
+  const inverted = alphabet(k)
+    .filter((d) => d.inverted)
+    .map((d) => d.index);
+  const rotPerm = childPermutation(k, S3[1].perm);
+  const byKey = new Map<string, PlaneStructure>();
+  for (const label of labellings) {
+    const lines = planeLines(g, label);
+    const key = lines
+      .map((l) => l.join(","))
+      .sort()
+      .join("|");
+    const found = byKey.get(key);
+    if (found) {
+      byKey.set(key, { ...found, labellings: found.labellings + 1 });
+      continue;
+    }
+    const lineSet = new Set(lines.map((l) => [...l].sort((a, b) => a - b).join(",")));
+    const isLine = (s: readonly number[]) =>
+      lineSet.has([...s].sort((a, b) => a - b).join(","));
+    const linear = linearPart(g, inducedMap(label, rotPerm));
+    byKey.set(key, {
+      key,
+      lines,
+      labellings: 1,
+      rotationIsTranslation: linear.every((x, i) => x === i),
+      invertedIsLine: isLine(inverted),
+      rotationOrbitsAreLines: rot.every(isLine),
+      mirrorSetsAreLines: mir.every(isLine),
+      witness: [...label],
+    });
+  }
+  return [...byKey.values()];
+}
+
+// ── the arms: which decompositions are D₃-stable, and why the hub goes ────
+
+/** Composition of two coordinate permutations: (p ∘ q)(i) = p[q[i]]. */
+export const permCompose = (p: readonly number[], q: readonly number[]): number[] =>
+  q.map((x) => p[x]);
+
+/** Index into `S3` of a coordinate permutation. */
+export function s3IndexOf(perm: readonly number[]): number {
+  const i = S3.findIndex((s) => s.perm.every((x, j) => x === perm[j]));
+  if (i < 0) throw new Error(`reptile: ${perm} is not in S3`);
+  return i;
+}
+
+/**
+ * How D₃ acts on the three VERTEX labels — read off the mirrors themselves.
+ *
+ * σ carries Fix(m_v) to Fix(σ m_v σ⁻¹), so the action on {A, B, C} is
+ * conjugation on the three reflections. Computed from the S₃ table rather than
+ * declared, because the whole point of the vertex coordinate is that it is the
+ * triangle's own labelling and not a second one invented here.
+ *
+ * Returns `act[s][v]`: the vertex label σ = S3[s] sends v to.
+ */
+export function vertexAction(): number[][] {
+  const idx = (p: readonly number[]) => s3IndexOf(p);
+  const invOf = (p: readonly number[]) => {
+    const q = new Array<number>(3);
+    p.forEach((x, i) => (q[x] = i));
+    return q;
+  };
+  return S3.map((s) =>
+    [3, 4, 5].map((m) => {
+      const conj = permCompose(permCompose(s.perm, S3[m].perm), invOf(s.perm));
+      return idx(conj) - 3;
+    })
+  );
+}
+
+export interface ArmLetterMaps {
+  /** D₃-orbits on the alphabet, with the size of each orbit's stabiliser. */
+  readonly orbits: { readonly members: number[]; readonly stabiliser: number }[];
+  /** Letters with no equivariant image at all: the hub. Must be excluded. */
+  readonly excluded: number[];
+  /** How many D₃-equivariant maps Σ ∖ excluded → {A, B, C} exist. */
+  readonly maps: number;
+}
+
+/**
+ * THE ARM DECOMPOSITION, counted instead of chosen.
+ *
+ * An arm control needs a map f from letters to the three vertex labels with
+ * f(σ·d) = σ·f(d) — that is exactly "the rotation permutes the arms cyclically
+ * and the mirrors permute them like the medians". Such an f is free on each
+ * D₃-orbit subject to one condition: f(d) must be fixed by everything that
+ * fixes d. So
+ *
+ *   Stab(d) = ⟨m_v⟩   →  exactly one choice, f(d) = v
+ *   Stab(d) = 1       →  three choices, none distinguished
+ *   Stab(d) = D₃      →  NO choice: no vertex label is fixed by all of D₃
+ *
+ * The last line is `arms.ts`'s excluded hub, derived rather than argued: the
+ * hub is not excluded because including it would break disjointness (though it
+ * would) but because there is nothing equivariant to map it to.
+ *
+ * At k = 3 every letter lies in exactly one mirror set, so every stabiliser is
+ * a mirror subgroup, so the count is 1 — the decomposition is FORCED. At k = 2
+ * it is also 1, with the hub excluded. From k = 4 the free orbits appear and
+ * the count is a power of three: that is where the transversal genuinely stops
+ * being canonical.
+ */
+export function armLetterMaps(k: number): ArmLetterMaps {
+  const n = k * k;
+  const perms = S3.map((s) => childPermutation(k, s.perm));
+  const act = vertexAction();
+  const seen = new Array<boolean>(n).fill(false);
+  const orbits: { members: number[]; stabiliser: number }[] = [];
+  const excluded: number[] = [];
+  let maps = 1;
+  for (let d = 0; d < n; d++) {
+    if (seen[d]) continue;
+    const members = [...new Set(perms.map((p) => p[d]))].sort((a, b) => a - b);
+    members.forEach((m) => (seen[m] = true));
+    const stab = perms.map((p, s) => (p[d] === d ? s : -1)).filter((s) => s >= 0);
+    const choices = [0, 1, 2].filter((v) => stab.every((s) => act[s][v] === v));
+    orbits.push({ members, stabiliser: stab.length });
+    if (choices.length === 0) excluded.push(...members);
+    else maps *= choices.length;
+  }
+  return { orbits, excluded, maps };
+}
+
+/**
+ * Every decomposition of the alphabet into three sets the ROTATION permutes
+ * cyclically — i.e. every transversal of the rotation orbits, up to which part
+ * you call first.
+ *
+ * `docs/rep-tile-findings.md` counted these as "27 choices, none
+ * distinguished". 27 is the transversal count; the DECOMPOSITION count is 9,
+ * because T, πT and π²T name the same decomposition. Either number is a count
+ * of rotation-stable candidates, and the point of `armLetterMaps` is that
+ * demanding the MIRRORS behave too cuts it to one.
+ */
+export function rotationTransversals(k: number): number[][][] {
+  const rot = rotationOrbits(k);
+  const perm = childPermutation(k, S3[1].perm);
+  if (rot.some((o) => o.length !== 3)) {
+    // A short orbit is a rotation-FIXED letter, and a transversal through it
+    // would put that letter in all three parts at once. Refusing is the honest
+    // answer: at k = 2 the construction below does not describe a partition,
+    // which is precisely why §D has to skip X rather than assign it.
+    throw new Error(`reptile: k=${k} rotation does not act freely on Σ`);
+  }
+  const out: number[][][] = [];
+  const build = (i: number, pick: number[]) => {
+    if (i === rot.length) {
+      const parts = [pick, pick.map((d) => perm[d]), pick.map((d) => perm[perm[d]])];
+      out.push(parts.map((p) => [...p].sort((a, b) => a - b)));
+      return;
+    }
+    for (const d of rot[i]) build(i + 1, [...pick, d]);
+  };
+  build(0, []);
+  return out;
+}
+
+/**
+ * Of those, the ones the MIRRORS also permute — i.e. the ones that give a
+ * D₃-equivariant arm label rather than merely a rotation-equivariant one.
+ *
+ * Distinct decompositions, not distinct transversals: `rotationTransversals`
+ * returns each decomposition three times (T, πT and π²T name the same three
+ * parts), so this deduplicates before filtering. The count that comes out is
+ * the answer to "is the transversal genuinely non-canonical".
+ */
+export function d3StableTransversals(k: number): number[][][] {
+  const perms = S3.map((s) => childPermutation(k, s.perm));
+  const norm = (part: readonly number[]) => [...part].sort((a, b) => a - b).join(",");
+  const seen = new Set<string>();
+  const out: number[][][] = [];
+  for (const parts of rotationTransversals(k)) {
+    const key = parts.map(norm).sort().join("|");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const names = new Set(parts.map(norm));
+    const stable = perms.every((p) =>
+      parts.every((part) => names.has(norm(part.map((d) => p[d]))))
+    );
+    if (stable) out.push(parts);
+  }
+  return out;
+}
+
+// ── frames: an apex-style convention, and the single-digit rotation law ───
+
+/**
+ * Subdivide with a per-child FRAME — a permutation of the child's vertex roles.
+ *
+ * `subdivide` hands every child the vertex order the formula produces, which is
+ * the `ifs` reading. A CONVENTION in `figure.ts`'s sense is a choice, per child,
+ * of which of its vertices plays role 0 and in which order the other two follow
+ * — and that choice is carried into the subtree, because the next cut is
+ * written in the child's own vertex order. This is that, parameterised.
+ *
+ * The triangles produced are the SAME triangles either way (the tests check it
+ * as point sets); only the addressing below them moves.
+ */
+export function subdivideFramed(
+  tri: Tri,
+  k: number,
+  frames: readonly number[]
+): Tri[] {
+  return subdivide(tri, k).map((t, d) => {
+    const p = S3[frames[d]].perm;
+    return { v: [t.v[p[0]], t.v[p[1]], t.v[p[2]]] as const, den: t.den };
+  });
+}
+
+/**
+ * A frame assignment under which the ROTATION REWRITES ONLY THE FIRST DIGIT.
+ *
+ * `frameResidual` measures the symmetry a descent carries into the subtree: σ
+ * maps child d's triple onto child π(d)'s triple, but possibly reordered, and
+ * the reordering is what the address below has to absorb. With frames F the
+ * residual becomes F(π(d))⁻¹ ∘ r ∘ F(d), so it vanishes for every letter iff
+ *
+ *     F(π(d)) = r ∘ F(d),     r = the rotation's residual (one 3-cycle, for
+ *                                 every letter, at every radix — measured).
+ *
+ * That recurrence is solvable exactly when π has no fixed letter: walk each
+ * π-orbit once, and consistency closing the orbit needs r^(orbit length) = id.
+ * At rep-4 the orbit through X has length 1 and asks r = id, which is false —
+ * that is `docs/symmetry-findings.md` §A's "first NON-X digit", stated as an
+ * obstruction. At rep-9 the rotation acts freely, every orbit has length 3, and
+ * r³ = id: the obstruction is gone and the law becomes single-digit with no
+ * exception. `docs/rep-tile-findings.md` DERIVED this; here it is constructed,
+ * and the test checks it cell-for-cell against the geometry.
+ */
+export function rotationFrames(k: number): number[] {
+  const residual = frameResidual(k, S3[1].perm);
+  const r = S3[residual[0]].perm;
+  if (residual.some((s) => s !== residual[0])) {
+    throw new Error(`reptile: k=${k} rotation residual is not uniform`);
+  }
+  const perm = childPermutation(k, S3[1].perm);
+  const n = k * k;
+  const frames = new Array<number>(n).fill(-1);
+  for (let d = 0; d < n; d++) {
+    if (frames[d] >= 0) continue;
+    frames[d] = 0; // identity on the orbit representative
+    let x = perm[d];
+    let acc: readonly number[] = S3[0].perm;
+    while (x !== d) {
+      acc = permCompose(r, acc);
+      frames[x] = s3IndexOf(acc);
+      x = perm[x];
+    }
+    // closing the orbit must return to the identity, or no convention exists
+    if (s3IndexOf(permCompose(r, acc)) !== 0) {
+      throw new Error(`reptile: k=${k} has no single-digit rotation convention`);
+    }
+  }
+  return frames;
 }

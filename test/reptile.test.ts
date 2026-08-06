@@ -22,24 +22,41 @@ import {
   S3,
   affineBijections,
   alphabet,
+  armLetterMaps,
   bestRelabelling,
   buildTree,
+  canonicalCoords,
   centroid,
   childPermutation,
+  collectAffineLabellings,
   containsCentroid,
+  coordLabelling,
+  cornerLetters,
+  d3StableTransversals,
   downCount,
   eachPermutation,
   fixedLetters,
   frameResidual,
+  groupIntoStructures,
+  inducedMap,
   isAffine,
   isAutomorphism,
+  isPartition,
+  linearPart,
+  mirrorFixedSets,
   permuteTri,
+  planeLines,
+  rotationFrames,
+  rotationOrbits,
+  rotationTransversals,
   searchLabellings,
   shiftNode,
   subdivide,
+  subdivideFramed,
   triKey,
   upCount,
   wordCharge,
+  type PlaneStructure,
   type Tree,
   type Tri,
 } from "../src/lib/reptile";
@@ -64,8 +81,54 @@ function leaves(k: number, depth: number): Leaf[] {
   return cur;
 }
 
+/** The same, with a per-child FRAME — i.e. under a stated role convention. */
+function framedLeaves(k: number, depth: number, frames: readonly number[]): Leaf[] {
+  let cur: Leaf[] = [{ word: [], tri: ROOT }];
+  for (let d = 0; d < depth; d++) {
+    const next: Leaf[] = [];
+    for (const n of cur) {
+      subdivideFramed(n.tri, k, frames).forEach((t, i) =>
+        next.push({ word: [...n.word, i], tri: t })
+      );
+    }
+    cur = next;
+  }
+  return cur;
+}
+
+/**
+ * Where a symmetry sends each cell, decided by the GEOMETRY: the triangle is
+ * transformed and then looked up by canonical key. Every claim below about
+ * addresses is checked through this, never by applying a permutation to a word
+ * and asserting the result is what the same permutation produces.
+ */
+function symmetryImages(cells: readonly Leaf[], N: number, permIndex: number): number[] {
+  const byKey = new Map(cells.map((c, i) => [triKey(c.tri, N), i]));
+  return cells.map((c) => {
+    const j = byKey.get(triKey(permuteTri(c.tri, S3[permIndex].perm), N));
+    if (j === undefined) throw new Error("no image cell");
+    return j;
+  });
+}
+
 const isPrefix = (p: readonly number[], w: readonly number[]) =>
   p.every((d, i) => w[i] === d);
+
+/**
+ * The 9! sweep, run ONCE for the whole file. `searchLabellings` runs its own and
+ * the tests cross-check the two counts against each other, so this cache cannot
+ * make a wrong number look right — it only stops the sweep happening six times.
+ */
+let affineCache: number[][] | null = null;
+const affineLabellings = (): number[][] => {
+  affineCache ??= collectAffineLabellings(3, "Z3xZ3");
+  return affineCache;
+};
+let structureCache: PlaneStructure[] | null = null;
+const structures = (): PlaneStructure[] => {
+  structureCache ??= groupIntoStructures(GROUPS.Z3xZ3, affineLabellings(), 3);
+  return structureCache;
+};
 
 /**
  * Descent side of a mixed tree: for every node, the set of common-refinement
@@ -816,5 +879,671 @@ describe("Q4 — rings, and the senary numeral", () => {
     expect(subdivide(ROOT, 6).length).toBe(36);
     expect(upCount(6)).toBe(21);
     expect(downCount(6)).toBe(15);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// The rep-9 follow-on. Q3 above left two holes — no canonical charge
+// basepoint, and "the split needs a transversal … and none is distinguished".
+// Everything below decides whether those holes are real. Both are, in part,
+// and both are smaller than Q3 believed.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe("rep-9 A — is there a canonical basepoint, or must one be chosen?", () => {
+  /**
+   * THE STRUCTURE EVERYTHING ELSE RESTS ON, and it is two objects rather than
+   * the one the brief expected.
+   *
+   *   P₁ = the rotation's orbits           {0,3,5} {1,2,4} {6,7,8}
+   *   P₂ = the mirrors' fixed sets         {0,4,6} {2,3,7} {1,5,8}
+   *
+   * Each is a partition of Σ₉ into three 3-sets, and every line of one meets
+   * every line of the other exactly once. So they COORDINATISE the alphabet
+   * with no group, no labelling and no search: Σ₉ ≅ P₁ × P₂.
+   *
+   * P₂ partitioning is a rep-9 accident and the test says so: three mirrors fix
+   * k letters each, and 3k = k² only at k = 3. At every other radix tested the
+   * three sets OVERLAP, and what they overlap in is the D₃-fixed letter — the
+   * hub. So "rep-9 has no hub" and "rep-9 has an arm partition" are one fact
+   * about one family of three sets, seen from two sides.
+   */
+  it("Σ₉ carries two canonical parallel classes — and P₂ partitions only at k = 3", () => {
+    expect(rotationOrbits(3)).toEqual([
+      [0, 3, 5],
+      [1, 2, 4],
+      [6, 7, 8],
+    ]);
+    expect(mirrorFixedSets(3)).toEqual([
+      [0, 4, 6],
+      [2, 3, 7],
+      [1, 5, 8],
+    ]);
+    expect(isPartition(rotationOrbits(3), 9)).toBe(true);
+    expect(isPartition(mirrorFixedSets(3), 9)).toBe(true);
+    // transverse: each rotation orbit meets each mirror set in exactly one letter
+    for (const orbit of rotationOrbits(3)) {
+      for (const line of mirrorFixedSets(3)) {
+        expect(orbit.filter((d) => line.includes(d)).length).toBe(1);
+      }
+    }
+    // and the accident, over the whole sweep k = 2..9
+    const report: Record<number, { partitions: boolean; common: number }> = {};
+    for (const k of [2, 3, 4, 5, 6, 7, 8, 9]) {
+      const sets = mirrorFixedSets(k);
+      expect(sets.every((s) => s.length === k)).toBe(true);
+      report[k] = {
+        partitions: isPartition(sets, k * k),
+        common: sets.reduce((a, b) => a.filter((x) => b.includes(x))).length,
+      };
+    }
+    expect(report).toEqual({
+      2: { partitions: false, common: 1 },
+      3: { partitions: true, common: 0 },
+      4: { partitions: false, common: 1 },
+      5: { partitions: false, common: 1 },
+      6: { partitions: false, common: 0 },
+      7: { partitions: false, common: 1 },
+      8: { partitions: false, common: 1 },
+      9: { partitions: false, common: 0 },
+    });
+  });
+
+  /**
+   * (a) AND (b) ARE THE SAME QUESTION. The three inverted letters are not
+   * merely A line: they are one of the rotation's own orbits, decided here by
+   * set equality and not by a labelling. So the parallel class of the inverted
+   * line IS the rotation-orbit partition, the two leads cannot compete, and
+   * confirming one confirms the other.
+   *
+   * The other two classes are just as nameable — the CORNER letters are the
+   * three that share a vertex with the parent (decided geometrically in
+   * `cornerLetters`), the remaining three are the uprights that do not. So P₁'s
+   * three lines are individually distinguishable and one of them, the inverted
+   * one, is the analogue of rep-4's X.
+   */
+  it("the inverted letters ARE a rotation orbit — (a) and (b) are one partition", () => {
+    const inverted = alphabet(3)
+      .filter((d) => d.inverted)
+      .map((d) => d.index);
+    expect(inverted).toEqual([6, 7, 8]);
+    expect(rotationOrbits(3)).toContainEqual(inverted);
+    expect(cornerLetters(3)).toEqual([0, 3, 5]);
+    expect(rotationOrbits(3)).toContainEqual(cornerLetters(3));
+    const c = canonicalCoords(3);
+    expect(c.gradeClasses).toEqual([
+      [6, 7, 8],
+      [0, 3, 5],
+      [1, 2, 4],
+    ]);
+    expect([...c.grade]).toEqual([1, 2, 2, 1, 2, 1, 0, 0, 0]);
+    expect([...c.vertex]).toEqual([0, 2, 1, 1, 0, 2, 0, 1, 2]);
+    // the coordinates exist at k = 3 and refuse to exist anywhere else
+    for (const k of [2, 4, 5, 6, 7]) expect(() => canonicalCoords(k)).toThrow();
+  });
+
+  /**
+   * WHERE THE BRIEF'S LEAD (a) IS ONLY THREE-QUARTERS RIGHT, and the correction
+   * matters. "Is the inverted set a line" is not a question about Σ₉; it is a
+   * question about Σ₉ TOGETHER WITH an affine structure, and there are three.
+   *
+   * The 1,296 affine labellings fall into exactly 3 classes of 432 under
+   * recolouring — AGL(2,3), whose orbits are the classes of equal LINE SET. In
+   * one of them the inverted set is a line and every rotation orbit is a line;
+   * in the other two it is not. The one where it is, is exactly the one where
+   * the rotation is a pure translation.
+   *
+   * That sharpens `docs/rep-tile-findings.md`, which recorded "the rotation's
+   * linear part is exactly the identity [PROVEN]" from a single witness. It is
+   * a property of ONE of the three structures, not of the torsor; in the other
+   * two the linear part is a transvection and the rotation twist takes three
+   * values per depth instead of one. So the structure is not free — it is
+   * selected by a property already measured and already wanted.
+   *
+   * The mirror sets are lines in ALL THREE, which is forced: the fixed set of
+   * an affine map is an affine subspace, and a 3-element affine subspace of
+   * AG(2,3) is a line. Checked rather than assumed.
+   */
+  it("the inverted set is a line in exactly 1 of the 3 structures — the translation one", () => {
+    expect(affineLabellings().length).toBe(1296);
+    expect(searchLabellings(3, "Z3xZ3").affine).toBe(affineLabellings().length);
+    const all = structures();
+    expect(all.length).toBe(3);
+    expect(all.map((s) => s.labellings)).toEqual([432, 432, 432]);
+    expect(all.every((s) => s.mirrorSetsAreLines)).toBe(true);
+    const translation = all.filter((s) => s.rotationIsTranslation);
+    expect(translation.length).toBe(1);
+    expect(translation[0].invertedIsLine).toBe(true);
+    expect(translation[0].rotationOrbitsAreLines).toBe(true);
+    for (const s of all.filter((x) => !x.rotationIsTranslation)) {
+      expect(s.invertedIsLine).toBe(false);
+      expect(s.rotationOrbitsAreLines).toBe(false);
+      // a transvection: unipotent, order 3, no fixed letter
+      expect(
+        linearPart(GROUPS.Z3xZ3, inducedMap(s.witness, childPermutation(3, S3[1].perm)))
+      ).toEqual([0, 4, 8, 3, 7, 2, 6, 1, 5]);
+    }
+    // and the price of the two rejected structures, measured
+    const g = GROUPS.Z3xZ3;
+    const inv = g.map((row) => row.indexOf(0));
+    const twistClasses = (label: readonly number[], depth: number) => {
+      const cells = leaves(3, depth);
+      const image = symmetryImages(cells, 3 ** depth, 1);
+      const out = new Set<number>();
+      cells.forEach((c, i) => {
+        const a = wordCharge(g, label, c.word);
+        const b = wordCharge(g, label, cells[image[i]].word);
+        out.add(g[b][inv[a]]);
+      });
+      return out.size;
+    };
+    for (const depth of [1, 2, 3]) {
+      expect(twistClasses(translation[0].witness, depth)).toBe(1);
+      for (const s of all.filter((x) => !x.rotationIsTranslation)) {
+        expect(twistClasses(s.witness, depth)).toBe(3);
+      }
+    }
+  });
+
+  /**
+   * LAYER 2 — the labelling, which a canonical partition does NOT fix. A charge
+   * is a value, and turning a fibration into a value needs a functional (φ and
+   * 2φ share every fibre and disagree on every value) and, on a torsor, an
+   * offset. The chain of counts, each an observed filter over the 1,296:
+   *
+   *   1,296  affine labellings
+   *     144  with the basepoint at letter 6 — the inverted letter fixed by m_A,
+   *          which is what "inverted ∧ on the A median" picks out, the direct
+   *          analogue of rep-4's forced X ↦ identity
+   *       4  with each canonical class on its own factor: the grade classes as
+   *          cosets of one axis, the vertex classes as cosets of the other
+   *       2  with rot⁺ translating by +1 rather than −1 on the vertex axis
+   *
+   * The surviving two are `coordLabelling(3, 1)` and `coordLabelling(3, 2)` —
+   * constructed from geometry with no search — and they differ by the unique
+   * non-trivial automorphism of ℤ/3 on the GRADE axis and by nothing else.
+   * That is the named equivalence: the charge is canonical up to which of the
+   * two upright classes counts as +1.
+   *
+   * Note the step that does NOT appear: no filter for the structure. Putting
+   * both canonical classes on the coordinate axes already forces it.
+   */
+  it("the canonical labelling is written down, not searched: 1,296 → 144 → 4 → 2", () => {
+    const labs = affineLabellings();
+    const coords = canonicalCoords(3);
+    const gradeAxis = [0, 1, 2]; // (ℤ/3)² elements with vertex component 0
+    const vertexAxis = [0, 3, 6]; // … and with grade component 0
+    expect(labs.filter((l) => l[6] === 0).length).toBe(144);
+    const axed = labs.filter(
+      (l) =>
+        l[6] === 0 &&
+        coords.vertexClasses[0].every((d) => gradeAxis.includes(l[d])) &&
+        coords.gradeClasses[0].every((d) => vertexAxis.includes(l[d]))
+    );
+    expect(axed.length).toBe(4);
+    // no structure filter was applied and yet all four are in the good one
+    const key = structures().find((s) => s.rotationIsTranslation)?.key;
+    for (const l of axed) {
+      expect(groupIntoStructures(GROUPS.Z3xZ3, [l], 3)[0].key).toBe(key);
+    }
+    const rot = childPermutation(3, S3[1].perm);
+    const t0 = inducedMap(coordLabelling(3, 1), rot)[0];
+    const oriented = axed.filter((l) => inducedMap(l, rot)[0] === t0);
+    expect(oriented.length).toBe(2);
+    expect(oriented.map((l) => l.join(","))).toEqual(
+      expect.arrayContaining([coordLabelling(3, 1).join(","), coordLabelling(3, 2).join(",")])
+    );
+    // and the pair differ by negating the grade coordinate, nothing else
+    const one = coordLabelling(3, 1);
+    const two = coordLabelling(3, 2);
+    one.forEach((e, d) => {
+      expect(two[d] % 3).toBe((3 - (e % 3)) % 3);
+      expect(Math.floor(two[d] / 3)).toBe(Math.floor(e / 3));
+    });
+  });
+
+  /**
+   * WHY THERE ARE EXACTLY TWO CANONICAL FUNCTIONALS AND NOT FOUR. AG(2,3) has
+   * four parallel classes; each is a fibration of Σ₉ and so a candidate ℤ/3
+   * charge up to scalar and offset. Under D₃:
+   *
+   *   P₁ rotation orbits    every line fixed by all six symmetries → the GRADE
+   *   P₂ mirror fixed sets  class fixed; each line fixed by exactly its own
+   *                         mirror, permuted by the rotations → the VERTEX
+   *   the two diagonals     SWAPPED with each other by every mirror
+   *
+   * A charge built on a diagonal would therefore be carried onto a different
+   * charge by a reflection of the figure, so neither diagonal can be named. Two
+   * of four survive, and they are precisely the two the geometry already gave.
+   */
+  it("exactly 2 of the 4 fibrations are D₃-canonical; the mirrors swap the other 2", () => {
+    const lines = planeLines(GROUPS.Z3xZ3, coordLabelling(3, 1));
+    expect(lines.length).toBe(12);
+    const norm = (l: readonly number[]) => [...l].sort((a, b) => a - b).join(",");
+    const classes: number[][][] = [];
+    for (const l of lines) {
+      const cl = classes.find((c) => c.every((m) => m.every((x) => !l.includes(x))));
+      if (cl) cl.push(l);
+      else classes.push([l]);
+    }
+    expect(classes.length).toBe(4);
+    const perms = S3.map((s) => childPermutation(3, s.perm));
+    const keyOf = (c: number[][]) => c.map(norm).sort().join("|");
+    /** For each class: where each symmetry sends it, and how many of its own
+     *  three lines that symmetry fixes individually. */
+    const profile = classes.map((c, self) => ({
+      lines: c.map(norm).sort(),
+      self,
+      goesTo: perms.map((p) =>
+        classes.findIndex((c2) => keyOf(c2) === keyOf(c.map((l) => l.map((d) => p[d]))))
+      ),
+      linesFixed: perms.map(
+        (p) => c.filter((l) => norm(l.map((d) => p[d])) === norm(l)).length
+      ),
+    }));
+    const rotClass = profile.filter((p) => p.lines.includes("0,3,5"));
+    const mirClass = profile.filter((p) => p.lines.includes("0,4,6"));
+    expect(rotClass.length).toBe(1);
+    expect(mirClass.length).toBe(1);
+    // P₁: fixed as a class, and every line fixed by every symmetry — an invariant
+    expect(rotClass[0].goesTo.every((x) => x === rotClass[0].self)).toBe(true);
+    expect(rotClass[0].linesFixed).toEqual([3, 3, 3, 3, 3, 3]);
+    // P₂: fixed as a class, lines permuted by the rotations, one fixed per mirror
+    expect(mirClass[0].goesTo.every((x) => x === mirClass[0].self)).toBe(true);
+    expect(mirClass[0].linesFixed).toEqual([3, 0, 0, 1, 1, 1]);
+    // the diagonals: kept by id and the rotations, EXCHANGED by every mirror
+    const diagonals = profile.filter((p) => p !== rotClass[0] && p !== mirClass[0]);
+    expect(diagonals.length).toBe(2);
+    expect(diagonals[0].goesTo).toEqual([
+      diagonals[0].self, diagonals[0].self, diagonals[0].self,
+      diagonals[1].self, diagonals[1].self, diagonals[1].self,
+    ]);
+    expect(diagonals[1].goesTo).toEqual([
+      diagonals[1].self, diagonals[1].self, diagonals[1].self,
+      diagonals[0].self, diagonals[0].self, diagonals[0].self,
+    ]);
+  });
+
+  /**
+   * THE ANSWER TO "can a rep-9 charge be defined from the digit word alone".
+   *
+   * The GRADE can: sum the per-letter grades, where a letter's grade is 0 if it
+   * is inverted and ±1 by which upright class it is in. That needs no group, no
+   * basepoint and no structure — only the sign convention above — and it is
+   * EXACTLY D₃-invariant, cell for cell, at every depth: 44,280 tests, zero
+   * mismatches. Not equivariant-up-to-a-relabelling as the full charge is;
+   * invariant.
+   *
+   * The reason it survives the mirrors, which act by a TRANSDUCER and not by a
+   * digit rewrite, is that every element of S₃ preserves each grade class — the
+   * classes are cut out by the multiset {i, j, l}, which a coordinate
+   * permutation cannot change. So whatever state the transducer is in, each
+   * digit's grade is preserved and the sum with it.
+   *
+   * The vertex sum does NOT survive: the mirrors send it to c − v with c fixed
+   * by the transducer state, so the shift is word-dependent. That is where the
+   * full charge's mirror decay (54/81, 405/729, 3645/6561) comes from, and it
+   * is measured here beside the grade so the two cannot be confused.
+   */
+  it("the grade is exactly D₃-invariant at every depth; the full charge is not", () => {
+    const { grade, vertex } = canonicalCoords(3);
+    const sum = (t: readonly number[]) => (w: readonly number[]) =>
+      w.reduce((a, d) => (a + t[d]) % 3, 0);
+    const gradeOf = sum(grade);
+    const vertexOf = sum(vertex);
+    const g = GROUPS.Z3xZ3;
+    const label = coordLabelling(3, 1);
+    const maps = affineBijections(g);
+    let tests = 0;
+    let gradeBad = 0;
+    let vertexBad = 0;
+    const mirror: string[] = [];
+    for (const depth of [1, 2, 3, 4]) {
+      const cells = leaves(3, depth);
+      const N = 3 ** depth;
+      for (const [si] of S3.entries()) {
+        const image = symmetryImages(cells, N, si);
+        cells.forEach((c, i) => {
+          tests++;
+          if (gradeOf(cells[image[i]].word) !== gradeOf(c.word)) gradeBad++;
+          if (vertexOf(cells[image[i]].word) !== vertexOf(c.word)) vertexBad++;
+        });
+      }
+      if (depth >= 2) {
+        const image = symmetryImages(cells, N, 3);
+        const pairs = cells.map(
+          (c, i) =>
+            [
+              wordCharge(g, label, c.word),
+              wordCharge(g, label, cells[image[i]].word),
+            ] as const
+        );
+        mirror.push(`${bestRelabelling(g, pairs, maps).matches}/${cells.length}`);
+      }
+    }
+    expect(tests).toBe(44280);
+    expect(gradeBad).toBe(0);
+    expect(vertexBad).toBe(36 + 324 + 1458 + 26244);
+    // the full charge under m_A, for contrast — the numbers Q3 already reported
+    expect(mirror).toEqual(["54/81", "405/729", "3645/6561"]);
+
+    // GUARD-FIRE. Move one letter between grade classes — the smallest possible
+    // falsehood, still a total function Σ₉ → ℤ/3 — and the invariance dies.
+    const mutant = [...grade];
+    mutant[7] = 1;
+    const bad = sum(mutant);
+    const cells = leaves(3, 2);
+    let fired = 0;
+    for (const [si] of S3.entries()) {
+      const image = symmetryImages(cells, 9, si);
+      cells.forEach((c, i) => {
+        if (bad(cells[image[i]].word) !== bad(c.word)) fired++;
+      });
+    }
+    expect(fired).toBe(126);
+  });
+});
+
+describe("rep-9 B — what replaces the arm decomposition with no hub?", () => {
+  /**
+   * THE BRIEF'S OBVIOUS CANDIDATE IS REFUTED, and the refutation is the point.
+   *
+   * The rotation orbits cannot be the arms: the rotation FIXES each of them.
+   * They are the fibres of an invariant, and an invariant is a charge, not a
+   * decomposition into parts something permutes. The arms have to come from the
+   * OTHER canonical parallel class, which is transverse to this one — and the
+   * two jobs are exactly what P₁ and P₂ divide between them.
+   */
+  it("the rotation orbits do NOT give arms — the rotation fixes each of them", () => {
+    const perms = S3.map((s) => childPermutation(3, s.perm));
+    const norm = (l: readonly number[]) => [...l].sort((a, b) => a - b).join(",");
+    for (const orbit of rotationOrbits(3)) {
+      for (const p of perms) expect(norm(orbit.map((d) => p[d]))).toBe(norm(orbit));
+    }
+    // geometrically, at depth 3: the region under one rotation orbit is carried
+    // onto ITSELF, so no labelling of those three regions can be cyclic
+    const cells = leaves(3, 3);
+    const image = symmetryImages(cells, 27, 1);
+    const classOf = new Map<number, number>();
+    rotationOrbits(3).forEach((o, c) => o.forEach((d) => classOf.set(d, c)));
+    cells.forEach((c, i) => {
+      expect(classOf.get(cells[image[i]].word[0])).toBe(classOf.get(c.word[0]));
+    });
+  });
+
+  /**
+   * THE TRANSVERSAL IS FORCED, and Q3's "27 choices, none distinguished" was
+   * wrong on both halves.
+   *
+   * 27 is the count of TRANSVERSALS; the count of DECOMPOSITIONS is 9, since T,
+   * πT and π²T name the same three parts. And of those 9, requiring the
+   * MIRRORS to permute the parts as well as the rotation leaves exactly one —
+   * the mirror fixed sets. The rotation alone cannot see the difference, which
+   * is why Q3 found none: it was asking a question the rotation cannot answer.
+   */
+  it("9 decompositions, exactly 1 D₃-stable, and it is P₂", () => {
+    expect(rotationTransversals(3).length).toBe(27);
+    const norm = (p: readonly number[]) => [...p].sort((a, b) => a - b).join(",");
+    const distinct = new Set(
+      rotationTransversals(3).map((parts) => parts.map(norm).sort().join("|"))
+    );
+    expect(distinct.size).toBe(9);
+    const stable = d3StableTransversals(3);
+    expect(stable.length).toBe(1);
+    expect(stable[0].map(norm).sort()).toEqual(mirrorFixedSets(3).map(norm).sort());
+    // at k = 2 the construction is not even well posed: X is rotation-fixed, so
+    // a "transversal" would place it in all three parts at once. That refusal is
+    // §D's skip rule, seen from underneath.
+    expect(() => rotationTransversals(2)).toThrow();
+  });
+
+  /**
+   * WHY THE HUB IS EXCLUDED — derived, where `arms.ts` argued it.
+   *
+   * An arm label is a D₃-equivariant map from letters to the three vertices.
+   * Such a map is free on each D₃-orbit subject to one condition: the value has
+   * to be fixed by everything that fixes the letter. A letter with a mirror
+   * stabiliser has exactly one admissible value; a letter with trivial
+   * stabiliser has three; and the letter fixed by ALL of D₃ has NONE, because no
+   * vertex is fixed by all of D₃. The hub is not excluded to protect
+   * disjointness. It is excluded because there is nothing to map it to.
+   *
+   * The count of equivariant maps is 1 at k = 2 and k = 3 and at no other radix
+   * tested — the free orbits appear from k = 4 and each contributes a factor of
+   * three. So a canonical arm control exists at exactly two radices, and rep-9
+   * is the one of them with nothing left over.
+   */
+  it("the hub's exclusion is forced by equivariance; the arm map is unique only at k = 2, 3", () => {
+    const report: Record<number, { maps: number; excluded: number[] }> = {};
+    for (const k of [2, 3, 4, 5, 6, 7]) {
+      const a = armLetterMaps(k);
+      report[k] = { maps: a.maps, excluded: a.excluded };
+    }
+    expect(report).toEqual({
+      2: { maps: 1, excluded: [3] }, // X, the rep-4 hub
+      3: { maps: 1, excluded: [] }, // nothing to exclude
+      4: { maps: 3, excluded: [4] },
+      5: { maps: 9, excluded: [19] },
+      6: { maps: 27, excluded: [] },
+      7: { maps: 243, excluded: [12] },
+    });
+    // the excluded letter is exactly the D₃-fixed one Q3 tabulated
+    expect(armLetterMaps(2).excluded).toEqual(fixedLetters(2, S3[1].perm));
+    // and the two counts are computed by genuinely different routes — orbit
+    // stabilisers here, brute-force transversal enumeration there — so their
+    // agreement is a cross-check and not a restatement
+    expect(d3StableTransversals(3).length).toBe(armLetterMaps(3).maps);
+    expect(d3StableTransversals(6).length).toBe(armLetterMaps(6).maps);
+  });
+
+  /**
+   * THE DECOMPOSITION ITSELF, measured against the geometry.
+   *
+   * arm(w) = the vertex class of the FIRST digit. Three parts, 9^d/3 cells each,
+   * RESIDUAL EXACTLY ZERO at every depth — against rep-4's (4^d − 1)/3 per arm
+   * plus one hub. The rotation permutes them cyclically A → C → B and each
+   * mirror fixes its own and swaps the other two, which is the vertex action and
+   * nothing else. Congruence is checked as POINT SETS, not by counting: the
+   * rotated image of arm A is arm C key for key.
+   *
+   * The label is stable under extension — a suffix cannot change the first digit
+   * — which is the property `arms.ts` needs for isolation and the address-keyed
+   * plate to compose without either knowing about the other.
+   */
+  it("three congruent arms, 9^d/3 cells each, residual exactly 0", () => {
+    const { vertex } = canonicalCoords(3);
+    const sizes: number[][] = [];
+    for (const depth of [1, 2, 3, 4]) {
+      const cells = leaves(3, depth);
+      const N = 3 ** depth;
+      const armOf = (w: readonly number[]) => vertex[w[0]];
+      const count = [0, 0, 0];
+      for (const c of cells) count[armOf(c.word)]++;
+      expect(count.reduce((a, b) => a + b, 0)).toBe(cells.length); // residual 0
+      sizes.push(count);
+      const rot = symmetryImages(cells, N, 1);
+      const mir = symmetryImages(cells, N, 3);
+      const rotMoves = new Set<string>();
+      const mirMoves = new Set<string>();
+      cells.forEach((c, i) => {
+        rotMoves.add(`${armOf(c.word)}->${armOf(cells[rot[i]].word)}`);
+        mirMoves.add(`${armOf(c.word)}->${armOf(cells[mir[i]].word)}`);
+      });
+      expect([...rotMoves].sort()).toEqual(["0->2", "1->0", "2->1"]);
+      expect([...mirMoves].sort()).toEqual(["0->0", "1->2", "2->1"]);
+    }
+    expect(sizes).toEqual([
+      [3, 3, 3],
+      [27, 27, 27],
+      [243, 243, 243],
+      [2187, 2187, 2187],
+    ]);
+    // congruent as POINT SETS: rotate arm A and land on arm C exactly
+    const cells = leaves(3, 3);
+    const armA = cells.filter((c) => vertex[c.word[0]] === 0);
+    const armC = new Set(
+      cells.filter((c) => vertex[c.word[0]] === 2).map((c) => triKey(c.tri, 27))
+    );
+    const rotated = armA.map((c) => triKey(permuteTri(c.tri, S3[1].perm), 27));
+    expect(rotated.length).toBe(armC.size);
+    expect(rotated.every((k) => armC.has(k))).toBe(true);
+
+    // GUARD-FIRE, and it is the sharp one rather than the easy one. Take one of
+    // the other eight decompositions — {0,1,6}, its rotation images {2,5,8} and
+    // {3,4,7}. It is a genuine transversal of the rotation orbits, so the parts
+    // stay EQUAL IN SIZE and the rotation still permutes them cyclically: every
+    // gate a rotation-only argument can raise stays green. What dies is the
+    // mirror, which is exactly the condition Q3 never imposed and the reason it
+    // concluded nothing was distinguished.
+    const rival = [0, 1, 6];
+    const rotPerm = childPermutation(3, S3[1].perm);
+    const rivalArm = new Array<number>(9).fill(-1);
+    rival.forEach((d) => {
+      rivalArm[d] = 0;
+      rivalArm[rotPerm[d]] = 1;
+      rivalArm[rotPerm[rotPerm[d]]] = 2;
+    });
+    expect(rivalArm.every((a) => a >= 0)).toBe(true);
+    const rivalCount = [0, 0, 0];
+    for (const c of cells) rivalCount[rivalArm[c.word[0]]]++;
+    expect(rivalCount).toEqual([243, 243, 243]); // still equal
+    const rotImage = symmetryImages(cells, 27, 1);
+    const mirImage = symmetryImages(cells, 27, 3);
+    const rivalRot = new Set(
+      cells.map((c, i) => `${rivalArm[c.word[0]]}->${rivalArm[cells[rotImage[i]].word[0]]}`)
+    );
+    expect([...rivalRot].sort()).toEqual(["0->1", "1->2", "2->0"]); // still cyclic
+    const rivalMir = new Set(
+      cells.map((c, i) => `${rivalArm[c.word[0]]}->${rivalArm[cells[mirImage[i]].word[0]]}`)
+    );
+    expect(rivalMir.size).toBeGreaterThan(3); // not a permutation of the parts
+  });
+
+  /**
+   * THE INDUCED ACTION, and it is `arms.ts`'s table unchanged.
+   *
+   * The setwise stabiliser of arm A in D₃ is ⟨m_A⟩ of order 2: the rotations
+   * carry the arm off itself, and of the three mirrors only m_A fixes it. So
+   * clipping a symmetry brush to one arm leaves exactly the ⟨m_A⟩ orbit —
+   *
+   *   mode 1 → 1     mode 2 → unchanged     mode 3 → 1     mode 6 → mode 2
+   *
+   * measured at depth 3 over all 243 cells of arm A. Mode 3 paints what mode 1
+   * paints and mode 6 paints what mode 2 paints, exactly as at rep-4, and for
+   * exactly the same reason. What has changed is that there is no hub to be
+   * unreachable while an arm is isolated.
+   */
+  it("isolating an arm clips the orbit to ⟨m_A⟩ — mode 3 → mode 1, mode 6 → mode 2", () => {
+    const { vertex } = canonicalCoords(3);
+    const cells = leaves(3, 3);
+    const image = S3.map((_, si) => symmetryImages(cells, 27, si));
+    const modes: [number, number[]][] = [
+      [1, [0]],
+      [2, [0, 3]],
+      [3, [0, 1, 2]],
+      [6, [0, 1, 2, 3, 4, 5]],
+    ];
+    const report: Record<string, string> = {};
+    for (const [mode, elements] of modes) {
+      const full = new Map<number, number>();
+      const clipped = new Map<number, number>();
+      cells.forEach((c, i) => {
+        if (vertex[c.word[0]] !== 0) return;
+        const orbit = new Set(elements.map((e) => image[e][i]));
+        full.set(orbit.size, (full.get(orbit.size) ?? 0) + 1);
+        const inside = [...orbit].filter((j) => vertex[cells[j].word[0]] === 0).length;
+        clipped.set(inside, (clipped.get(inside) ?? 0) + 1);
+      });
+      const fmt = (m: Map<number, number>) =>
+        [...m].sort((a, b) => a[0] - b[0]).map(([k, v]) => `${k}×${v}`).join(" ");
+      report[`mode${mode}`] = `${fmt(full)} | ${fmt(clipped)}`;
+    }
+    expect(report).toEqual({
+      mode1: "1×243 | 1×243",
+      mode2: "1×27 2×216 | 1×27 2×216",
+      mode3: "3×243 | 1×243",
+      mode6: "3×27 6×216 | 1×27 2×216",
+    });
+  });
+
+  /**
+   * THE DOWNSTREAM CONSTRAINT: does a single-digit rotation law cost the arms?
+   *
+   * It does not, and the reason is that they live at different levels. Under the
+   * `ifs`-style frames the rotation is a UNIFORM digit rewrite; under the frames
+   * `rotationFrames` solves for it rewrites ONLY THE FIRST DIGIT — 729 of 729
+   * cells at depth 3, and 0 of 729 the other way round, so the two conventions
+   * are genuinely different addressings of the same triangles. The construction
+   * is the one rep-4 cannot have: the recurrence F(π d) = r ∘ F(d) closes iff
+   * the rotation acts freely, and at rep-4 the orbit through X has length one.
+   *
+   * Across that convention change, at depth 3:
+   *
+   *   the ARM of every cell is unchanged   729/729  — it reads the first digit,
+   *                                                  which no convention moves
+   *   the GRADE of every cell is unchanged 729/729  — a convention rewrites
+   *                                                  digits by elements of S₃,
+   *                                                  and S₃ preserves the grade
+   *                                                  classes
+   *   the VERTEX SUM is not               243/729   — the part that was never
+   *                                                  canonical anyway
+   *
+   * So the two demands are simultaneously satisfiable, and more than that: the
+   * arm decomposition and the grade charge are invariants of the CELL, immune to
+   * both the symmetry applied and the addressing convention chosen. There is no
+   * trade to price.
+   */
+  it("the single-digit rotation law and the arm decomposition hold at once", () => {
+    const frames = rotationFrames(3);
+    expect(frames).toEqual([0, 0, 2, 1, 1, 2, 0, 1, 2]);
+    expect(() => rotationFrames(2)).toThrow();
+    const rot = childPermutation(3, S3[1].perm);
+    const counts: Record<string, number> = {};
+    for (const depth of [2, 3]) {
+      const N = 3 ** depth;
+      for (const [name, cells] of [
+        ["framed", framedLeaves(3, depth, frames)],
+        ["ifs", leaves(3, depth)],
+      ] as const) {
+        const image = symmetryImages(cells, N, 1);
+        let single = 0;
+        let uniform = 0;
+        cells.forEach((c, i) => {
+          const w = cells[image[i]].word;
+          if (w[0] === rot[c.word[0]] && w.slice(1).every((d, j) => d === c.word[j + 1])) single++;
+          if (w.every((d, j) => d === rot[c.word[j]])) uniform++;
+        });
+        counts[`${name}${depth}single`] = single;
+        counts[`${name}${depth}uniform`] = uniform;
+      }
+    }
+    expect(counts).toEqual({
+      framed2single: 81,
+      framed2uniform: 0,
+      framed3single: 729,
+      framed3uniform: 0,
+      ifs2single: 0,
+      ifs2uniform: 81,
+      ifs3single: 0,
+      ifs3uniform: 729,
+    });
+
+    // and what the convention change does to the three quantities
+    const { grade, vertex } = canonicalCoords(3);
+    const sum = (t: readonly number[]) => (w: readonly number[]) =>
+      w.reduce((a, d) => (a + t[d]) % 3, 0);
+    const gradeOf = sum(grade);
+    const vertexOf = sum(vertex);
+    const ifs = leaves(3, 3);
+    const byKey = new Map(ifs.map((c) => [triKey(c.tri, 27), c.word]));
+    let sameGrade = 0;
+    let sameVertex = 0;
+    let sameArm = 0;
+    for (const c of framedLeaves(3, 3, frames)) {
+      const other = byKey.get(triKey(c.tri, 27)) as number[];
+      if (gradeOf(c.word) === gradeOf(other)) sameGrade++;
+      if (vertexOf(c.word) === vertexOf(other)) sameVertex++;
+      if (vertex[c.word[0]] === vertex[other[0]]) sameArm++;
+    }
+    expect([sameGrade, sameVertex, sameArm]).toEqual([729, 243, 729]);
   });
 });

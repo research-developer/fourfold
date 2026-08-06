@@ -423,6 +423,19 @@ a declared basepoint, the transversal arms — should not start until that lands
 chosen by fiat, its arms a transversal chosen by fiat, and both choices would
 harden into the file format before anyone has decided what they mean.
 
+> **HALF RETRACTED — see `docs/rep9-charge.md`.** The arms need **no fiat at
+> all**: requiring the *mirrors* (not merely the rotation) to permute the parts
+> cuts 27 transversals to 9 decompositions to **exactly one**. Q3's "27 choices,
+> none distinguished" was true of the rotation alone and false of D₃. The charge
+> reduces to **one bit** — which upright class is +1 — and that bit is never
+> serialised. Rep-9's residual freedom is `Aut(ℤ/3)`, order 2, against rep-4's
+> `Aut(V₄)`, order 6: **rep-9 is the less arbitrary of the two.**
+>
+> Also corrected there: this document's "[PROVEN] the rotation's linear part is
+> exactly the identity" came from a **single witness**. The 1,296 affine
+> labellings fall into **three** classes of 432, and that property holds in only
+> one of them — it is a property of the structure we want, not of the torsor.
+
 ---
 
 ## Artifacts
