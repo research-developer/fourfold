@@ -20,14 +20,24 @@ oracles. Labels follow the house convention:
 **Three of the brief's five framings were wrong, and the most important one was
 wrong in both directions at once.** Q5 is the headline and it is a refutation.
 
-**Float:** `src/lib/warp.ts` contains none — no `Math.`, no division on
-`number`, no `number` used as a coordinate past the lattice. Warped coordinates
-are exact rationals over `bigint`; ring elements are exact `a + b√3`; even the
-decimals quoted below are rendered in `bigint` by `rToFixed`. `test/warp.test.ts`
-has float in exactly one `it`, marked FLOAT ORACLE, which cross-checks the ring
-values of §R against `Math.tan` and decides nothing. The display boundary this
-work is *about* is `figure.toXY` and `hexagon.latticeToPixel`; neither is touched
-and neither is called.
+**Float:** `src/lib/warp.ts` contains none on any decision path. Warped
+coordinates are exact rationals over `number` with **every product routed through
+a `safe()` overflow guard** — the discipline `reptile.ts` already uses. Ring
+elements are exact `a + b√3`; even the decimals quoted below are emitted digit by
+digit. `test/warp.test.ts` has float in one `it` marked FLOAT ORACLE (cross-checks
+§R against `Math.tan`, decides nothing) and in one `Math.log2` used to *report* a
+bit width. The display boundary this work is *about* is `figure.toXY` and
+`hexagon.latticeToPixel`; neither is touched and neither is called.
+
+**Arithmetic:** plain `number`, deliberately. An earlier draft used `bigint`; that
+was answering the wrong question. The exactness argument belongs to the **ring**
+and the production arithmetic belongs to **`floang-core`'s RNS path**
+(`rationall-dev@feat/bigdozenal-rns-montgomery`), where *"the only carries are the
+⌈log₂ mᵢ⌉-bit modular reductions, bounded by the modulus width, not by 2·W"* and
+CRT is exact for any `|result| < 𝓜/2`. So machine-word width is not a constraint
+to route around — it is a **lane-sizing input**, and what a scoping prototype owes
+the design is a *number*, not a wider type. Where the guard fires, that is the
+measurement. See Q2 below.
 
 ---
 
@@ -143,9 +153,6 @@ divisions — and every row sums to it. Verified on rep-4 words, rep-9 words, an
 > arrived at in bigger steps. This is `rep-tile-findings.md` Q4's cost law
 > restated for the derive-on-demand path.
 
-At this program's `MAX_DEPTH` of 5 the widest accumulator entry is **32**. The
-descent would not leave `number`'s exact range until depth **53**.
-
 ### The costs, measured
 
 | depth | cells | distinct V | derive all (O(d)) | build table (O(V)) | lookup all (O(1)) |
@@ -193,37 +200,82 @@ a period of 10 — **19 bits per 10 levels**, which is log₂(2 + √3) = 1.9004
 four places, knowable from the factor alone without computing it. A JavaScript
 `number` runs out at **k = 29** (`safeIntegerDepth(ε̄) = 29`).
 
-### On BigInt, since it was challenged
+### ★ The dynamic range, and the lane count — which is what Q2 is actually asking
 
-Two width laws, and they must not be confused:
+Not "how wide an integer". **What dynamic range does each composition need at
+each reachable depth, and how many RNS lanes is that?** Reported against the RNS
+demo's own default family, `pow2_adjacent_base(k) = {2^k−1, 2^k, 2^k+1}` — always
+**three lanes**, with 𝓜 ≈ 2^{3k} and a signed window ±2^{3k−1}. A measurement
+fixes *k*.
 
-| path | per-level cost | denominator? | leaves 2^53 at |
+**1. The rep-tile descent [PROVEN].** The widest accumulator entry is **exactly
+the scale**, because the rows are barycentric weights summing to it — so the range
+is knowable from the depth alone, before any geometry exists.
+
+| depth | scale | bits | lanes × width |
 |---|---|---|---|
-| rep-tile descent, rep-4 | 1 bit | no (single denom = scale) | depth 53 |
-| rep-tile descent, rep-9 | log₂3 ≈ 1.585 bits | no | depth 33 |
-| FlowAngle unit composition | ≈1.9 bits | **no** | k = **29** |
-| FlowAngle non-unit (120°) | ≈0.79 bits of denominator | **yes**, 3^⌈k/2⌉ | k ≈ 67 |
-| fold-re cubic Bézier §11 | 3 bits | yes, D0·8^k | k = 16 from D0 = 48 |
+| 1 | 2 | 2 | 3 × 1 |
+| 2 | 4 | 3 | 3 × 2 |
+| 3 | 8 | 4 | 3 × 2 |
+| 4 | 16 | 5 | 3 × 2 |
+| **5 (`MAX_DEPTH`)** | 32 | 6 | **3 × 3** |
 
-**The proposal does not need BigInt.** At `MAX_DEPTH` 5 the descent's widest
-entry is 32, and unit composition is safe to 29 levels.
+One 3-bit lane triple covers the entire shipped range. **The descent is not where
+any width pressure lives.**
 
-**The instrument does** [MEASURED]. `warp.ts` decides Q3 and Q5 by *exact
-rational polygon clipping* — intersection parameters, affine combinations at those
-parameters, areas that are sums of products of them. `ratWidth()` reports the
-widest values actually formed on the Q5 run: **45-bit numerators, 43-bit
-denominators**, whose pairwise products reach ~90 bits. That is past 2^53, so the
-choice is forced *for the measuring apparatus*, not for the thing measured.
+**2. The unit composition [PROVEN].** ε̄^k is an integer pair forever with N = 1, so
+there is no denominator to size — only coefficients, at 19 bits per 10 levels.
 
-`tsconfig.json` targets ES2017, where BigInt **literals** are a syntax error while
-the `BigInt()` constructor and the `bigint` type (via `lib: esnext`) are fine —
-so `warp.ts` writes `B0`, `B1`, … and `rat()` accepts `number | bigint` so no
-caller writes a literal. **An ES2020 target bump is the cleaner long-run fix and
-is deliberately not made here**; it is a build-config change with browser-support
-implications and belongs in its own diff. `tsc --noEmit` and `eslint` are clean
-as it stands.
+- the **product** composes to **k = 28** in one exact machine word (bits(a₂₈) = 53);
+- **k = 64 would need 3 lanes × 42 bits**, computed from the rate, not measured;
+- **★ the NORM runs out at k = 14 — half the depth of the product.** `a² − 3b²`
+  squares the coefficients, so the Galois error **check** needs 2·W where the
+  product needs W.
 
----
+That last line is the one to carry: **the check is wider than the thing it
+checks**, which is exactly why `floang_core::ring_arena::RingPair` carries
+`norm_i128` beside an i64 product, and why `RATIONAL.md`'s objection to schoolbook
+("the adders are 2·W bits") bites hardest on the norm.
+
+**3. The clipper [MEASURED].** Exact rational polygon clipping is a genuinely
+different law: width grows with the number of **clip stages**, not with depth.
+Swept over the T-junction displacement:
+
+| δ | | bits | lanes × width |
+|---|---|---|---|
+| 1/8 | fits | 40 | 3 × 14 |
+| 1/16 | fits | 49 | 3 × 17 |
+| **1/32** | **fits** | **50** | **3 × 17** |
+| 1/64 | **exceeds one word** | 54 | 3 × 19 |
+
+So δ = 1/32 is the smallest displacement this configuration resolves in a machine
+word. **This bounds the demonstration, not the finding** — Q5's law is that the
+crack opens at *any* ε, and the lens area `2mδ` is exact at every δ tested down to
+1/1048576 (it forms no products).
+
+### ★ The ring multiply is not mine — it is `floang-core`'s, and I checked against theirs
+
+`z3Mul` here is the same operation as `floang_core::ring_arena::RingPair::mul` and
+`demos/rns-ring-multiply-synth/rns_ring_multiply.RingZd.mul_schoolbook`, which
+`RATIONAL.md` names as *the* multiply that matters — *"a Bezier control point ×
+Bernstein coefficient"*. Their RTL, Python and Rust paths already agree 128/128.
+
+**So this is deliberately not a second implementation to maintain.** It is a
+scoping restatement, decided against **their** checked-in vectors
+(`crates/floang-core/tests/fixtures/rns_ring_multiply_operands.csv`); twelve rows
+are quoted verbatim in the test — first, last and a spread — and all twelve agree
+on `a_out` and `b_out`. **Production arithmetic should call theirs.**
+
+> **And their own fixture makes the width point independently [PROVEN].** Across
+> their 128 rows the products top out at **32 bits** and fit a machine word
+> comfortably; the norms reach **63 bits**, and **113 of 128 exceed 2^53**. On the
+> twelve rows checked here, 4 norms are computable in one word and 8 are not — and
+> the cleanest witness is row 10, whose `n_z` is 2.4 × 10¹⁵ and *fits* while the
+> `a²` it is computed from is 1.98 × 10¹⁷ and does not. **3 lanes × 22 bits**
+> covers both the norm and its intermediates.
+
+Nothing in §R re-implements `snellius_pi.py` either: that computes π digits three
+ways and shares only the ring and the ε̄ constant, not the object.
 
 ## Q3 — does a warp preserve containment? **Not across scales. It is a threshold, and the threshold vanishes under refinement.**
 
@@ -386,12 +438,14 @@ exact-area answer for the configuration under test cannot be a tautology.
 | shear λ=1/8 | −128 | 138 | 84 | 14 | **0** | **0** | 0.8889 | 0.8333 |
 | bump +3/2 | 24 | 332 | 280 | 15 | **0** | 1 | 0.99998 | 1.0000 |
 | bump +1/16 | 1 | 322 | 294 | 14 | **0** | **0** | 0.0622 | 0.0583 |
-| **bump +1/1024** | 1/64 | 322 | 294 | 14 | **0** | **0** | 0.00092 | 0.00091 |
+| **bump +1/32** | 1/2 | 322 | 294 | 14 | **0** | **0** | 0.03027 | 0.02917 |
 
 [PROVEN.] **Both tiers break, and the exact-area tier — the one the brief expected
 to survive — is the one reporting a real hole**, because the geometry genuinely
 stops partitioning: the chord configuration stops covering 28 of 322 region cells
-at a displacement of one part in 1,024.
+at a displacement of one part in 32, the smallest this configuration resolves in a
+machine word (see the dynamic-range section — the bound is on the demonstration,
+not on the law).
 
 The linear model breaks by **very nearly the same amount** (0.00091 against
 0.00092), because the two sides are now reading two *different* segments and
@@ -422,8 +476,8 @@ non-affine shear [PROVEN].
 > recorded **1.222×** cost for `exact-boundary` is *not* incurred by adding a
 > warp. What the exact-area tier buys is something else and arguably more
 > valuable: **it is the only tier that detects a T-junction crack at all**, since
-> the linear model at 1/1024 displacement is wrong by 0.0009 — a number no
-> model-internal check would flag. That is §10.2's lesson repeating ("the two
+> the linear model at δ = 1/32 is wrong by 0.0292 while the truth is 0.0303, and
+> both shrink with δ — a discrepancy no model-internal check would flag. That is §10.2's lesson repeating ("the two
 > model weights still summed to 1 on every one of these cells, which is precisely
 > why a model-internal check could never have caught it"), and here it is the
 > exact-area oracle catching a *geometry* error rather than a *model* error.
@@ -503,6 +557,9 @@ What the measurements support:
 3. **The warp at the display boundary** — free on same-scale seams, in both α
    tiers, under strongly non-affine maps.
 4. **The FlowAngle hexagon** — already the shipped canvas, exactly, in ℤ[√3].
+5. **The arithmetic is not a problem** — the descent needs 3 lanes × 3 bits at
+   `MAX_DEPTH`, and the ring product is already built, verified and synthesised in
+   `floang-core`. Nothing here should grow a second one.
 
 What they do **not** support, and what has to be a stated rule rather than an
 assumption:
@@ -522,7 +579,7 @@ Three consequences, each with a number attached:
   it, the linear identity is exact. Without it, both tiers break at any ε.
 - **The exact-area tier's value is detection, not complementarity** (Q5). It is
   not needed to keep α_L + α_R = 1 under curvature; it is the only thing that
-  sees a 1/1024 crack.
+  sees a sub-cell crack at all.
 
 ### The first honest increment
 
@@ -550,9 +607,10 @@ edited nothing outside its three files):
   something reads it. No change is required for the increment above.
 - `src/lib/scale.ts` — unchanged. `radixAt`'s signature is what makes `deriveCell`
   possible at all, and Q2 depends on it.
-- `tsconfig.json` — an ES2020 `target` bump would let `warp.ts` use BigInt
-  literals. **Not made here**; it is a build-config change and belongs in its own
-  diff. Nothing is blocked without it.
+- `tsconfig.json` — **nothing needed.** An earlier draft would have wanted an
+  ES2020 target for BigInt literals; the `number`-plus-guard rewrite removed the
+  requirement, and `tsc --noEmit` and `next build` are clean under ES2017 as it
+  stands.
 - Anything that would test containment on warped coordinates — nothing does today,
   and Q3 says nothing should.
 
@@ -560,14 +618,16 @@ edited nothing outside its three files):
 
 ## Artifacts
 
-- `src/lib/warp.ts` — exact rationals over `bigint`, the vertex census, the
+- `src/lib/warp.ts` — exact rationals over `number` behind a `safe()` range
+  guard, the range meter and `laneCount`, the vertex census, the
   descent-as-matrix-product, three warp families with an exhibited inverse, exact
   convex clipping and both α tiers, the partition gate, the T-junction, and the
-  ℤ[√3] apex machinery. No float. Nothing in `src/app` imports it.
-- `test/warp.test.ts` — **28 tests**, every number above.
-- Suite: **1,573 → 1,601**, none of the existing tests modified.
+  ℤ[√3] apex machinery. No float on a decision path. Nothing in `src/app` imports
+  it.
+- `test/warp.test.ts` — **31 tests**, every number above.
+- Suite: **1,573 → 1,604**, none of the existing tests modified.
   (Baseline at the start of this pass was 1,541; a concurrent lane added 32.)
-- `tsc --noEmit` clean; `eslint` clean.
+- `tsc --noEmit` clean; `eslint .` clean; `next build` succeeds.
 - Lethality: five guard-fires, each shown red — the de-identified census (Q1), the
   permuted frame (Q2, 3,416 mismatches), the sagitta-1/2 warp (Q3), the unshared
   bump (Q4, 260 vs 256 with a fold), and the un-stitched T-junction (Q5).

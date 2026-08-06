@@ -30,9 +30,10 @@
  *
  * NOWHERE IN THIS FILE. There is no `Math.` call, no `/` on numbers, and no
  * `number` used as a coordinate past the lattice. Warped coordinates are exact
- * rationals over `bigint` (`Rat`); ring elements are exact `a + b√3` over the
- * same rationals (`Z3`). `rToFixed` renders a decimal for a report and does it in
- * `bigint` with explicit rounding, so even the human-readable numbers are exact.
+ * rationals over `number` with every product routed through a `safe()` overflow
+ * guard (`Rat`); ring elements are exact `a + b√3` over the same rationals
+ * (`Z3`). `rToFixed` renders a decimal digit by digit, so even the
+ * human-readable numbers are exact and no wide intermediate is formed.
  *
  * The display boundary this module is ABOUT is `figure.toXY` and
  * `hexagon.latticeToPixel`, which are the two places the shipped program divides
@@ -66,118 +67,146 @@ import {
 import { baryToLat, rotK, type Lat } from "./hexagon";
 
 // ═════════════════════════════════════════════════════════════════════════
-// EXACT RATIONALS
+// EXACT RATIONALS OVER `number`, WITH A HARD GUARD
 // ═════════════════════════════════════════════════════════════════════════
 //
-// ── WHY `bigint` HERE, WHEN NOTHING ELSE IN THIS REPO USES IT ────────────
+// ── The arithmetic type is not the question. The DYNAMIC RANGE is. ───────
 //
-// It was challenged, and the challenge was right to make: `figure.ts`,
-// `hexagon.ts` and `reptile.ts` all do exact integer geometry in plain `number`,
-// which is exact to 2^53, and the lattice magnitudes are tiny. So the default
-// answer should be `number`, and `bigint` needs a measured reason.
+// An earlier draft of this module used `bigint`, on the reasoning that exact
+// rational clipping forms wide intermediates. That was answering the wrong
+// question. The exactness argument belongs to the RING, and the production
+// arithmetic belongs to `floang-core`'s RNS path — see
+// `rationall-dev@feat/bigdozenal-rns-montgomery`,
+// `demos/rns-ring-multiply-synth/RATIONAL.md`:
 //
-// It has one, and the reason is a DIFFERENT law from the descent's. Two widths
-// are in play and they must not be confused:
+//   > In RNS the only carries are the ⌈log₂ mᵢ⌉-bit modular reductions, BOUNDED
+//   > BY THE MODULUS WIDTH, NOT BY 2·W. … As long as |result| < 𝓜/2, CRT is
+//   > exact — the RNS path returns bit-for-bit the same (a_out, b_out) as the
+//   > schoolbook (verified: 128/128 RTL vectors, 128/128 Rust).
 //
-//   THE DESCENT (Q2). `deriveCell` composes affine maps as INTEGER 3×3 matrices
-//   in plain `number`, guarded by `Number.isSafeInteger`. Its denominator is the
-//   scale — the product of the edge divisions — and nothing more: 1 bit per
-//   rep-4 level, log₂3 ≈ 1.585 bits per rep-9 level. At MAX_DEPTH it is a
-//   two-digit number. `bigint` is NOT needed for the thing the proposal is about,
-//   and that is itself the Q2 finding.
+// So the width of a machine word is not a constraint to be worked around; it is
+// a LANE SIZING INPUT. What a scoping prototype owes the design is therefore not
+// a wider integer type but a NUMBER: the dynamic range each operation actually
+// needs at each reachable depth, from which the moduli set is sized once.
 //
-//   THE WARP MEASUREMENT (Q3/Q5). Exact rational clipping is a different animal:
-//   an intersection parameter is a quotient, a clipped vertex is an affine
-//   combination at that parameter, and an area is a sum of products of those. Each
-//   clip stage multiplies denominators, so the width grows with the number of
-//   stages rather than with the depth. `ratWidth()` reports the widest numerator
-//   and denominator any run actually formed, and `test/warp.test.ts` prints it —
-//   so the choice is defended by a measurement instead of by a habit.
+// Hence: plain `number`, and every product routed through `safe()` — exactly the
+// discipline `reptile.ts` already uses ("a measurement instrument that can lie is
+// worthless"). Where the guard fires, that is not a failure of the prototype; it
+// is the measurement, and `rangeReport()` turns it into a lane count.
 //
-// The literals are written `B0`, `B1`, … rather than `0n`, `1n` because
-// `tsconfig.json` targets ES2017, where BigInt LITERALS are a syntax error while
-// the `BigInt()` constructor and the `bigint` type (via `lib: esnext`) are fine.
-// Bumping the target is a build-config change with browser-support implications
-// and belongs in someone else's diff, not in a measurement module's.
+// This also clears `tsc --noEmit` and `next build` under the repo's ES2017
+// target with no config change, which was the immediate need.
 
-const B0 = BigInt(0);
-const B1 = BigInt(1);
-const B2 = BigInt(2);
-const B3 = BigInt(3);
-const B10 = BigInt(10);
-const BM1 = BigInt(-1);
-
-/** n/d in lowest terms, d > 0. */
+/** n/d in lowest terms, d > 0. Both are exact integers below 2^53. */
 export interface Rat {
-  readonly n: bigint;
-  readonly d: bigint;
+  readonly n: number;
+  readonly d: number;
 }
 
 /**
- * THE WIDTH METER. The widest numerator and denominator `rat` has normalised
- * since the last reset, as bit counts.
+ * THE RANGE METER. The widest magnitude any guarded operation has formed since
+ * the last reset — INCLUDING un-normalised intermediates, which is the number
+ * that actually sizes a datapath.
  *
- * This exists to answer "is bigint actually needed" with a number rather than an
- * opinion, and it is the same shape of measurement fold-re's §11 states for its
- * curve path (`D_k = D0·8^k`, three bits of denominator per subdivision level).
- * A meter that is never read is decoration; `test/warp.test.ts` asserts on it.
+ * Reported as bits, and converted to a lane count by `laneCount` below. A meter
+ * that is never read is decoration; `test/warp.test.ts` asserts on this one.
  */
-let widestN = B1;
-let widestD = B1;
+let widest = 1;
 
-const bitsOf = (v: bigint): number => (v < B0 ? -v : v).toString(2).length;
-
-export const ratWidth = (): { readonly bitsNum: number; readonly bitsDen: number } => ({
-  bitsNum: bitsOf(widestN),
-  bitsDen: bitsOf(widestD),
-});
-
-export const ratWidthReset = (): void => {
-  widestN = B1;
-  widestD = B1;
+const bitsOf = (v: number): number => {
+  const a = Math.abs(v);
+  return a < 1 ? 1 : a.toString(2).replace(/[-.].*$/, "").length;
 };
 
-const bgcd = (a: bigint, b: bigint): bigint => {
-  let x = a < B0 ? -a : a;
-  let y = b < B0 ? -b : b;
+/**
+ * Every product, sum-of-products and quotient numerator passes through here.
+ * Throwing rather than silently rounding is the whole point: a prototype whose
+ * answer degrades quietly past 2^53 would report Q5's identities as holding when
+ * they had merely stopped being computed.
+ */
+function safe(x: number): number {
+  const a = Math.abs(x);
+  if (a > widest) widest = a;
+  if (!Number.isSafeInteger(x)) {
+    throw new Error(
+      `warp: exact range exceeded (${x}) — this is a MEASUREMENT, not a bug: ` +
+        `the operation needs ${bitsOf(x)} bits, see rangeReport()`
+    );
+  }
+  return x;
+}
+
+export interface RangeReport {
+  /** Widest magnitude formed, in bits. */
+  readonly bits: number;
+  /**
+   * Lanes needed under `rns_ring_multiply.pow2_adjacent_base(k)` — the classic
+   * low-cost triple {2^k−1, 2^k, 2^k+1}, whose dynamic range is
+   * 𝓜 = 2^k(2^{2k}−1) ≈ 2^{3k} with a signed window of ±2^{3k−1}.
+   *
+   * That base is ALWAYS three lanes; what the measurement fixes is the lane
+   * WIDTH k. Reported as both, because "three lanes of 16 bits" is the sentence
+   * a hardware design needs and "62 bits" is not.
+   */
+  readonly lanes: number;
+  readonly laneBits: number;
+}
+
+/** k = ⌈(bits + 1)/3⌉ for the {2^k−1, 2^k, 2^k+1} triple. Three lanes, always. */
+export const laneCount = (bits: number): RangeReport => ({
+  bits,
+  lanes: 3,
+  laneBits: Math.ceil((bits + 1) / 3),
+});
+
+export const rangeReport = (): RangeReport => laneCount(bitsOf(widest));
+export const rangeReset = (): void => {
+  widest = 1;
+};
+
+/**
+ * The same measurement WITHOUT the throw, for probing where a composition's
+ * range boundary lies. Returns null when the operation would leave exact range.
+ */
+export function tryMul(a: number, b: number): number | null {
+  const x = a * b;
+  return Number.isSafeInteger(x) ? x : null;
+}
+
+const igcd = (a: number, b: number): number => {
+  let x = Math.abs(a);
+  let y = Math.abs(b);
   while (y) [x, y] = [y, x % y];
   return x;
 };
 
-/**
- * Takes `number | bigint` so no CALLER has to write a BigInt literal — which is
- * both an ES2017 syntax constraint and, more usefully, what keeps this module's
- * arithmetic choice from leaking into every test that wants a third.
- */
-export function rat(n: number | bigint, d: number | bigint = B1): Rat {
-  const nn = BigInt(n);
-  const dd = BigInt(d);
-  if (dd === B0) throw new Error("warp: zero denominator");
-  const s = dd < B0 ? BM1 : B1;
-  const g = bgcd(nn, dd) || B1;
-  const out = { n: (s * nn) / g, d: (s * dd) / g };
-  const an = out.n < B0 ? -out.n : out.n;
-  if (an > widestN) widestN = an;
-  if (out.d > widestD) widestD = out.d;
-  return out;
+export function rat(n: number, d = 1): Rat {
+  if (d === 0) throw new Error("warp: zero denominator");
+  safe(n);
+  safe(d);
+  const s = d < 0 ? -1 : 1;
+  const g = igcd(n, d) || 1;
+  return { n: (s * n) / g, d: (s * d) / g };
 }
 
-export const rInt = (n: number | bigint): Rat => ({ n: BigInt(n), d: B1 });
-export const R0 = rInt(0);
-export const R1 = rInt(1);
+export const rInt = (n: number): Rat => ({ n: safe(n), d: 1 });
+export const R0: Rat = { n: 0, d: 1 };
+export const R1: Rat = { n: 1, d: 1 };
 
-export const rAdd = (x: Rat, y: Rat): Rat => rat(x.n * y.d + y.n * x.d, x.d * y.d);
-export const rSub = (x: Rat, y: Rat): Rat => rat(x.n * y.d - y.n * x.d, x.d * y.d);
-export const rMul = (x: Rat, y: Rat): Rat => rat(x.n * y.n, x.d * y.d);
+export const rAdd = (x: Rat, y: Rat): Rat =>
+  rat(safe(safe(x.n * y.d) + safe(y.n * x.d)), safe(x.d * y.d));
+export const rSub = (x: Rat, y: Rat): Rat =>
+  rat(safe(safe(x.n * y.d) - safe(y.n * x.d)), safe(x.d * y.d));
+export const rMul = (x: Rat, y: Rat): Rat => rat(safe(x.n * y.n), safe(x.d * y.d));
 export const rDiv = (x: Rat, y: Rat): Rat => {
-  if (y.n === B0) throw new Error("warp: division by zero");
-  return rat(x.n * y.d, x.d * y.n);
+  if (y.n === 0) throw new Error("warp: division by zero");
+  return rat(safe(x.n * y.d), safe(x.d * y.n));
 };
 export const rNeg = (x: Rat): Rat => ({ n: -x.n, d: x.d });
-export const rSign = (x: Rat): number => (x.n > B0 ? 1 : x.n < B0 ? -1 : 0);
+export const rSign = (x: Rat): number => (x.n > 0 ? 1 : x.n < 0 ? -1 : 0);
 export const rCmp = (x: Rat, y: Rat): number => rSign(rSub(x, y));
 export const rEq = (x: Rat, y: Rat): boolean => x.n === y.n && x.d === y.d;
-export const rAbs = (x: Rat): Rat => (x.n < B0 ? rNeg(x) : x);
+export const rAbs = (x: Rat): Rat => (x.n < 0 ? rNeg(x) : x);
 export const rMax = (x: Rat, y: Rat): Rat => (rCmp(x, y) >= 0 ? x : y);
 
 /** Clamp to [0, 1]. The residue model's clamp, exactly. */
@@ -185,28 +214,44 @@ export const rClamp01 = (x: Rat): Rat =>
   rSign(x) < 0 ? R0 : rCmp(x, R1) > 0 ? R1 : x;
 
 /**
- * A fixed-point decimal rendering, computed in `bigint` with round-half-away.
+ * A fixed-point decimal rendering, digit by digit, with no wide product.
  *
- * For reports only. It exists so that a findings document can quote 5.33 without
- * this file ever forming a float — the alternative being `Number(x.n)/Number(x.d)`,
- * which would put a float in a module whose entire claim is that it has none.
+ * For reports only. The naive `n·10^p / d` would form exactly the kind of
+ * intermediate this module exists to measure, so the integer part is taken first
+ * and the fraction is emitted one digit at a time from the remainder — every
+ * step bounded by 10·d.
  */
 export function rToFixed(x: Rat, places: number): string {
-  const p = B10 ** BigInt(places);
-  const neg = x.n < B0;
-  const a = neg ? -x.n : x.n;
-  const scaled = (a * p * B2 + x.d) / (x.d * B2);
-  const whole = scaled / p;
-  const frac = scaled % p;
-  const body =
-    places === 0 ? `${whole}` : `${whole}.${frac.toString().padStart(places, "0")}`;
-  return neg && scaled !== B0 ? `-${body}` : body;
+  const neg = x.n < 0;
+  let r = Math.abs(x.n);
+  const d = x.d;
+  const whole = Math.floor(r / d);
+  r -= whole * d;
+  let frac = "";
+  let carry = 0;
+  const digits: number[] = [];
+  for (let i = 0; i < places; i++) {
+    r = safe(r * 10);
+    digits.push(Math.floor(r / d));
+    r -= digits[i] * d;
+  }
+  // round half away from zero on the first dropped digit
+  if (r * 2 >= d) carry = 1;
+  for (let i = places - 1; i >= 0 && carry; i--) {
+    const v = digits[i] + carry;
+    digits[i] = v % 10;
+    carry = v >= 10 ? 1 : 0;
+  }
+  frac = digits.join("");
+  const head = whole + carry;
+  const body = places === 0 ? `${head}` : `${head}.${frac}`;
+  return neg && (head !== 0 || r !== 0 || frac.replace(/0/g, "") !== "") ? `-${body}` : body;
 }
 
 /** A point of the warped plane. Exact. */
 export type QPt = readonly [Rat, Rat];
 
-export const qOf = (a: number | bigint, b: number | bigint): QPt => [rInt(a), rInt(b)];
+export const qOf = (a: number, b: number): QPt => [rInt(a), rInt(b)];
 export const qEq = (p: QPt, q: QPt): boolean => rEq(p[0], q[0]) && rEq(p[1], q[1]);
 
 /** Twice the signed area of the triangle (o, a, b). Sign is the orientation. */
@@ -300,7 +345,7 @@ export function vertexCensus(triples: readonly (readonly Lat[])[]): VertexCensus
     cells: triples.length,
     slots,
     distinct,
-    ratio: rat(BigInt(slots), BigInt(distinct)),
+    ratio: rat(slots, distinct),
     deficit: 6 * distinct - slots,
     degrees,
   };
@@ -803,7 +848,7 @@ export function alphaLinear(P: QPt, Q: QPt, cell: readonly QPt[]): Rat {
   const c = qCentroid(cell);
   const e = edgeFunction(P, Q, c);
   const s = edgeStep(P, Q, cell);
-  return rClamp01(rAdd(rat(B1, B2), rDiv(e, rMul(rInt(2), s))));
+  return rClamp01(rAdd(rat(1, 2), rDiv(e, rMul(rInt(2), s))));
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -1155,12 +1200,12 @@ export function z3Div(x: Z3, y: Z3): Z3 {
 }
 
 /** Is this an ALGEBRAIC INTEGER of ℤ[√3] — both components integers? */
-export const z3IsIntegral = (x: Z3): boolean => x.a.d === B1 && x.b.d === B1;
+export const z3IsIntegral = (x: Z3): boolean => x.a.d === 1 && x.b.d === 1;
 /** Is this a UNIT of ℤ[√3] — integral with norm ±1? */
 export const z3IsUnit = (x: Z3): boolean => {
   if (!z3IsIntegral(x)) return false;
   const n = z3Norm(x);
-  return n.d === B1 && (n.n === B1 || n.n === BM1);
+  return n.d === 1 && (n.n === 1 || n.n === -1);
 };
 
 /** ε = 2 + √3, the fundamental unit of ℤ[√3]. */
@@ -1184,8 +1229,17 @@ export interface WidthRow {
   /** Bits in the shared denominator. 0 means the power is an ALGEBRAIC INTEGER. */
   readonly bitsDen: number;
   readonly integral: boolean;
-  /** N(x^k) = N(x)^k, checked rather than assumed. */
-  readonly norm: Rat;
+  /**
+   * N(x^k) = N(x)^k, checked rather than assumed — or `null` once a² − 3b²
+   * leaves exact range.
+   *
+   * NULLABLE ON PURPOSE, and this is a finding rather than an inconvenience: the
+   * norm squares the coefficients, so it needs 2·W bits where the product needs
+   * W. The Galois error CHECK is wider than the thing it checks, which is exactly
+   * why `floang_core::ring_arena::RingPair` exposes `norm_i128` beside an i64
+   * product. `unitPowerWidths` therefore reports two depths, not one.
+   */
+  readonly norm: Rat | null;
 }
 
 /**
@@ -1226,15 +1280,30 @@ export interface WidthRow {
 export function unitPowerWidths(x: Z3, kmax: number): WidthRow[] {
   const out: WidthRow[] = [];
   for (let k = 0; k <= kmax; k++) {
-    const p = z3Pow(x, k);
+    let p: Z3;
+    try {
+      p = z3Pow(x, k);
+    } catch {
+      // THE RANGE BOUNDARY, reached and reported rather than worked around. The
+      // caller reads `out.length` to learn the depth this factor composes to in
+      // one machine word, and `rangeReport()` to learn the lane width it would
+      // take to go further.
+      break;
+    }
     const den = p.a.d > p.b.d ? p.a.d : p.b.d;
+    let norm: Rat | null;
+    try {
+      norm = z3Norm(p);
+    } catch {
+      norm = null; // the norm ran out before the product did — see WidthRow.norm
+    }
     out.push({
       k,
       bitsA: bitsOf(p.a.n),
       bitsB: bitsOf(p.b.n),
-      bitsDen: den === B1 ? 0 : bitsOf(den),
+      bitsDen: den === 1 ? 0 : bitsOf(den),
       integral: z3IsIntegral(p),
-      norm: z3Norm(p),
+      norm,
     });
   }
   return out;
@@ -1251,14 +1320,27 @@ export function unitPowerWidths(x: Z3, kmax: number): WidthRow[] {
  * choose an arithmetic type once instead of discovering the answer at depth.
  */
 export function safeIntegerDepth(x: Z3, cap = 200): number {
-  const limit = BigInt(Number.MAX_SAFE_INTEGER);
-  let acc = z3Int(1, 0);
+  let a = 1;
+  let b = 0;
+  if (x.a.d !== 1 || x.b.d !== 1) {
+    // A non-integral factor accumulates a DENOMINATOR, so the boundary is a
+    // different question and the caller wants `unitPowerWidths`. Refuse rather
+    // than return a number that means something else.
+    throw new Error("warp: safeIntegerDepth is for integral factors; see unitPowerWidths");
+  }
+  const A = x.a.n;
+  const B = x.b.n;
   for (let k = 0; k <= cap; k++) {
-    for (const c of [acc.a, acc.b]) {
-      const n = c.n < B0 ? -c.n : c.n;
-      if (n > limit || c.d > limit) return k;
-    }
-    acc = z3Mul(acc, x);
+    const na = tryMul(a, A);
+    const nb3 = tryMul(3 * b, B);
+    const nb1 = tryMul(a, B);
+    const nb2 = tryMul(b, A);
+    if (na === null || nb3 === null || nb1 === null || nb2 === null) return k;
+    const ra = na + nb3;
+    const rb = nb1 + nb2;
+    if (!Number.isSafeInteger(ra) || !Number.isSafeInteger(rb)) return k;
+    a = ra;
+    b = rb;
   }
   return cap + 1;
 }
@@ -1285,17 +1367,17 @@ export function z3TanDouble(t: Z3): Z3 | null {
  */
 export function ratIsSquare(x: Rat): boolean {
   if (rSign(x) < 0) return false;
-  const isq = (v: bigint) => {
-    if (v < B0) return false;
-    if (v < B2) return true;
-    let lo = B1;
+  const isq = (v: number) => {
+    if (v < 0) return false;
+    if (v < 2) return true;
+    let lo = 1;
     let hi = v;
     while (lo < hi) {
-      const mid = (lo + hi) / B2;
-      if (mid * mid < v) lo = mid + B1;
+      const mid = Math.floor((lo + hi) / 2);
+      if (safe(mid * mid) < v) lo = mid + 1;
       else hi = mid;
     }
-    return lo * lo === v;
+    return safe(lo * lo) === v;
   };
   return isq(x.n) && isq(x.d);
 }
@@ -1322,7 +1404,7 @@ export const z3PtEq = (p: Z3Pt, q: Z3Pt): boolean => z3Eq(p.x, q.x) && z3Eq(p.y,
  * `z3HasSquareRoot` decides both without a search.
  */
 export function hexAnchor(k: number, R: Rat): Z3Pt {
-  const half = rat(B1, B2);
+  const half = rat(1, 2);
   const cos: Rat[] = [R, rMul(R, half), rMul(R, rNeg(half)), rNeg(R), rMul(R, rNeg(half)), rMul(R, half)];
   // sin 60°k = 0, √3/2, √3/2, 0, −√3/2, −√3/2 — carried in the √-component.
   const sinRoot: Rat[] = [R0, half, half, R0, rNeg(half), rNeg(half)];
@@ -1356,7 +1438,7 @@ export function flowAngleApex(
   cotHalf: Z3,
   inward: boolean
 ): Z3Pt {
-  const half = z3(rat(B1, B2), R0);
+  const half = z3(rat(1, 2), R0);
   const mid: Z3Pt = {
     x: z3Mul(z3Add(P.x, Q.x), half),
     y: z3Mul(z3Add(P.y, Q.y), half),
@@ -1426,5 +1508,5 @@ export function latCentroid(tri: readonly Lat[]): QPt {
     a += v[0];
     b += v[1];
   }
-  return [rat(BigInt(a), B3), rat(BigInt(b), B3)];
+  return [rat(a, 3), rat(b, 3)];
 }

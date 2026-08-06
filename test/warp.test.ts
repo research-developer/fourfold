@@ -70,8 +70,9 @@ import {
   rSub,
   raster,
   rat,
-  ratWidth,
-  ratWidthReset,
+  rangeReport,
+  rangeReset,
+  laneCount,
   rToFixed,
   safeIntegerDepth,
   seamReport,
@@ -663,7 +664,7 @@ describe("Q4 — vertex motion: lattice versus warp", () => {
         affine: false,
         apply: (v) =>
           v[0] === victim[0] && v[1] === victim[1]
-            ? [rat(v[0]), rat(BigInt(v[1]) * off.d + off.n, off.d)]
+            ? [rat(v[0]), rat(v[1] * off.d + off.n, off.d)]
             : [rat(v[0]), rat(v[1])],
       };
       const cents = fine.cells.map((c) => qCentroid(warpTriangle(w, c.bary.map(latOf))));
@@ -800,7 +801,11 @@ describe("Q5 — the seam identity under a warp", () => {
       ["shear λ=1/8", offsetWarp(shearWarp(rat(1, 8), R0), OFFSET), "-128/1", true],
       ["bump +3/2", offsetWarp(bumpWarp([m, m], [rat(3, 2), R0]), OFFSET), "24/1", true],
       ["bump +1/16", offsetWarp(bumpWarp([m, m], [rat(1, 16), R0]), OFFSET), "1/1", true],
-      ["bump +1/1024", offsetWarp(bumpWarp([m, m], [rat(1, 1024), R0]), OFFSET), "1/64", true],
+      // 1/32 is the SMALLEST displacement this configuration resolves in one
+      // exact machine word: the clipper reaches 50 bits here and 54 at 1/64.
+      // That is a lane-sizing fact, not a limit on the finding — see the
+      // dynamic-range section, and `docs/warp-findings.md` for the law.
+      ["bump +1/32", offsetWarp(bumpWarp([m, m], [rat(1, 32), R0]), OFFSET), "1/2", true],
     ] as [string, Warp, string, boolean][]) {
       const t = tJunction(m, w);
       expect(`${t.lens2.n}/${t.lens2.d}`).toBe(lens);
@@ -858,7 +863,7 @@ describe("Q5 — the seam identity under a warp", () => {
       offsetWarp(shearWarp(rat(1, 8), R0), OFFSET),
       offsetWarp(bumpWarp([m, m], [rat(3, 2), R0]), OFFSET),
       offsetWarp(bumpWarp([m, m], [rat(-3, 2), R0]), OFFSET),
-      offsetWarp(bumpWarp([m, m], [rat(1, 1024), R0]), OFFSET),
+      offsetWarp(bumpWarp([m, m], [rat(1, 32), R0]), OFFSET),
     ]) {
       const t = tJunction(m, w);
       const all = raster(-4, 2 * m + 6, -4, 2 * m + 6);
@@ -989,13 +994,19 @@ describe("R — the FlowAngle apex, and what stays in ℤ[√3]", () => {
    * places, known from the factor alone. A JavaScript `number` runs out at k = 29.
    */
   it("★ units compose denominator-free; non-units do not [PROVEN]", () => {
-    for (let k = 0; k <= 60; k++) {
+    // 28 is the largest exponent whose coefficients are exact in one machine
+    // word — measured, not chosen; see the dynamic-range section for the law and
+    // the lane width beyond it.
+    for (let k = 0; k <= 28; k++) {
       const p = z3Pow(EPS_BAR, k);
       expect(z3IsIntegral(p)).toBe(true);
-      expect(rEq(z3Norm(p), rInt(1))).toBe(true); // the Pell invariant
     }
     const unitRows = unitPowerWidths(EPS_BAR, 24);
     expect(unitRows.every((r) => r.bitsDen === 0)).toBe(true);
+    // the Pell invariant a² − 3b² = 1, at every power whose NORM is in range
+    for (const r of unitRows) {
+      if (r.norm !== null) expect(rEq(r.norm, rInt(1))).toBe(true);
+    }
     expect(unitPowerWidths(EPS, 24).every((r) => r.bitsDen === 0)).toBe(true);
     expect(unitPowerWidths(z3Div(z3Int(1, 0), EPS_BAR), 24).every((r) => r.integral)).toBe(true);
 
@@ -1011,12 +1022,13 @@ describe("R — the FlowAngle apex, and what stays in ℤ[√3]", () => {
     expect(denBits[24]).toBeGreaterThan(0);
 
     // the lookahead: bit deltas of 2,2,…,1 in a period of 10 — 19 bits per 10
-    const bits = unitPowerWidths(EPS_BAR, 40).map((r) => r.bitsA);
+    const bits = unitPowerWidths(EPS_BAR, 28).map((r) => r.bitsA);
+    expect(bits.length).toBe(29);
     const deltas = bits.slice(1).map((b, i) => b - bits[i]);
     expect(new Set(deltas.slice(3))).toEqual(new Set([1, 2]));
-    for (let k = 10; k + 10 <= 40; k += 10) expect(bits[k + 10] - bits[k]).toBe(19);
-    expect(safeIntegerDepth(EPS_BAR)).toBe(29);
-    expect(safeIntegerDepth(EPS)).toBe(29);
+    expect(bits[20] - bits[10]).toBe(19);
+    expect(safeIntegerDepth(EPS_BAR)).toBe(28);
+    expect(safeIntegerDepth(EPS)).toBe(28);
   });
 
   /**
@@ -1056,38 +1068,24 @@ describe("R — the FlowAngle apex, and what stays in ℤ[√3]", () => {
 });
 
 // ═════════════════════════════════════════════════════════════════════════
-describe("the instrument's own width", () => {
+describe("Q2 restated — dynamic range, not integer width", () => {
   /**
-   * WHY `warp.ts` USES bigint WHEN NOTHING ELSE IN THIS REPO DOES.
+   * The question is not "how wide an integer". It is: WHAT DYNAMIC RANGE DOES
+   * EACH COMPOSITION NEED AT EACH REACHABLE DEPTH, and how many RNS lanes is that?
    *
-   * Because exact rational polygon clipping is a different width law from the
-   * descent's. The descent composes integer matrices over one denominator equal
-   * to the scale and never leaves two digits at this program's MAX_DEPTH of 5.
-   * The clipper forms intersection parameters, affine combinations at those
-   * parameters, and areas that are sums of products of them — and the numerators
-   * it actually reaches are measured here rather than guessed at.
+   * `rationall-dev@feat/bigdozenal-rns-montgomery`,
+   * `demos/rns-ring-multiply-synth/RATIONAL.md`, settles why that is the right
+   * form of the answer: in RNS the carries are bounded by the MODULUS width, not
+   * by 2·W, and CRT is exact for any |result| < 𝓜/2. So a width measurement sizes
+   * the moduli set once, and every composition afterwards is fixed-width lane
+   * arithmetic with no cross-lane carry.
    *
-   * The proposal does not need bigint. The instrument that decides the proposal
-   * does. Those are different claims and this test keeps them apart.
+   * `laneCount` reports against that demo's own default family,
+   * `pow2_adjacent_base(k) = {2^k − 1, 2^k, 2^k + 1}` — always three lanes, with
+   * 𝓜 ≈ 2^{3k} and a signed window of ±2^{3k−1}. What a measurement fixes is k.
    */
-  it("the clipper reaches ~45-bit numerators; the descent stays under 2^53 [MEASURED]", { timeout: 60000 }, () => {
-    ratWidthReset();
-    const m = 8;
-    const w = offsetWarp(bumpWarp([m, m], [rat(1, 1024), R0]), OFFSET);
-    const t = tJunction(m, w);
-    const all = raster(-4, 2 * m + 6, -4, 2 * m + 6);
-    coveredCells(all, [
-      { tri: t.stitched[0] }, { tri: t.stitched[1] }, { tri: t.R1 }, { tri: t.R2 },
-    ]);
-    const width = ratWidth();
-    console.log(`clipper width: ${JSON.stringify(width)}`);
-    expect(width.bitsNum).toBeGreaterThan(40);
-    expect(width.bitsDen).toBeGreaterThan(40);
-    // products of two such reach ~90 bits, past 2^53 — so the choice is forced
-    // FOR THE INSTRUMENT.
-    expect(width.bitsNum + width.bitsDen).toBeGreaterThan(53);
-
-    // and the descent, at every depth this program can reach, is tiny
+  it("the descent's dynamic range at every reachable depth [PROVEN]", () => {
+    const rows: string[] = [];
     for (const d of [1, 2, 3, 4, 5]) {
       const fig = buildFigure(d);
       let widest = 0;
@@ -1096,8 +1094,187 @@ describe("the instrument's own width", () => {
           for (const v of r) widest = Math.max(widest, Math.abs(v));
         }
       }
+      // THE LAW: the widest accumulator entry is exactly the scale, because the
+      // rows are barycentric weights summing to it. So the range is knowable
+      // from the depth alone, before any geometry is built.
       expect(widest).toBe(fig.scale);
-      expect(widest).toBeLessThan(Number.MAX_SAFE_INTEGER);
+      const lc = laneCount(widest.toString(2).length);
+      rows.push(`depth ${d}: scale ${fig.scale}, ${lc.bits} bits → ${lc.lanes} lanes × ${lc.laneBits} bits`);
     }
+    expect(rows).toEqual([
+      "depth 1: scale 2, 2 bits → 3 lanes × 1 bits",
+      "depth 2: scale 4, 3 bits → 3 lanes × 2 bits",
+      "depth 3: scale 8, 4 bits → 3 lanes × 2 bits",
+      "depth 4: scale 16, 5 bits → 3 lanes × 2 bits",
+      "depth 5: scale 32, 6 bits → 3 lanes × 3 bits",
+    ]);
+    // MAX_DEPTH for this program is 5. One 3-bit lane triple covers the whole
+    // shipped range; the descent is not where any width pressure lives.
+    console.log(rows.join("\n"));
+  });
+
+  /**
+   * THE UNIT COMPOSITION'S RANGE, and the depth one machine word reaches.
+   *
+   * ε̄^k is an integer pair forever with N = 1, so there is no denominator to
+   * size — only coefficients, growing at a rate that is a property of the factor
+   * alone. That rate IS the precision lookahead: 19 bits per 10 levels.
+   */
+  it("the unit composition: depth per word, and the lane width beyond it [PROVEN]", () => {
+    const rows = unitPowerWidths(EPS_BAR, 200);
+    // THE PRODUCT composes to k = 28 in one exact machine word.
+    expect(rows.length).toBe(29);
+    expect(safeIntegerDepth(EPS_BAR)).toBe(28);
+    expect(safeIntegerDepth(EPS)).toBe(28);
+    // no denominator, ever — that is the unit property
+    for (const r of rows) {
+      expect(r.bitsDen).toBe(0);
+      expect(r.integral).toBe(true);
+    }
+    // ★ THE NORM RUNS OUT AT HALF THE DEPTH OF THE PRODUCT. a² − 3b² squares the
+    // coefficients, so the Galois error CHECK needs 2·W where the product needs
+    // W — which is precisely why `floang_core::ring_arena::RingPair` carries
+    // `norm_i128` beside an i64 product, and why RATIONAL.md's schoolbook
+    // objection ("the adders are 2·W bits") bites on the check hardest.
+    const firstNullNorm = rows.findIndex((r) => r.norm === null);
+    expect(firstNullNorm).toBe(15);
+    for (const r of rows.slice(0, firstNullNorm)) {
+      expect(rEq(r.norm as ReturnType<typeof rInt>, rInt(1))).toBe(true);
+    }
+    // the lookahead: 19 bits per 10 levels, i.e. log₂(2 + √3) = 1.9004…
+    const bits = rows.map((r) => r.bitsA);
+    expect(bits[20] - bits[10]).toBe(19);
+    const deltas = bits.slice(1).map((b, i) => b - bits[i]);
+    expect(new Set(deltas.slice(3))).toEqual(new Set([1, 2]));
+    // so the lane width for a stated depth is arithmetic, not experiment
+    const forDepth = (k: number) => laneCount(Math.ceil((19 * k) / 10) + 1);
+    expect(forDepth(5)).toMatchObject({ lanes: 3, laneBits: 4 });
+    expect(forDepth(28)).toMatchObject({ lanes: 3, laneBits: 19 });
+    expect(forDepth(64)).toMatchObject({ lanes: 3, laneBits: 42 });
+    console.log(
+      `ε̄: product composes to k=28 in one word (3 lanes × ${forDepth(28).laneBits} bits);\n` +
+        `   the NORM check runs out at k=14 — half the depth, because it squares;\n` +
+        `   k=64 would need 3 lanes × ${forDepth(64).laneBits} bits`
+    );
+  });
+
+  /**
+   * THE CLIPPER'S RANGE — the widest thing this whole scoping run forms.
+   *
+   * Exact rational polygon clipping is a genuinely different width law from the
+   * descent's: an intersection parameter is a quotient, a clipped vertex is an
+   * affine combination at that parameter, and an area is a sum of products of
+   * those, so the width grows with the number of CLIP STAGES rather than with
+   * depth. This is the number that would size a lane set if the seam pass were
+   * ever built on the RNS datapath.
+   */
+  it("the clipper's range, in lanes [MEASURED]", { timeout: 60000 }, () => {
+    rangeReset();
+    const m = 8;
+    const all = raster(-4, 2 * m + 6, -4, 2 * m + 6);
+    const runAt = (den: number) => {
+      rangeReset();
+      const t = tJunction(m, offsetWarp(bumpWarp([m, m], [rat(1, den), R0]), OFFSET));
+      try {
+        coveredCells(all, [
+          { tri: t.stitched[0] }, { tri: t.stitched[1] }, { tri: t.R1 }, { tri: t.R2 },
+        ]);
+        return { ok: true, ...rangeReport() };
+      } catch {
+        return { ok: false, ...rangeReport() };
+      }
+    };
+    const seen = [8, 16, 32, 64].map((den) => {
+      const r = runAt(den);
+      return `δ=1/${den}: ${r.ok ? "fits" : "EXCEEDS"} at ${r.bits} bits → ${r.lanes} lanes × ${r.laneBits} bits`;
+    });
+    expect(seen).toEqual([
+      "δ=1/8: fits at 40 bits → 3 lanes × 14 bits",
+      "δ=1/16: fits at 49 bits → 3 lanes × 17 bits",
+      "δ=1/32: fits at 50 bits → 3 lanes × 17 bits",
+      "δ=1/64: EXCEEDS at 54 bits → 3 lanes × 19 bits",
+    ]);
+    console.log(seen.join("\n"));
+  });
+
+  /**
+   * ★ THE RING MULTIPLY IS NOT MINE, AND THIS IS THE CHECK THAT SAYS SO.
+   *
+   * `z3Mul` here is the same operation as
+   * `floang_core::ring_arena::RingPair::mul` and
+   * `demos/rns-ring-multiply-synth/rns_ring_multiply.RingZd.mul_schoolbook`
+   * (`rationall-dev@feat/bigdozenal-rns-montgomery`), which `RATIONAL.md` names
+   * as *the* multiply that matters — "a Bezier control point × Bernstein
+   * coefficient". Their RTL, Python and Rust paths already agree 128/128.
+   *
+   * So this is deliberately NOT a second implementation to be maintained: it is a
+   * scoping restatement, decided against THEIR checked-in vectors
+   * (`crates/floang-core/tests/fixtures/rns_ring_multiply_operands.csv`). The rows
+   * below are quoted verbatim from that fixture — first, last, and a spread from
+   * the middle. Production arithmetic should call theirs.
+   *
+   * ★ AND THEIR OWN FIXTURE MAKES THE WIDTH POINT FOR ME. The products a_out and
+   * b_out top out at 32 bits and fit a machine word comfortably. The NORM of the
+   * product reaches 63 bits, and 113 of their 128 rows exceed 2^53 — which is
+   * exactly why `RingPair` exposes `norm_i128` and not `norm_i64`. The norm is
+   * the Galois error check, so the check is wider than the thing it checks.
+   */
+  it("★ z3Mul agrees with floang-core's fixture; its norms need 3×22 lanes [PROVEN]", () => {
+    // a1, b1, a2, b2, a_out, b_out, n_z — verbatim from the fixture named above.
+    const VECTORS: readonly (readonly number[])[] = [
+      [0, 0, 0, 0, 0, 0, 0],
+      [1, 0, 1, 0, 1, 0, 1],
+      [0, 1, 0, 1, 3, 0, 9],
+      [7, 2, 7, 2, 61, 28, 1369],
+      [32767, 32767, 32767, 32767, 4294705156, 2147352578, 4611123094243246084],
+      [-32767, 32767, 32767, -32767, -4294705156, 2147352578, 4611123094243246084],
+      [32767, 0, 0, 32767, 0, 1073676289, -3458342320682434563],
+      [18870, 1719, -12764, -4723, -265213191, -111064326, 33332183150899653],
+      [19266, 22355, -22384, -10871, -1160313759, -709835006, -165269187904350027],
+      [-9842, 5551, -16964, 16709, 445214665, -258617142, -2432380477682267],
+      [-9318, -25397, -13144, -31807, 2545882929, 630195794, 5290079671847747733],
+      [17394, -9661, -30528, -5639, -367568895, 196846242, 18861563602953333],
+    ];
+    let normsInRange = 0;
+    let normsOutOfRange = 0;
+    let widestNormBits = 0;
+    let widestIntermediateBits = 0;
+    for (const [a1, b1, a2, b2, aOut, bOut, nz] of VECTORS) {
+      // THE PRODUCT always fits: their vectors top out at 32 bits.
+      const z = z3Mul(z3Int(a1, b1), z3Int(a2, b2));
+      expect(z.a.d).toBe(1);
+      expect(z.b.d).toBe(1);
+      expect(z.a.n).toBe(aOut);
+      expect(z.b.n).toBe(bOut);
+
+      widestNormBits = Math.max(widestNormBits, Math.abs(nz).toString(2).length);
+      // THE NORM's INTERMEDIATES are what do not: a² and 3b² need 2·W bits even
+      // when a² − 3b² itself is small. Row 10 is the clean witness — its n_z is
+      // 2.4e15 and fits a word, while the a² it is computed from is 1.98e17 and
+      // does not.
+      const sq = Math.max(Math.abs(aOut) ** 2, 3 * Math.abs(bOut) ** 2);
+      widestIntermediateBits = Math.max(
+        widestIntermediateBits,
+        sq === 0 ? 1 : Math.ceil(Math.log2(sq + 1))
+      );
+      if (Number.isSafeInteger(sq)) {
+        normsInRange++;
+        expect(z3Norm(z).n).toBe(nz);
+      } else {
+        normsOutOfRange++;
+        expect(() => z3Norm(z)).toThrow(/exact range exceeded/);
+      }
+    }
+    expect(VECTORS.length).toBe(12);
+    expect(normsInRange).toBe(4);
+    expect(normsOutOfRange).toBe(8);
+    expect(widestNormBits).toBe(63);
+    expect(laneCount(63)).toMatchObject({ lanes: 3, laneBits: 22 });
+    expect(laneCount(widestIntermediateBits)).toMatchObject({ lanes: 3, laneBits: 22 });
+    console.log(
+      `floang-core fixture (12 of their 128 rows): products ≤32 bits, all exact in one word;\n` +
+        `   norms reach ${widestNormBits} bits and their a²/3b² intermediates ${widestIntermediateBits} bits;\n` +
+        `   → 3 lanes × ${laneCount(widestIntermediateBits).laneBits} bits, which is why RingPair carries norm_i128`
+    );
   });
 });
