@@ -103,12 +103,15 @@
  * goes into the SCALE and not into the number type — `vertices.refineTable`'s
  * move, reused rather than restated:
  *
- *   > every coordinate this module emits is an exact INTEGER on the ×144
- *   > lattice: `cp = 144·P + k·(A − P)`, k the dial.
+ *   > every coordinate this module emits is an exact INTEGER on the ×`scale`
+ *   > lattice: `cp = scale·P + k·(A − P)`, k the dial's numerator over `scale`.
  *
- * 144 because `docs/spec-curvature.md` G2 already names it (the dozenal
- * smoothstep's denominator, and the twelfth-based rationals the exported
- * keyframes state). There is no `Math.` call and no division in this file. The
+ * `scale` is `REFINE` = 144 for a static build, and 144 because
+ * `docs/spec-curvature.md` G2 already names it (the dozenal smoothstep's
+ * denominator, and the twelfth-based rationals the exported keyframes state).
+ * Increment 3's eased build passes `144·den` and stays integral for exactly the
+ * same reason — resolution in the SCALE, never in the number type. There is no
+ * `Math.` call and no division in this file. The
  * single float boundary is the `ToPixel` the caller supplies at path emission,
  * which is `hexagon.latticeToPixel` — the display boundary that already exists,
  * unmodified.
@@ -199,6 +202,24 @@ export const MAX_FLOW = 48;
 
 /** A dial position, in 144ths. `0` is off and is the ONLY value that is off. */
 export type Flow = number;
+
+/**
+ * A dial BETWEEN two integer positions, exact — increment 3's micro-dial.
+ *
+ * `num/den` is the dial in 144ths, so `{num: k·144, den: 144}` is the integer
+ * dial `k` and the field it builds is `den` times the static one, point for
+ * point. The denominator is carried rather than divided out because
+ * `morph.ts`'s proportional clamp (fold-re §12.1) renormalises by moving it —
+ * see that module's header for why a fixed denominator cannot express the clamp
+ * on integers.
+ *
+ * `den ≥ REFINE` always: 144 is the unclamped case and the clamp only ever
+ * raises it.
+ */
+export interface MicroDial {
+  readonly num: number;
+  readonly den: number;
+}
 
 // ═════════════════════════════════════════════════════════════════════════
 // THE EDGE LAW
@@ -292,13 +313,21 @@ export const V4_FULL_COBOUNDARY: EdgeLaw = {
 // ═════════════════════════════════════════════════════════════════════════
 
 /**
- * The two control points of one wall, on the ×`REFINE` lattice.
+ * The two control points of one wall, on the ×`scale` lattice.
  *
- * `cp₁ = REFINE·P + k·(A − P)`, `cp₂ = REFINE·Q + k·(A − Q)` — the FlowAngle
+ * `cp₁ = scale·P + k·(A − P)`, `cp₂ = scale·Q + k·(A − Q)` — the FlowAngle
  * handles `anchor + flow·(apex − anchor)` with the division deferred into the
  * lattice. At k = 0 they collapse onto the anchors and the cubic IS the chord,
  * which is why L3's identity is an arithmetic fact and not a special case (the
  * model still refuses to build at all at k = 0; see `buildCurvature`).
+ *
+ * `scale` IS the denominator of the dial `flow/scale`, and it defaults to
+ * `REFINE` — which is every call increment 2 made, unchanged in behaviour and in
+ * output. Increment 3's eased build passes `REFINE·den` and the micro-dial's
+ * numerator, and gets the same construction one refinement level down:
+ * `den·(REFINE·P + k·(A − P))` when the micro-dial is the integer dial `k`. The
+ * parameter exists so that identity is the SAME code rather than a second
+ * formula that agrees.
  *
  * `flow` is NOT range-checked here. This is the primitive the ceiling is a
  * policy over, and `test/curvature.test.ts` drives it past the ceiling to show
@@ -308,16 +337,17 @@ export function controlPoints(
   p: Lat,
   q: Lat,
   apex: Lat,
-  flow: Flow
+  flow: Flow,
+  scale: number = REFINE
 ): readonly [Lat, Lat] {
   return [
     [
-      exact(REFINE * p[0] + flow * (apex[0] - p[0])),
-      exact(REFINE * p[1] + flow * (apex[1] - p[1])),
+      exact(scale * p[0] + flow * (apex[0] - p[0])),
+      exact(scale * p[1] + flow * (apex[1] - p[1])),
     ],
     [
-      exact(REFINE * q[0] + flow * (apex[0] - q[0])),
-      exact(REFINE * q[1] + flow * (apex[1] - q[1])),
+      exact(scale * q[0] + flow * (apex[0] - q[0])),
+      exact(scale * q[1] + flow * (apex[1] - q[1])),
     ],
   ];
 }
@@ -389,12 +419,29 @@ export interface CurvatureCensus {
 }
 
 export interface CurvatureField {
-  /** The dial, in 144ths. Never 0 — a zero dial produces no field at all. */
+  /**
+   * The dial's NUMERATOR over `scale`. Never 0 — a zero dial builds no field.
+   *
+   * `scale === REFINE` on the static path, so this is the dial in 144ths and
+   * means exactly what increment 2 said it meant. An eased field carries a
+   * larger denominator; see `scale`.
+   */
   readonly flow: Flow;
+  /**
+   * The lattice this field's coordinates live on, and the denominator of
+   * `flow`.
+   *
+   * `REFINE` for a static build; `REFINE·den` for an eased one. The FIELD
+   * carries it rather than the caller assuming it, because the display boundary
+   * has to divide the unit by exactly this number and a caller that guessed
+   * `REFINE` during an ease would draw the figure a hundred and forty-four times
+   * too large.
+   */
+  readonly scale: number;
   readonly law: EdgeLaw;
   /** The table this was built on. `vertices.ts` owns it; this borrows it. */
   readonly table: VertexTable;
-  /** The same table on the ×REFINE lattice — every emitted anchor comes from it. */
+  /** The same table on the ×`scale` lattice — every emitted anchor comes from it. */
   readonly refined: VertexTable;
   readonly walls: readonly Wall[];
   readonly wallByEdge: ReadonlyMap<string, Wall>;
@@ -415,11 +462,24 @@ export interface CurvatureField {
  */
 export type Mutation = "none" | "per-cell";
 
+/**
+ * THE COMBINATORICS ARE DIAL-INDEPENDENT, and increment 3 leans on it.
+ *
+ * Read the body: `flow` and `scale` reach exactly one expression, the
+ * `controlPoints` call. The edge sweep, the wall set, the `into`/`from` sides,
+ * the apex indices and the whole census are functions of the TABLE, the CHARGES
+ * and the LAW alone. So an ease never rebuilds a wall — it slides two points
+ * along a fixed anchor→apex segment — and the ceiling is the only thing the dial
+ * decides. Verified rather than asserted: `test/morph.test.ts` compares wall
+ * edge-key sets and side assignments across the dial's whole range and across
+ * eased micro-dials, at both radices.
+ */
 const wallsOf = (
   table: VertexTable,
   charges: readonly number[],
   law: EdgeLaw,
-  flow: Flow
+  flow: Flow,
+  scale: number
 ): { walls: Wall[]; byEdge: Map<string, Wall>; census: CurvatureCensus } => {
   // The edge sweep. A triangulation gives every edge one or two incident cells;
   // three would mean the table is not a surface, which is a corruption worth a
@@ -486,7 +546,8 @@ const wallsOf = (
         table.vertices[p],
         table.vertices[q],
         table.vertices[into.apex],
-        flow
+        flow,
+        scale
       ),
     };
     walls.push(wall);
@@ -545,14 +606,75 @@ export function buildCurvature(
       `curvature: dial ${flow} is not an integer in 0…${MAX_FLOW} (144ths)`
     );
   }
+  return build(table, charges, law, flow, REFINE, mutation);
+}
+
+/**
+ * THE EASED FIELD — increment 3, and it is the same builder one level down.
+ *
+ * `morph.ts` composes the registry into an exact `num/den` in 144ths; this
+ * builds the field at `flow = num` on the ×`REFINE·den` lattice, so
+ *
+ *   > **at `num = den·k` the eased control points are exactly `den` times the
+ *   > static ones at dial `k`** — the same integers, one refinement apart,
+ *
+ * which is why an eased tick is a model state and not a rendering of one. The
+ * COMBINATORICS do not move: `wallsOf` reads only the charges and the law, and
+ * the dial enters only through `controlPoints`, linearly. An ease slides control
+ * points along fixed anchor→apex segments and never rebuilds a wall set
+ * [PROVEN, `test/morph.test.ts`].
+ *
+ * `num = 0` returns `null`, for exactly `buildCurvature`'s reason: a zero dial
+ * is not a field of straight curves, it is no field. That is what makes the
+ * first tick of a 0 → k ease — where the overlay's weight is still exactly 0 —
+ * render as the figure the ease is leaving rather than as a new object that
+ * happens to agree with it.
+ *
+ * THE BOUND IS ENFORCED AT EVERY TICK, not only at the ends: `num ≤ den·MAX_FLOW`
+ * is the micro-dial form of the ceiling `docs/warp-findings.md` Q3 measured, and
+ * every composed value is a convex combination of dials at or below it, so the
+ * guard is expected never to fire from the app and fires at once for anything
+ * that is not such a combination.
+ */
+export function buildEasedCurvature(
+  table: VertexTable,
+  charges: readonly number[],
+  law: EdgeLaw,
+  micro: MicroDial,
+  mutation: Mutation = "none"
+): CurvatureField | null {
+  const { num, den } = micro;
+  if (!Number.isSafeInteger(den) || den < REFINE) {
+    throw new Error(
+      `curvature: micro-dial denominator ${den} is below the ladder's ${REFINE}`
+    );
+  }
+  if (!Number.isSafeInteger(num) || num < 0 || num > exact(den * MAX_FLOW)) {
+    throw new Error(
+      `curvature: micro-dial ${num}⁄${den} is not in 0…${MAX_FLOW} (144ths)`
+    );
+  }
+  if (num === 0) return null;
+  return build(table, charges, law, num, exact(REFINE * den), mutation);
+}
+
+/** The one builder both entry points run. `scale` is the dial's denominator. */
+function build(
+  table: VertexTable,
+  charges: readonly number[],
+  law: EdgeLaw,
+  flow: Flow,
+  scale: number,
+  mutation: Mutation
+): CurvatureField {
   if (charges.length !== table.cells.length) {
     throw new Error(
       `curvature: ${charges.length} charges for ${table.cells.length} cells`
     );
   }
 
-  const { walls, byEdge, census } = wallsOf(table, charges, law, flow);
-  const refined = refineTable(table, REFINE);
+  const { walls, byEdge, census } = wallsOf(table, charges, law, flow, scale);
+  const refined = refineTable(table, scale);
 
   let sinks = 0;
   let flat = 0;
@@ -577,7 +699,8 @@ export function buildCurvature(
           table.vertices[a],
           table.vertices[b],
           table.vertices[tri[(r + 2) % 3]],
-          flow
+          flow,
+          scale
         );
         steps.push({ kind: "curve", wall, c1: cp[0], c2: cp[1], to });
         continue;
@@ -602,6 +725,7 @@ export function buildCurvature(
 
   return {
     flow,
+    scale,
     law,
     table,
     refined,
@@ -639,9 +763,13 @@ export const wallBetween = (
  *
  * Supplied rather than imported so this module contains no projection and no
  * float: the page passes `p => applyAffine(transform, latticeToPixel(p, unit /
- * REFINE, cx, cy))`, which is `hexagon.ts`'s existing display boundary followed
- * by `view.ts`'s existing affine — and a Bézier is affine-invariant, so passing
- * the control points through that composition IS the image of the curve.
+ * field.scale, cx, cy))`, which is `hexagon.ts`'s existing display boundary
+ * followed by `view.ts`'s existing affine — and a Bézier is affine-invariant, so
+ * passing the control points through that composition IS the image of the curve.
+ *
+ * The divisor is the FIELD's `scale` and not `REFINE`, since increment 3: an
+ * eased field lives one refinement further down and a caller that assumed the
+ * constant would draw it `den` times too large.
  */
 export type ToPixel = (p: Lat) => readonly [number, number];
 

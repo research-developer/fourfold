@@ -111,11 +111,31 @@ import { buildHexagon, latticeToPixel, type Hexagon } from "@/lib/hexagon";
  */
 import {
   buildCurvature,
+  buildEasedCurvature,
   curvePaths,
   MAX_FLOW,
   REFINE,
   V4_H_WALL,
 } from "@/lib/curvature";
+/**
+ * AND THE ONLY FILE THAT NAMES THE MORPH.
+ *
+ * `morph.ts` is the eased dial's arithmetic — a ladder of exact rationals and a
+ * pure `(registry, event) → registry` — and it is on the display side of the
+ * same boundary for the same reason: it holds a dial, never a coordinate. The
+ * page owns the state and the timer; the module owns the numbers.
+ */
+import {
+  effectiveDial,
+  isEasing,
+  LADDER_TICKS,
+  morphTarget,
+  restMorph,
+  retarget as retargetMorph,
+  settle as settleMorph,
+  tick as tickMorph,
+  type Morph,
+} from "@/lib/morph";
 import { buildVertexTable } from "@/lib/vertices";
 import {
   EMPTY_PROPOSAL,
@@ -540,6 +560,25 @@ const ZOOM_MAX = 8;
  * `prefers-reduced-motion` skips it entirely; see `easeFocus`.
  */
 const FOCUS_MS = 180;
+
+/**
+ * How long one rung of the curvature ease holds, in milliseconds.
+ *
+ * TICKS ARE COUNTED, NEVER SAMPLED, and this number is a CADENCE rather than a
+ * duration — the difference is the whole of `docs/spec-curvature.md` G2. The
+ * drill-in above reads `performance.now()` and interpolates, so a slow frame
+ * skips ahead; the ease indexes a table, so a slow frame stretches the cadence
+ * and no arithmetic is skipped. Every rung of the ladder is rendered, on every
+ * machine, or the transition takes longer. That is what makes an intermediate
+ * tick a model state rather than a sample of one.
+ *
+ * 30 ms × the ladder's 12 rungs is 360 ms — twice the drill-in's travel, which
+ * is right for a shape change against a camera move: the picture is REDRAWN
+ * rather than moved, and a redraw the eye cannot follow reads as a glitch.
+ *
+ * `prefers-reduced-motion` skips it entirely; see `pickFlow`.
+ */
+const MORPH_MS = 30;
 
 /**
  * How long a replay holds each gesture, in milliseconds.
@@ -1151,8 +1190,31 @@ export default function DrawPage() {
    * One number, and the charge supplies everything else — which edges bend and
    * which way is decided by the two cells' charges, never by this. See
    * `src/lib/curvature.ts`.
+   *
+   * ── ONE STATE, NOT TWO — increment 3 ────────────────────────────────────
+   *
+   * The dial used to be a bare `useState(0)`. It is now the BASE of a morph
+   * registry, and `flow` is read off it, because the alternative — a `flow` and
+   * a registry kept in step by the tick driver — is two writers for one value
+   * and the thing this file avoids everywhere else (see `stopEasing`). With one
+   * state the two structural claims are not maintained, they are true:
+   *
+   *   AT REST the registry is empty, `flow` IS `morph.base`, and every memo
+   *   below takes increment 2's path — `buildCurvature` at an integer dial.
+   *   There is no eased build at rest, ever, because there is nothing to build
+   *   one from.
+   *
+   *   ON ARRIVAL `morph.tick` absorbs the overlay INTO the base, so the tick
+   *   that lands is the tick that returns to the static path. "Bit-identical to
+   *   the un-eased render of the target state" is the same code with the same
+   *   argument, not a comparison.
    */
-  const [flow, setFlow] = useState(0);
+  const [morph, setMorph] = useState<Morph>(() => restMorph(0));
+  const flow = morph.base;
+  /** Is a transition in flight? The branch between the two builders. */
+  const easingFlow = isEasing(morph);
+  /** What the user last ASKED for — the slider's thumb, not the settled value. */
+  const flowTarget = morphTarget(morph);
   const [schemeName, setSchemeName] = useState<SchemeName>("hexad");
   const [base, setBase] = useState<Swatch>(() => swatchFromHex("#d4a017"));
 
@@ -2186,9 +2248,10 @@ export default function DrawPage() {
    * a plate nobody has curved must not pay for it. `vertices.ts` states the
    * costs it was measured at.
    */
+  const curving = flow > 0 || easingFlow;
   const vertexTable = useMemo(
     () =>
-      flow === 0
+      !curving
         ? null
         : buildVertexTable({
             radix: 4,
@@ -2196,7 +2259,7 @@ export default function DrawPage() {
             sectors: 6,
             convention: hex.convention,
           }),
-    [flow, hex]
+    [curving, hex]
   );
 
   /**
@@ -2205,18 +2268,34 @@ export default function DrawPage() {
    * `null` at flow 0 — `buildCurvature` refuses to build one — so the board
    * takes the branch it took before this existed. That is L3's identity as a
    * structural fact rather than an agreement.
+   *
+   * TWO BUILDERS, ONE BRANCH, and the branch is on the REGISTRY rather than on
+   * the dial. At rest it is increment 2's call, unchanged and unconditional; in
+   * flight it is the same builder one refinement down, at the exact rational the
+   * ladder composed. `morph.effectiveDial` returns `{num: 144·base, den: 144}`
+   * when the registry is empty, so the two agree at the seam by arithmetic — but
+   * the point is that the rest state never asks it to, because it takes the
+   * other branch. G3's "flow returning to 0 lands on L3's identity, not near it"
+   * is this `if`.
    */
   const curveField = useMemo(
     () =>
       vertexTable === null
         ? null
-        : buildCurvature(
-            vertexTable,
-            hex.cells.map((c) => c.charge),
-            V4_H_WALL,
-            flow
-          ),
-    [vertexTable, hex, flow]
+        : easingFlow
+          ? buildEasedCurvature(
+              vertexTable,
+              hex.cells.map((c) => c.charge),
+              V4_H_WALL,
+              effectiveDial(morph)
+            )
+          : buildCurvature(
+              vertexTable,
+              hex.cells.map((c) => c.charge),
+              V4_H_WALL,
+              flow
+            ),
+    [vertexTable, hex, flow, easingFlow, morph]
   );
 
   /**
@@ -2242,7 +2321,10 @@ export default function DrawPage() {
    */
   const curve = useMemo<CurveView | null>(() => {
     if (curveField === null) return null;
-    const unit = hex.radius / hex.scale / REFINE;
+    // THE FIELD'S OWN SCALE, not `REFINE`: an eased field lives one refinement
+    // further down (×144·den) and a divisor that assumed the constant would
+    // draw the figure `den` times too large. See `curvature.CurvatureField`.
+    const unit = hex.radius / hex.scale / curveField.scale;
     const [cx, cy] = hex.centre;
     const m = canvas.toView;
     const identity = canvas.view.mode === "hexagon";
@@ -2253,6 +2335,23 @@ export default function DrawPage() {
       }),
     };
   }, [curveField, hex, canvas]);
+
+  /**
+   * THE TICK DRIVER — one rung per firing, and the firing is the only clock.
+   *
+   * ONE timeout per rendered state, cleared on the way out, so a state can never
+   * be advanced twice and an unmounted page cannot advance one at all. The
+   * effect re-runs on every `morph`, which is exactly once per rung, so the
+   * chain is self-terminating: `tick` on an empty registry is a no-op returning
+   * the SAME object, React bails out of the render, and the effect never
+   * schedules again. Nothing here counts elapsed time and nothing samples a
+   * clock — see `MORPH_MS` for why that distinction is the feature.
+   */
+  useEffect(() => {
+    if (!isEasing(morph) || typeof window === "undefined") return;
+    const id = window.setTimeout(() => setMorph(tickMorph), MORPH_MS);
+    return () => window.clearTimeout(id);
+  }, [morph]);
 
   // ── the colour the next stroke will start from ──────────────────────────
 
@@ -3051,8 +3150,12 @@ export default function DrawPage() {
   const pickRelief = useCallback(
     (on: boolean) => {
       setReliefOn(on);
-      const dropped = on && flow > 0;
-      if (dropped) setFlow(0);
+      // AN EASE IN FLIGHT IS CANCELLED, NOT EASED OUT, and instantly — every
+      // frame of a graceful exit would be a frame in which the two composed,
+      // and the exclusion is at the source rather than at an amplitude. So the
+      // registry is emptied onto 0 in one move: `settle`, not `retarget`.
+      const dropped = on && (flow > 0 || easingFlow);
+      if (dropped) setMorph((m) => settleMorph(m, 0));
       setAnnounce(
         on
           ? `relief on — ${READING_LABEL[reading]}; the ring under the pointer is the template${
@@ -3061,23 +3164,43 @@ export default function DrawPage() {
           : "relief off — the plate is flat again"
       );
     },
-    [reading, flow]
+    [reading, flow, easingFlow]
   );
 
+  /**
+   * THE DIAL IS A RETARGET, not a write — increment 3.
+   *
+   * The value the user asked for is installed as an overlay walking up the
+   * dozenal ladder while whatever was in flight walks down to exactly zero and
+   * is reclaimed. Nothing here counts a tick: `morph.retarget` is a pure
+   * function of the registry and the new value, and the effect above is the only
+   * thing that advances anything.
+   *
+   * `prefers-reduced-motion` LANDS INSTANTLY, and that is the correct reading of
+   * the setting rather than a concession to it: the destination drawing is
+   * identical either way — the arrival IS the un-eased render — so a reader who
+   * has asked not to be moved loses nothing at all by getting it at once. The
+   * drill-in's `easeTo` makes the same call for the same reason, and PR #20
+   * learned it the hard way on the dim layer.
+   */
   const pickFlow = useCallback(
     (next: number) => {
-      setFlow(next);
       const dropped = next > 0 && reliefOn;
       if (dropped) setReliefOn(false);
+      setMorph((m) =>
+        reduceMotion ? settleMorph(m, next) : retargetMorph(m, next)
+      );
       setAnnounce(
         next === 0
-          ? "curvature off — every edge straight again"
-          : `curvature ${next}/${REFINE} of the apex — cells bend on the charge's H-coset walls${
-              dropped ? "; relief off, the two cannot compose" : ""
+          ? `curvature off — every edge straight again${
+              reduceMotion ? "" : `, over ${LADDER_TICKS} steps`
             }`
+          : `curvature ${next}/${REFINE} of the apex — cells bend on the charge's H-coset walls${
+              reduceMotion ? "" : `, eased over ${LADDER_TICKS} steps`
+            }${dropped ? "; relief off, the two cannot compose" : ""}`
       );
     },
-    [reliefOn]
+    [reliefOn, reduceMotion]
   );
 
   const pickReading = useCallback(
@@ -7906,17 +8029,23 @@ export default function DrawPage() {
                 min={0}
                 max={MAX_FLOW}
                 step={1}
-                value={flow}
+                /* The thumb sits where the user PUT it, not where the picture
+                   has got to — `morphTarget`, not `base`. A slider that snapped
+                   back to the settled value for the length of the ease would be
+                   a control fighting its own animation. */
+                value={flowTarget}
                 onChange={(e) => pickFlow(Number(e.target.value))}
                 aria-label="curvature, in 144ths of the apex"
                 aria-valuetext={
-                  flow === 0
-                    ? "flat — every edge straight"
-                    : `${flow} of ${REFINE} — the charge's walls bend`
+                  easingFlow
+                    ? `easing to ${flowTarget} of ${REFINE}`
+                    : flow === 0
+                      ? "flat — every edge straight"
+                      : `${flow} of ${REFINE} — the charge's walls bend`
                 }
               />
               <span className={styles.dialValue}>
-                {flow}/{REFINE}
+                {flowTarget}/{REFINE}
               </span>
             </label>
             {curveField !== null && (
@@ -7933,9 +8062,19 @@ export default function DrawPage() {
                 control points are exact integers on the ×{REFINE} lattice. The
                 dial stops at {MAX_FLOW}/{REFINE}, where the bulge is a quarter
                 of a cell&rsquo;s height — the largest deflection the warp study
-                measured with nothing changing owner. <b>The export is still
-                straight</b>: the file pairs shapes position for position, so a
-                curved file is a format decision and gets its own pass.
+                measured with nothing changing owner.{" "}
+                {easingFlow ? (
+                  <>
+                    <b>Easing</b> to {flowTarget}/{REFINE} along the dozenal
+                    smoothstep — {LADDER_TICKS} rungs of exact twelfths, and
+                    this tick is {curveField.flow}/{curveField.scale} of the
+                    apex, still an exact integer. The arrival is the still
+                    picture, not a copy of it.{" "}
+                  </>
+                ) : null}
+                <b>The export is still straight</b>: the file pairs shapes
+                position for position, so a curved file is a format decision and
+                gets its own pass.
               </p>
             )}
           </section>

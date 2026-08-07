@@ -148,7 +148,81 @@ flow returning to 0 lands on L3's identity, not near it.
    > shapes position for position, so a curved file is a format decision and
    > deserves its own pass. Nothing in `emit.ts`/`artfile.ts` was touched, and
    > all three byte pins are green because flow 0 builds no field at all.
-3. **Eased flow** under G1–G3.
+3. **Eased flow** under G1–G3 (this wave — LANDED, see `src/lib/morph.ts`).
+   The dial retargets rather than writes; the picture walks the dozenal ladder
+   to it; both endpoints are structural.
+
+   > **Corrected by building it — four times, and two of them are about the
+   > tests rather than the code.**
+   >
+   > **(a) The proportional clamp cannot be landed on a fixed integer
+   > denominator, and it never fires anyway.** §12.1 zeroes the base weight and
+   > rescales the overlays by 1/Σt. On integers over 144 that rescaling does not
+   > exist — `Σ tᵢ·targetᵢ / Σ tᵢ` is not an integer over 144 or over any other
+   > constant — so it is landed by moving the DENOMINATOR instead of the
+   > numerators: unclamped weights `(144 − Σw, w₁ … wₙ)` over `den = 144`,
+   > clamped weights `(0, w₁ … wₙ)` over `den = Σw`. The weights sum to exactly
+   > `den` in both, which is "sum to exactly 1" with the fraction cleared, and
+   > the overlay numerators are untouched, so the ratios are preserved
+   > literally rather than to a rounding. That is why `CurvatureField` now
+   > carries its own `scale`: the dial's denominator stopped being a constant.
+   >
+   > And then the clamp turns out to be **unreachable from this dial** [PROVEN].
+   > At most one overlay is ever rising; a tick raises it by 1 and lowers every
+   > departing one by 1, so **Σ steps ≤ 12** at every reachable state; and over
+   > the finite domain that leaves — multisets of steps summing to at most 12,
+   > all 272 of them enumerated — `Σ stop(sᵢ) ≤ 144` always, with equality
+   > exactly on the seven mirror pairs `stop(a) + stop(12 − a) = 144`. Measured
+   > over 6,700 driven states (regular cadences 1–15 ticks plus an irregular
+   > script): worst Σ steps 11, worst Σ stops 142, up to **5 overlays alive at
+   > once**, clamp fires 0 times. It ships tested anyway, driven directly past
+   > what the dial can build, because a normalisation rule that is only correct
+   > on the states one control happens to produce is not a normalisation rule.
+   >
+   > **(b) The guard-fire the brief predicted does not fire.** A float ladder
+   > was to be caught by "its endpoints or sum or arrival-identity". None of the
+   > three catches it: `Math.round(144·(3u² − 2u³))` at twelfths has endpoints
+   > exactly 0 and 144, increments that telescope to exactly 144, strict
+   > monotonicity, and an exact arrival — **every headline property of G2**.
+   > What catches it is the MIRROR, and it fails at exactly the two samples the
+   > cubic Hermite lands on a half-integer: `(18s² − s³)/6` at s = 3 and s = 9
+   > is 22½ and 121½ — fold-re's own reason for shipping that ladder over 864
+   > rather than rounding it into 144 — and round-half-up sends them to 23 and
+   > 122, so `23 + 122 = 145`. The shipped ladder is caught by a second oracle
+   > as well: its rising half has the closed form `stop(s) = 2s²`, the
+   > increments being an arithmetic progression of difference 4.
+   >
+   > **(c) The linearity identity is `den ×`, not `144 ×`.** `cp = scale·P +
+   > flow·(A − P)` is linear in the pair, so an eased build at `num = den·k` is
+   > exactly `den` times the static build at dial `k` — the same integers one
+   > refinement apart, on the ×`REFINE·den` lattice rather than a fixed ×REFINE².
+   > `controlPoints` took an optional `scale` and `buildCurvature` split into a
+   > guard plus a shared builder; every increment-2 call site is unchanged in
+   > signature, behaviour and output, and the identity is the SAME code rather
+   > than a second formula that agrees.
+   >
+   > **(d) One state, not two.** The page's `flow` is now `morph.base` rather
+   > than a `useState` the driver keeps in step with a registry — two writers
+   > for one value is the bug `stopEasing` exists to avoid. With one state the
+   > two acceptance lines are not maintained but true: at rest the registry is
+   > empty and the memo takes `buildCurvature` at an integer dial, and arrival
+   > is absorption, so the tick that lands is the tick that returns to the
+   > static path. The slider's thumb reads `morphTarget` — where the user put
+   > it — while the picture reads the composed dial.
+   >
+   > Also load-bearing: **the combinatorics are dial-independent** [PROVEN over
+   > the whole 1…48 range and three eased denominators, both radices] — `flow`
+   > and `scale` reach exactly one expression in `wallsOf`, the `controlPoints`
+   > call — so an ease slides two points along a fixed anchor→apex segment and
+   > never rebuilds a wall set. Nothing is cached on the strength of it; it is
+   > the reason nothing NEEDS to be. Cost [MEASURED]: 0.64 ms per tick at depth
+   > 3 and 7.2 ms at depth 5, the deepest canvas, for the field and every path
+   > string together, against a 30 ms cadence. Ticks are COUNTED, so a slow
+   > machine stretches the transition and never skips a rung.
+   >
+   > **The export is still straight**, and still on purpose: increment 2's
+   > deferral stands, `emit.ts` and `artfile.ts` are untouched, and the three
+   > byte pins are green without being looked at.
 4. **Per-cell curvature** (ε̄^k per cell) only when a use case demands k
    variation within a class — this is what would justify adopting the
    ring-LNS substrate, recorded in `ring-lns-fit.md` as a design decision
@@ -175,6 +249,18 @@ flow returning to 0 lands on L3's identity, not near it.
 - Ease arrival: bit-identical to the un-eased render of the target state;
   ease return: L3's identity. Overlay registry empty after the ladder's
   tick count exactly.
+
+  > **Met at increment 3, structurally.** Arrival is ABSORPTION: `morph.tick`
+  > moves the overlay into the base and empties the registry, so the arrived
+  > render is `buildCurvature(table, charges, law, target)` — the same call with
+  > the same argument, not a comparison. Return to zero empties onto `base = 0`,
+  > where that call returns `null` and the board takes its pre-curvature branch.
+  > The tick count is exact and exhaustive: all 49 × 49 ordered dial pairs, 12
+  > ticks for every move and 0 for every stay, registry empty after; a departure
+  > reaches exactly 0 in exactly its starting step's ticks, all twelve rungs
+  > checked, and the entry is DELETED rather than held at zero. Containment
+  > holds at every tick and not only at the ends — every composed dial is a
+  > convex combination of dials at or below the ceiling, so it is one too.
 - The charge → flow binding visible on the plate: same-coset cells curve
   the same way, and the `data-` provenance in exports says which.
 

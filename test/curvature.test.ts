@@ -935,11 +935,15 @@ describe("L2 — the module boundary, read off the import graph", () => {
         )
       )
       .sort();
-    // ONE FILE. The board does not import it either: it declares its own
-    // `CurveView` — `d` strings and nothing else — exactly as it declares
-    // `ReliefView` rather than importing `relief.ts`. So the whole of the
-    // curvature model reaches the DOM through a single page-level memo.
-    expect(importers).toEqual(["src/app/draw/page.tsx"]);
+    // TWO FILES, and the second arrived with increment 3. The board does not
+    // import it: it declares its own `CurveView` — `d` strings and nothing else
+    // — exactly as it declares `ReliefView` rather than importing `relief.ts`.
+    // So the curvature model still reaches the DOM through a single page-level
+    // memo, and `morph.ts` is on the display side of the boundary rather than
+    // through it: it names `curvature` for the dial's denominator and ceiling
+    // and holds no coordinate at all. `test/morph.test.ts` runs the mirror of
+    // this test on `morph.ts`'s own importers.
+    expect(importers).toEqual(["src/app/draw/page.tsx", "src/lib/morph.ts"]);
   });
 
   it("and it names nothing that decides ownership [PROVEN]", () => {
