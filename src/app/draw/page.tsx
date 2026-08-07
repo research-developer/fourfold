@@ -15,6 +15,7 @@ import DrawBoard, {
   SEAM,
   TILE,
   type BoardGeometry,
+  type CurveView,
   type PreviewSpec,
   type ReliefView,
   type ShapeTool,
@@ -99,7 +100,23 @@ import {
   type Tool,
 } from "@/lib/brush";
 import { buildFigure, type Convention } from "@/lib/figure";
-import { buildHexagon, type Hexagon } from "@/lib/hexagon";
+import { buildHexagon, latticeToPixel, type Hexagon } from "@/lib/hexagon";
+/**
+ * THE ONLY FILE IN `src/` THAT NAMES THE CURVATURE MODULE.
+ *
+ * `docs/spec-curvature.md` L2 says no warped coordinate may reach a mask, a
+ * plate, a brush or a containment decision, and the surest way to say that is
+ * the import graph: curvature enters at the display boundary, once, here.
+ * `test/curvature.test.ts` reads the tree and asserts exactly this list.
+ */
+import {
+  buildCurvature,
+  curvePaths,
+  MAX_FLOW,
+  REFINE,
+  V4_H_WALL,
+} from "@/lib/curvature";
+import { buildVertexTable } from "@/lib/vertices";
 import {
   EMPTY_PROPOSAL,
   proposalHolds,
@@ -1128,6 +1145,14 @@ export default function DrawPage() {
   const [focus, setFocus] = useState<FocusPath>(ROOT);
   const [reliefOn, setReliefOn] = useState(false);
   const [reading, setReading] = useState<Reading>("convex");
+  /**
+   * THE FLOW DIAL, in 144ths of the 60° apex. 0 is off and is the default.
+   *
+   * One number, and the charge supplies everything else — which edges bend and
+   * which way is decided by the two cells' charges, never by this. See
+   * `src/lib/curvature.ts`.
+   */
+  const [flow, setFlow] = useState(0);
   const [schemeName, setSchemeName] = useState<SchemeName>("hexad");
   const [base, setBase] = useState<Swatch>(() => swatchFromHex("#d4a017"));
 
@@ -2151,6 +2176,84 @@ export default function DrawPage() {
     };
   }, [frame, reliefSurface, canvas]);
 
+  // ── curvature ───────────────────────────────────────────────────────────
+
+  /**
+   * The shared vertex table — increment 1, finally with a reader.
+   *
+   * A function of the CUT and not of the frame, like `reliefSurface`, and built
+   * only when the dial is off zero: at depth 5 it is 6,144 cells and ~2 ms, and
+   * a plate nobody has curved must not pay for it. `vertices.ts` states the
+   * costs it was measured at.
+   */
+  const vertexTable = useMemo(
+    () =>
+      flow === 0
+        ? null
+        : buildVertexTable({
+            radix: 4,
+            depth: hex.depth,
+            sectors: 6,
+            convention: hex.convention,
+          }),
+    [flow, hex]
+  );
+
+  /**
+   * The curve field: one curve per wall, referenced by both its cells.
+   *
+   * `null` at flow 0 — `buildCurvature` refuses to build one — so the board
+   * takes the branch it took before this existed. That is L3's identity as a
+   * structural fact rather than an agreement.
+   */
+  const curveField = useMemo(
+    () =>
+      vertexTable === null
+        ? null
+        : buildCurvature(
+            vertexTable,
+            hex.cells.map((c) => c.charge),
+            V4_H_WALL,
+            flow
+          ),
+    [vertexTable, hex, flow]
+  );
+
+  /**
+   * The field, in the view's own pixels.
+   *
+   * THE ONE FLOAT BOUNDARY, and it is composed of two maps that already exist:
+   * `hexagon.latticeToPixel` at a unit divided by the refinement, then the
+   * sector view's affine. Nothing new projects anything.
+   *
+   * ── WHY THIS COMPOSES EXACTLY, WHERE THE RELIEF DOES NOT ────────────────
+   *
+   * A Bézier is affine-invariant: the image of the curve is the curve of the
+   * imaged control points, so pushing four points through `canvas.toView` IS the
+   * transformed curve, to the last bit of what the transform itself does. The
+   * relief's remap is radial and piecewise-linear IN THE RING INDEX, defined at
+   * lattice VERTICES; a control point is not a vertex and has no ring, so the
+   * same trick would need `deformPoint`'s float interpolation and the curve's
+   * ends would drift off the corners the relief drew.
+   *
+   * So the two do not compose, and rather than let them fight over the same
+   * points the page refuses to hold both: `pickFlow` turns the relief off and
+   * `pickRelief` returns the dial to zero, both announced. LOUD, and reversible.
+   */
+  const curve = useMemo<CurveView | null>(() => {
+    if (curveField === null) return null;
+    const unit = hex.radius / hex.scale / REFINE;
+    const [cx, cy] = hex.centre;
+    const m = canvas.toView;
+    const identity = canvas.view.mode === "hexagon";
+    return {
+      paths: curvePaths(curveField, (p) => {
+        const q = latticeToPixel(p, unit, cx, cy);
+        return identity ? q : applyAffine(m, q);
+      }),
+    };
+  }, [curveField, hex, canvas]);
+
   // ── the colour the next stroke will start from ──────────────────────────
 
   const prog = useMemo(
@@ -2934,16 +3037,47 @@ export default function DrawPage() {
     );
   };
 
+  /**
+   * THE RELIEF AND THE CURVE ARE MUTUALLY EXCLUSIVE, and the exclusion lives
+   * here — in the two writers — rather than in the board, so that it is a thing
+   * the user does and hears rather than a silent precedence rule.
+   *
+   * The reason is arithmetic and is stated in full on `curve`: a Bézier composes
+   * with an affine transform exactly and with the relief's radial remap not at
+   * all. Whichever control was just touched wins, which is the least surprising
+   * rule there is, and neither is destroyed — the dial keeps its position while
+   * the relief is on, and comes back when it goes off.
+   */
   const pickRelief = useCallback(
     (on: boolean) => {
       setReliefOn(on);
+      const dropped = on && flow > 0;
+      if (dropped) setFlow(0);
       setAnnounce(
         on
-          ? `relief on — ${READING_LABEL[reading]}; the ring under the pointer is the template`
+          ? `relief on — ${READING_LABEL[reading]}; the ring under the pointer is the template${
+              dropped ? "; curvature off, the two cannot compose" : ""
+            }`
           : "relief off — the plate is flat again"
       );
     },
-    [reading]
+    [reading, flow]
+  );
+
+  const pickFlow = useCallback(
+    (next: number) => {
+      setFlow(next);
+      const dropped = next > 0 && reliefOn;
+      if (dropped) setReliefOn(false);
+      setAnnounce(
+        next === 0
+          ? "curvature off — every edge straight again"
+          : `curvature ${next}/${REFINE} of the apex — cells bend on the charge's H-coset walls${
+              dropped ? "; relief off, the two cannot compose" : ""
+            }`
+      );
+    },
+    [reliefOn]
   );
 
   const pickReading = useCallback(
@@ -7756,6 +7890,54 @@ export default function DrawPage() {
                 </p>
               </>
             )}
+
+            {/* CURVATURE — ONE DIAL, and the charge decides everything else.
+                Which edges bend and which way they bend is read off the two
+                cells' charges; this number only says how far. The relief is the
+                other display warp on this page and the two cannot compose (a
+                Bézier survives an affine transform exactly and the relief's
+                radial remap not at all), so each control turns the other off
+                and says so — see `pickFlow`. */}
+            <label className={styles.dialRow}>
+              <span className={styles.benchKey}>curve</span>
+              <input
+                type="range"
+                className={styles.dial}
+                min={0}
+                max={MAX_FLOW}
+                step={1}
+                value={flow}
+                onChange={(e) => pickFlow(Number(e.target.value))}
+                aria-label="curvature, in 144ths of the apex"
+                aria-valuetext={
+                  flow === 0
+                    ? "flat — every edge straight"
+                    : `${flow} of ${REFINE} — the charge's walls bend`
+                }
+              />
+              <span className={styles.dialValue}>
+                {flow}/{REFINE}
+              </span>
+            </label>
+            {curveField !== null && (
+              <p className={styles.hint}>
+                A cell bends where its neighbour is <b>incoherent</b> with it —
+                a different coset of H = {"{"}1, σ₂σ₃{"}"}, the subgroup fixing
+                √6. Inside a domain the edge stays straight, so what you see is
+                the charge&rsquo;s <b>gradient</b>. Of{" "}
+                <b>{curveField.census.interior}</b> interior edges,{" "}
+                <b>{curveField.census.walls}</b> are walls and each is{" "}
+                <i>one</i> curve, drawn from both sides. The apex is the 60°
+                FlowAngle&rsquo;s — your neighbour&rsquo;s far corner, a vertex
+                the table already holds — so no root and no rational: the
+                control points are exact integers on the ×{REFINE} lattice. The
+                dial stops at {MAX_FLOW}/{REFINE}, where the bulge is a quarter
+                of a cell&rsquo;s height — the largest deflection the warp study
+                measured with nothing changing owner. <b>The export is still
+                straight</b>: the file pairs shapes position for position, so a
+                curved file is a format decision and gets its own pass.
+              </p>
+            )}
           </section>
 
           </div>
@@ -8695,6 +8877,7 @@ export default function DrawPage() {
               <DrawBoard
                 geom={canvas.geom}
                 relief={relief}
+                curve={curve}
                 paint={paint}
                 strata={strataTree}
                 // The ghost, the standing proposal and the cursor are all

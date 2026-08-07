@@ -66,7 +66,7 @@ flow returning to 0 lands on L3's identity, not near it.
 
 ## Increments, in order
 
-1. **Shared vertex table** (this wave — LANDED, see `src/lib/vertices.ts`).
+1. **Shared vertex table** (LANDED, see `src/lib/vertices.ts`).
    Derived from the address algebra — the derivation is the authority, the
    table is a memo. No drawing change; byte identity on all pinned exports;
    every existing test unmodified.
@@ -81,11 +81,73 @@ flow returning to 0 lands on L3's identity, not near it.
    > either way. And the closed forms are `(s+1)(s+2)/2` (triangle) and
    > `3s²+3s+1` (hexagon) for the distinct counts; `9s+6`/`18s+6` are the
    > *deficits*. Increment 2 inherits these distinctions by name.
-2. **Static per-charge flow.** One flow value per charge class, exact ring
-   apexes at the reversible angles, rendered as cubic Béziers at the display
-   boundary. The seam rule L1 enforced structurally (edge owned once, curve
-   emitted once, referenced by both cells — the "emit both sides from one
-   job" principle).
+2. **Static per-charge flow** (this wave — LANDED, see `src/lib/curvature.ts`).
+   One dial; the charge decides which edges bend and which way. Cubic Béziers
+   at the display boundary, L1 enforced structurally.
+
+   > **Corrected by building it — three times, and the first is the big one.**
+   >
+   > **(a) "flow as a function of the charge" is not drawable as stated at
+   > rep-4.** A curve needs a MAGNITUDE and a SIDE. The magnitude may be any
+   > symmetric function of the two adjacent charges; the SIDE may not, because
+   > the six reflections relabel the charge by φ = (σ₂ σ₃) and choosing a cell
+   > out of the pair {σ₂, σ₃} is choosing a fixed point of a transposition.
+   > The obstruction is not theoretical: **48 edges of the depth-3 hexagon lie
+   > ON a mirror line, where that reflection fixes the edge and SWAPS its two
+   > cells — and 24 of those carry the pair {σ₂, σ₃}** [PROVEN]. So the
+   > coboundary candidate survives only through the unique φ-stable quotient,
+   > **V₄ → V₄/H**, and H is `figure.ts`'s own √6-fixing subgroup — the one the
+   > game already scores on. The shipped law: *an edge curves exactly when its
+   > two cells are INCOHERENT, and bows into the non-H side.* No mirror-line
+   > edge is ever an H-wall, since h(x) = h(φx), so the law is never asked a
+   > question it cannot answer. The guard-fire is the rejected candidate itself
+   > (`V4_FULL_COBOUNDARY`), red on the six reflections and green on the six
+   > rotations.
+   >
+   > **(b) The radices are NOT symmetric here.** At rep-9 the grade is
+   > *invariant*, so φ₉ = id, nothing is unstable, and the FULL ℤ/3 coboundary
+   > draws — sign included, since of two distinct grades exactly one is the
+   > other's successor. **rep-4 can draw its charge only through V₄/H; rep-9
+   > draws all of ℤ/3.**
+   >
+   > **(c) "Exact ring apexes at the REVERSIBLE angles" names the wrong angles
+   > for this canvas.** `warp-findings.md` §R's unit condition is about
+   > COMPOSING apexes, which a static flow does not do, and its table is stated
+   > in the Cartesian ℤ[√3] frame. In the EISENSTEIN frame the figure actually
+   > lives in, √3·rot90 = 2ω − 1 is the integral map, so the lattice-exact apex
+   > angles are 60° and 120° and 30°/90°/150° are not. **Ring membership is a
+   > statement about a frame.** At 60° — the FlowAngle the canvas already IS —
+   > the apex over a cell edge is exactly the third vertex of the neighbouring
+   > cell, so the apex is an INDEX into the vertex table and there is no ring
+   > element, no √3 and no square root anywhere in the increment.
+   >
+   > Also load-bearing: the dial's ceiling is a MEASUREMENT, not a taste. At
+   > `k/144` the midpoint sagitta is `(3/4)(k/144)` of a cell's height, so
+   > `MAX_FLOW = 48` (= 1/3) is exactly Q3's measured-safe sagitta of ¼ of a
+   > cell, and twice it is Q3's measured failure. `3·MAX_FLOW = REFINE` is that
+   > sentence with the fractions cleared.
+   >
+   > **The two conventions draw different pictures** — 60 walls under `apex`
+   > against 48 under `ifs` at depth 2 on the same triangles [MEASURED], because
+   > `ifs` reorders the B/C roles and the recursion carries that down, so a
+   > triangle's ADDRESS and hence its charge differ. The curvature is the first
+   > thing in the program that makes §E's order-2-against-order-6 visible on the
+   > plate. Both fields are equivariant.
+   >
+   > **The rep-9 law ships in the library and has no UI**, because the draw page
+   > builds a rep-4 hexagon and nothing else. `Z3_GRADE_WALL` is tested at two
+   > depths on `buildRep9Hexagon`; it is one argument away from being drawn.
+   >
+   > **The relief and the curve do not compose, and the exclusion is at the
+   > source.** A Bézier is affine-invariant, so the sector view's transform
+   > passes through it exactly; the relief's remap is radial and defined at
+   > lattice VERTICES, and a control point is not a vertex. Each control turns
+   > the other off and announces it.
+   >
+   > **The export still writes the straight figure**, flagged: `emit.ts` pairs
+   > shapes position for position, so a curved file is a format decision and
+   > deserves its own pass. Nothing in `emit.ts`/`artfile.ts` was touched, and
+   > all three byte pins are green because flow 0 builds no field at all.
 3. **Eased flow** under G1–G3.
 4. **Per-cell curvature** (ε̄^k per cell) only when a use case demands k
    variation within a class — this is what would justify adopting the
@@ -115,3 +177,11 @@ flow returning to 0 lands on L3's identity, not near it.
   tick count exactly.
 - The charge → flow binding visible on the plate: same-coset cells curve
   the same way, and the `data-` provenance in exports says which.
+
+  > **Half met at increment 2.** On the plate it is met and measured — the
+  > walls are exactly the incoherent pairs, 4 × 66 of the 552 interior edges at
+  > depth 3, and the panel reads the count off the field rather than stating a
+  > constant. In the FILE it is not: the export writes the straight figure and
+  > carries no curvature provenance, because `emit.ts` pairs shapes position
+  > for position and neither it nor `artfile.ts` was touched. That is the one
+  > acceptance line increment 2 leaves open, and it is open on purpose.

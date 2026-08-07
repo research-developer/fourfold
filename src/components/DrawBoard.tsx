@@ -430,10 +430,43 @@ export interface ReliefView {
   bend: (p: readonly [number, number]) => readonly [number, number];
 }
 
+/**
+ * CURVATURE, as the board needs it: the plate's cells as `d` strings.
+ *
+ * The same DISPLAY SUBSTITUTION `ReliefView` is — same cells, same order, same
+ * indices, drawn somewhere else — and named here rather than imported for the
+ * same reason: the board must not learn what a charge is. `src/lib/curvature.ts`
+ * produces these and `src/app/draw/page.tsx` is the only file in `src/` that
+ * names that module. That is `docs/spec-curvature.md` L2 enforced by the import
+ * graph; `test/curvature.test.ts` reads it off the tree.
+ *
+ * `null` is the flow-0 state and is the ONLY thing that turns it off — L3. The
+ * board then takes the branch it took before curvature existed, which is why
+ * every layer below tests `curved` and keeps its old expression verbatim in the
+ * false arm rather than emitting a `<path>` that happens to trace a triangle.
+ *
+ * A `<path>` cannot be a `<polygon>` with an extra attribute, so the elements
+ * really do differ; what does NOT differ is anything else — same `key`, same
+ * `data-i`, same fills, same layer order, and the hit layer carries the curved
+ * outline so the pointer goes through the shape it can see, exactly as the
+ * relief already made it.
+ */
+export interface CurveView {
+  /** `d` attribute text per cell, aligned to `geom.cells`. */
+  readonly paths: readonly string[];
+}
+
 interface Props {
   geom: BoardGeometry;
   /** `null` when the relief is off, which is also the exported-file default. */
   relief: ReliefView | null;
+  /**
+   * `null` at flow 0 — the default, and the exported-file default. Mutually
+   * exclusive with `relief` at the source (the page will not hold both), because
+   * a Bézier composes with an AFFINE view transform exactly and with the
+   * relief's radial remap not at all. See the note in `draw/page.tsx`.
+   */
+  curve: CurveView | null;
   paint: PaintMap;
   /**
    * The stack as nested groups, when a layer in it is faded. `null` — and
@@ -577,11 +610,13 @@ const line = (p: readonly [number, number]) => `${p[0]},${p[1]}`;
 const TileLayer = memo(function TileLayer({
   geom,
   pts,
+  curved,
   order,
   show,
 }: {
   geom: BoardGeometry;
   pts: readonly string[];
+  curved: boolean;
   order: readonly number[];
   show: boolean;
 }) {
@@ -594,9 +629,13 @@ const TileLayer = memo(function TileLayer({
       strokeWidth={geom.seamWidth}
       pointerEvents="none"
     >
-      {order.map((i) => (
-        <polygon key={i} points={pts[i]} />
-      ))}
+      {order.map((i) =>
+        curved ? (
+          <path key={i} d={pts[i]} />
+        ) : (
+          <polygon key={i} points={pts[i]} />
+        )
+      )}
     </g>
   );
 });
@@ -618,6 +657,8 @@ const WashLayer = memo(function WashLayer({
   wash: readonly { fill: string; alpha: number; cells: readonly number[] }[];
   visible: ReadonlySet<number> | null;
 }) {
+  // No `curved` arm: the wash is the RELIEF's tone and the page never holds the
+  // relief and the curve at once, so this layer is only ever handed polygons.
   return (
     <g data-layer="relief" pointerEvents="none">
       {wash.map((band) => (
@@ -651,12 +692,14 @@ const WashLayer = memo(function WashLayer({
 const PaintLayer = memo(function PaintLayer({
   geom,
   pts,
+  curved,
   paint,
   visible,
   weld,
 }: {
   geom: BoardGeometry;
   pts: readonly string[];
+  curved: boolean;
   paint: PaintMap;
   visible: ReadonlySet<number> | null;
   weld: boolean;
@@ -670,12 +713,16 @@ const PaintLayer = memo(function PaintLayer({
     // difference between a view and a canvas.
     if (visible !== null && !visible.has(i)) continue;
     out.push(
-      <polygon
-        key={i}
-        points={p}
-        fill={colour}
-        stroke={weld ? colour : undefined}
-      />
+      curved ? (
+        <path key={i} d={p} fill={colour} stroke={weld ? colour : undefined} />
+      ) : (
+        <polygon
+          key={i}
+          points={p}
+          fill={colour}
+          stroke={weld ? colour : undefined}
+        />
+      )
     );
   }
   return (
@@ -759,12 +806,14 @@ export interface PaintNode {
 const StackLayer = memo(function StackLayer({
   geom,
   pts,
+  curved,
   strata,
   visible,
   weld,
 }: {
   geom: BoardGeometry;
   pts: readonly string[];
+  curved: boolean;
   strata: readonly PaintNode[];
   visible: ReadonlySet<number> | null;
   weld: boolean;
@@ -776,12 +825,16 @@ const StackLayer = memo(function StackLayer({
       if (p === undefined) continue;
       if (visible !== null && !visible.has(i)) continue;
       out.push(
-        <polygon
-          key={i}
-          points={p}
-          fill={colour}
-          stroke={weld ? colour : undefined}
-        />
+        curved ? (
+          <path key={i} d={p} fill={colour} stroke={weld ? colour : undefined} />
+        ) : (
+          <polygon
+            key={i}
+            points={p}
+            fill={colour}
+            stroke={weld ? colour : undefined}
+          />
+        )
       );
     }
     return out;
@@ -841,11 +894,13 @@ const DIM = 0.78;
  */
 const DimLayer = memo(function DimLayer({
   pts,
+  curved,
   order,
   focused,
   className,
 }: {
   pts: readonly string[];
+  curved: boolean;
   order: readonly number[];
   focused: ReadonlySet<number>;
   className: string;
@@ -871,7 +926,11 @@ const DimLayer = memo(function DimLayer({
       pointerEvents="none"
     >
       {order.map((i) =>
-        focused.has(i) ? null : <polygon key={i} points={pts[i]} />
+        focused.has(i) ? null : curved ? (
+          <path key={i} d={pts[i]} />
+        ) : (
+          <polygon key={i} points={pts[i]} />
+        )
       )}
     </g>
   );
@@ -887,16 +946,22 @@ const DimLayer = memo(function DimLayer({
  */
 const HitLayer = memo(function HitLayer({
   pts,
+  curved,
   order,
 }: {
   pts: readonly string[];
+  curved: boolean;
   order: readonly number[];
 }) {
   return (
     <g data-layer="hit" fill="transparent">
-      {order.map((i) => (
-        <polygon key={i} data-i={i} points={pts[i]} />
-      ))}
+      {order.map((i) =>
+        curved ? (
+          <path key={i} data-i={i} d={pts[i]} />
+        ) : (
+          <polygon key={i} data-i={i} points={pts[i]} />
+        )
+      )}
     </g>
   );
 });
@@ -1169,6 +1234,7 @@ const Ghost = memo(function Ghost({
 export default function DrawBoard({
   geom,
   relief,
+  curve,
   paint,
   strata = null,
   preview,
@@ -1208,8 +1274,21 @@ export default function DrawBoard({
    * changes only when the template ring does.
    */
   const flat = useMemo(() => geom.cells.map(points), [geom]);
-  const pts = relief === null ? flat : relief.points;
+  /**
+   * CURVATURE OUTRANKS THE RELIEF HERE ONLY BECAUSE THE PAGE NEVER SENDS BOTH.
+   * The exclusion is decided at the source, where a user can see it happen and
+   * hear it announced; this ternary is the consequence, not the decision.
+   */
+  const curved = curve !== null;
+  const pts = curve !== null ? curve.paths : relief === null ? flat : relief.points;
   const flatCentroids = useMemo(() => geom.cells.map((c) => c.centroid), [geom]);
+  /**
+   * CENTROIDS STAY STRAIGHT under curvature, deliberately. A curved cell's
+   * centroid is not the centroid of its corners, and nothing that reads this —
+   * the seed ring, the cursor, the axis overlay — is asking a question about the
+   * drawn outline. `docs/spec-curvature.md` L2: the warp is display-only, so it
+   * does not get to move the points other decisions are taken on.
+   */
   const centroids = relief === null ? flatCentroids : relief.centroids;
 
   /**
@@ -1583,11 +1662,18 @@ export default function DrawBoard({
 
       <rect width={geom.width} height={geom.height} fill="url(#draw-vignette)" />
 
-      <TileLayer geom={geom} pts={pts} order={order} show={showTiling} />
+      <TileLayer
+        geom={geom}
+        pts={pts}
+        curved={curved}
+        order={order}
+        show={showTiling}
+      />
       {strata === null ? (
         <PaintLayer
           geom={geom}
           pts={pts}
+          curved={curved}
           paint={paint}
           visible={visible}
           weld={weld}
@@ -1596,6 +1682,7 @@ export default function DrawBoard({
         <StackLayer
           geom={geom}
           pts={pts}
+          curved={curved}
           strata={strata}
           visible={visible}
           weld={weld}
@@ -1625,6 +1712,7 @@ export default function DrawBoard({
       {focused !== null && (
         <DimLayer
           pts={pts}
+          curved={curved}
           order={order}
           focused={focused}
           className={dimClass}
@@ -1682,7 +1770,7 @@ export default function DrawBoard({
         />
       )}
 
-      <HitLayer pts={pts} order={order} />
+      <HitLayer pts={pts} curved={curved} order={order} />
     </svg>
   );
 }
