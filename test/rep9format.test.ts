@@ -299,7 +299,7 @@ describe("the alphabet is the radix schedule", () => {
 describe("no existing address changes meaning", () => {
   it("admits all 1,364 triangle words and all 8,184 hexagon addresses", () => {
     const tri = wordsUpTo(REP4_LETTERS, MAX_DEPTH.triangle);
-    expect(tri.length).toBe(1364);
+    expect(tri.length).toBe(5460); // PROBE: 1364 on main (depth 5)
     for (const w of tri) expect(addressWord(w, "triangle")).toBe(w);
 
     let hex = 0;
@@ -309,7 +309,7 @@ describe("no existing address changes meaning", () => {
         hex++;
       }
     }
-    expect(hex).toBe(8184);
+    expect(hex).toBe(32760); // PROBE: 8184 on main (depth 5)
   });
 
   it("carries all 1,364 of them through the real reader in one payload", () => {
@@ -322,10 +322,10 @@ describe("no existing address changes meaning", () => {
       undefined,
       tri.map((w) => [w, GOLD] as const)
     );
-    expect(p.plate?.length).toBe(1364);
+    expect(p.plate?.length).toBe(5460); // PROBE: 1364 on main (depth 5)
     const back = extractArt(`<svg>${encodeArt(p)}</svg>`);
     expect(back).not.toBeNull();
-    expect(back?.plate?.length).toBe(1364);
+    expect(back?.plate?.length).toBe(5460);
   });
 
   it("makes the old length bound and the new scale bound the same predicate", () => {
@@ -338,8 +338,10 @@ describe("no existing address changes meaning", () => {
       expect(byScale).toBe(byLength);
       expect(addressWord(w, "triangle") !== null).toBe(byLength);
     }
-    expect(MAX_SCALE.triangle).toBe(32);
-    expect(MAX_SCALE.hexagon).toBe(32);
+    // PROBE (branch probe/depth-6): the pin's job is to notice the format cap
+    // moving, and on this branch it moved deliberately — 32 on main.
+    expect(MAX_SCALE.triangle).toBe(64);
+    expect(MAX_SCALE.hexagon).toBe(64);
   });
 });
 
@@ -532,16 +534,16 @@ describe("what the caps still mean", () => {
     for (const w of wordsUpTo(ADDRESS_LETTERS, MAX_DEPTH.triangle)) {
       if (addressWord(w, "triangle") !== null) admitted++;
     }
-    expect(admitted).toBe(5963);
-    expect(addressCount("triangle")).toBe(5963);
-    expect(addressCount("hexagon")).toBe(6 * 5963);
+    expect(admitted).toBe(41019); // PROBE: 5963 on main (depth 5)
+    expect(addressCount("triangle")).toBe(41019);
+    expect(addressCount("hexagon")).toBe(6 * 41019);
 
     // The formula this replaced — Σ cellCount over the drawable depths — counts
     // only the rep-4 words. It is a FLOOR, and the direction matters: a mixed
     // plate larger than it would have been refused as self-contradictory.
     let old = 0;
     for (let d = 1; d <= MAX_DEPTH.triangle; d++) old += cellCount("triangle", d);
-    expect(old).toBe(1364);
+    expect(old).toBe(5460); // PROBE: 1364 on main (depth 5)
     expect(addressCount("triangle")).toBeGreaterThan(old);
   });
 
