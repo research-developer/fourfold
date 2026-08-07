@@ -9043,6 +9043,11 @@ export default function DrawPage() {
                 className={styles.canvas}
                 candidateClass={styles.marching}
                 dimClass={styles.dimFade}
+                // The pointer overlay's box. It is a SIBLING of the plate inside
+                // `canvasHold` and every other child of that div is already
+                // absolutely positioned, so the plate remains the one thing in
+                // flow and the overlay lands exactly on it. See `DrawBoard`.
+                overlayClass={styles.canvasOverlay}
                 label={`${
                   rewind === null
                     ? "drawing plate"

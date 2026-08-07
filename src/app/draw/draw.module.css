@@ -3152,6 +3152,55 @@
 }
 
 /**
+ * THE POINTER OVERLAY — the keyboard cursor and the brush ghosts, in a
+ * compositor layer of their own.
+ *
+ * MEASURED, in Safari's Web Inspector at depth 6 (24,576 cells): 12.5 s of
+ * COMPOSITING against 120 ms of script over one 26 s session, one composite of
+ * 11.3 s following a single paint gesture and 270 ms per hover frame after that.
+ * WebKit re-rasterises a layer whole on any invalidation of it, so a three-sided
+ * cursor outline drawn INSIDE the plate cost a repaint of every cell on the
+ * plate. Outside it, it costs a repaint of itself.
+ *
+ * THE BOX IS THE PLATE'S OWN, and the board says so by putting `.canvas` on the
+ * overlay as well — one rule, on two elements, rather than two rules that have
+ * to be kept agreeing. This class adds POSITIONING and nothing else.
+ *
+ * `inset: 0` WAS THE FIRST ATTEMPT AND IT WAS MEASURED WRONG. An absolutely
+ * positioned REPLACED element does not solve its height from `bottom`: with
+ * `height: auto` it takes the intrinsic ratio against its used width, and the
+ * used width came from the container rather than from `.canvas`'s `max-width`.
+ * At 1280×900 that put the overlay at 847×746 over a 748×658 plate — the cursor
+ * drawn 13% oversize and off-centre. `left: 0; right: 0` with auto inline
+ * margins is the centring the flex container was doing for the plate, expressed
+ * for an out-of-flow box; the width then clamps to the same `max-width` and the
+ * height follows the same intrinsic ratio, so the two boxes coincide exactly.
+ * Verified in Chromium and WebKit: both SVGs map the same viewBox point to the
+ * same screen pixel, at every corner and at the centre.
+ *
+ * `pointer-events: none` because every gesture belongs to the plate underneath.
+ *
+ * `z-index: 0` AND NOT 1, which is the whole of the stacking argument. The
+ * cursor and the ghosts used to be the last children of the plate — a
+ * NON-positioned element, so every absolutely positioned thing in this box
+ * painted over them: the HUD at z-index 2, and also the empty hint, the drop
+ * note and the candidate bar, which carry no z-index at all. Lifting them into a
+ * positioned layer at 1 would have put them over those three. At 0 the overlay
+ * joins the same paint step as the auto-z-index siblings and loses to them on
+ * tree order, since the board is the first child — which is exactly the
+ * relationship it had before, and it is still unambiguously above the plate.
+ */
+.canvasOverlay {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  margin-inline: auto;
+  z-index: 0;
+  pointer-events: none;
+}
+
+/**
  * `8%` FLOORED AT 44px, and the floor is the zoom cluster's doing.
  *
  * These two notes are centred near the bottom of the plate and the zoom stepper
