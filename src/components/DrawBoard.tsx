@@ -280,6 +280,287 @@ export function focusFrame(
   };
 }
 
+/**
+ * THE `viewBox`, WRITTEN ONCE.
+ *
+ * The board draws two SVGs — the plate and the pointer overlay — and they have
+ * to be the same window onto the same units or the cursor is drawn somewhere
+ * the cell it names is not. Two agreeing copies of this expression is exactly
+ * the kind of agreement that survives a review and not a zoom, so there is one
+ * expression and both elements read it.
+ */
+export const viewBoxOf = (
+  geom: { width: number; height: number },
+  view: ViewWindow | null
+): string =>
+  view === null
+    ? `0 0 ${geom.width} ${geom.height}`
+    : `${view.x} ${view.y} ${view.w} ${view.h}`;
+
+/** As much of a `DOMRect` as the conversions below need. */
+export interface BoardRect {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+/**
+ * Canvas units per client pixel, on each axis. `null` for a box with no area.
+ *
+ * The board's `<svg>` has no `preserveAspectRatio`, so the default `xMidYMid
+ * meet` is in force — and it never letterboxes, because `.canvas` is
+ * `height: auto` and therefore takes its box from the viewBox's own ratio.
+ * `view` keeps that ratio (the page divides both extents by one zoom), so the
+ * two axes' scales are equal in practice and are still computed separately:
+ * a ratio that ever stopped agreeing would then be a slightly wrong cursor
+ * rather than a hit test that lands on the wrong cell.
+ */
+const unitScale = (
+  rect: BoardRect,
+  view: ViewWindow | null,
+  geom: { width: number; height: number }
+): readonly [number, number] | null => {
+  if (rect.width === 0 || rect.height === 0) return null;
+  const w = view === null ? geom.width : view.w;
+  const h = view === null ? geom.height : view.h;
+  return [w / rect.width, h / rect.height];
+};
+
+/**
+ * A CLIENT POINT in canvas units, or `null` when the box has no area.
+ *
+ * The one conversion. `unitsBy` below is the same scale applied to a delta,
+ * and the geometric hit test is this followed by a point-in-cell test, so a
+ * pan, a stroke and a cursor all agree about where the pointer is by
+ * construction rather than by three functions happening to round the same way.
+ */
+export function unitsAt(
+  rect: BoardRect,
+  view: ViewWindow | null,
+  geom: { width: number; height: number },
+  clientX: number,
+  clientY: number
+): readonly [number, number] | null {
+  const s = unitScale(rect, view, geom);
+  if (s === null) return null;
+  const x0 = view === null ? 0 : view.x;
+  const y0 = view === null ? 0 : view.y;
+  return [x0 + (clientX - rect.left) * s[0], y0 + (clientY - rect.top) * s[1]];
+}
+
+/** A client-pixel DELTA in canvas units. Used by the pan. */
+export function unitsBy(
+  rect: BoardRect,
+  view: ViewWindow | null,
+  geom: { width: number; height: number },
+  dx: number,
+  dy: number
+): readonly [number, number] {
+  const s = unitScale(rect, view, geom);
+  return s === null ? [0, 0] : [dx * s[0], dy * s[1]];
+}
+
+/**
+ * Is this point inside this polygon?
+ *
+ * Crossing number (PNPOLY), which for a TILING is the property that matters:
+ * the half-open comparison `(ya > y) !== (yb > y)` counts each boundary exactly
+ * once across the whole plane, so every point belongs to exactly one cell and
+ * none belongs to two. The browser's own answer on a shared edge is "whichever
+ * element is on top", which is a different rule that agrees everywhere except
+ * on a measure-zero set; see `makeCellIndex` for what is done about that.
+ */
+const insideCell = (
+  verts: readonly (readonly [number, number])[],
+  x: number,
+  y: number
+): boolean => {
+  let hit = false;
+  for (let a = 0, b = verts.length - 1; a < verts.length; b = a++) {
+    const va = verts[a];
+    const vb = verts[b];
+    if (
+      va[1] > y !== vb[1] > y &&
+      x < ((vb[0] - va[0]) * (y - va[1])) / (vb[1] - va[1]) + va[0]
+    ) {
+      hit = !hit;
+    }
+  }
+  return hit;
+};
+
+/** A point in canvas units to the cell under it, or `null` off the figure. */
+export interface CellIndex {
+  readonly cellAt: (x: number, y: number) => number | null;
+}
+
+/**
+ * The GEOMETRIC hit test: a point in canvas units to a cell index.
+ *
+ * ── Why this exists at all ──────────────────────────────────────────────
+ *
+ * The board used to answer "which cell" only by reading `data-i` off
+ * `event.target`, which meant one transparent DOM element per cell had to be in
+ * the document for the pointer to land on — 98,304 of them at depth 7, built at
+ * load, kept forever, and re-rasterised by WebKit on every invalidation of the
+ * plate. Measured in Safari at depth 6: 12.5 s of compositing against 120 ms of
+ * script. The elements were not paying for themselves.
+ *
+ * It is also the only way to answer for a point the pointer never visited,
+ * which is what bridging a fast drag needs — `document.elementFromPoint` per
+ * sample is a forced layout per sample and is not that answer.
+ *
+ * ── The index ───────────────────────────────────────────────────────────
+ *
+ * A uniform bucket grid over the cells' bounding boxes, at the size of the
+ * largest box, so a cell touches at most four buckets and a query scans the
+ * handful that overlap one. Built on FIRST USE and not at construction: a
+ * board that is never pointed at — an export, a preview, a print — must not pay
+ * for a structure only the pointer reads, and at depth 7 that build is the
+ * difference between a page that loads and one that hangs.
+ *
+ * ── The boundary, stated ────────────────────────────────────────────────
+ *
+ * Interior points are exact and are what the exhaustive test pins. On a shared
+ * EDGE the crossing rule gives the point to exactly one of the two incident
+ * cells, deterministically; the DOM gave it to whichever element was painted
+ * last. Candidates are still scanned topmost-first, so where the two rules can
+ * both fire — a geometry whose cells genuinely overlap, which a tiling's do not
+ * — this one answers as the DOM did.
+ */
+export function makeCellIndex(
+  geom: BoardGeometry,
+  order: readonly number[]
+): CellIndex {
+  let cols = 0;
+  let rows = 0;
+  let size = 0;
+  let ox = 0;
+  let oy = 0;
+  let buckets: number[][] | null = null;
+
+  const build = () => {
+    const n = order.length;
+    const box = new Float64Array(n * 4);
+    let ext = 0;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (let k = 0; k < n; k++) {
+      const cell = geom.cells[order[k]];
+      if (cell === undefined) {
+        box[k * 4] = NaN;
+        continue;
+      }
+      let x0 = Infinity;
+      let y0 = Infinity;
+      let x1 = -Infinity;
+      let y1 = -Infinity;
+      for (const v of cell.verts) {
+        if (v[0] < x0) x0 = v[0];
+        if (v[0] > x1) x1 = v[0];
+        if (v[1] < y0) y0 = v[1];
+        if (v[1] > y1) y1 = v[1];
+      }
+      box[k * 4] = x0;
+      box[k * 4 + 1] = y0;
+      box[k * 4 + 2] = x1;
+      box[k * 4 + 3] = y1;
+      if (x1 - x0 > ext) ext = x1 - x0;
+      if (y1 - y0 > ext) ext = y1 - y0;
+      if (x0 < minX) minX = x0;
+      if (y0 < minY) minY = y0;
+      if (x1 > maxX) maxX = x1;
+      if (y1 > maxY) maxY = y1;
+    }
+    if (!Number.isFinite(minX)) {
+      buckets = [];
+      return;
+    }
+    // The largest cell box, floored so a degenerate geometry cannot ask for a
+    // grid with more buckets than the plate has cells.
+    size = Math.max(ext, (maxX - minX) / 512, (maxY - minY) / 512, 1e-9);
+    ox = minX;
+    oy = minY;
+    cols = Math.max(1, Math.ceil((maxX - minX) / size) + 1);
+    rows = Math.max(1, Math.ceil((maxY - minY) / size) + 1);
+    const grid: number[][] = new Array(cols * rows);
+    for (let k = 0; k < n; k++) {
+      const x0 = box[k * 4];
+      if (Number.isNaN(x0)) continue;
+      const cx0 = Math.max(0, Math.floor((x0 - ox) / size));
+      const cy0 = Math.max(0, Math.floor((box[k * 4 + 1] - oy) / size));
+      const cx1 = Math.min(cols - 1, Math.floor((box[k * 4 + 2] - ox) / size));
+      const cy1 = Math.min(rows - 1, Math.floor((box[k * 4 + 3] - oy) / size));
+      for (let cy = cy0; cy <= cy1; cy++) {
+        for (let cx = cx0; cx <= cx1; cx++) {
+          const at = cy * cols + cx;
+          (grid[at] ??= []).push(order[k]);
+        }
+      }
+    }
+    buckets = grid;
+  };
+
+  return {
+    cellAt(x, y) {
+      if (buckets === null) build();
+      const grid = buckets;
+      if (grid === null || grid.length === 0) return null;
+      const cx = Math.floor((x - ox) / size);
+      const cy = Math.floor((y - oy) / size);
+      if (cx < 0 || cy < 0 || cx >= cols || cy >= rows) return null;
+      const b = grid[cy * cols + cx];
+      if (b === undefined) return null;
+      // Topmost first: `order` is ascending and the layers paint it in that
+      // order, so the LAST element that covers a point is the one the DOM
+      // would have handed back.
+      for (let k = b.length - 1; k >= 0; k--) {
+        const cell = geom.cells[b[k]];
+        if (cell !== undefined && insideCell(cell.verts, x, y)) return b[k];
+      }
+      return null;
+    },
+  };
+}
+
+/**
+ * Half a cell edge, in canvas units — the step a fast drag is bridged at.
+ *
+ * HALF, so no cell can be stepped over: a segment sampled at half the shortest
+ * edge of a cell cannot cross a whole cell between two samples. Taken off one
+ * cell because the figures this board draws are tilings of congruent triangles;
+ * a geometry of mixed sizes would want the minimum over all of them, and would
+ * get a step that is merely conservative rather than wrong from this.
+ */
+export function bridgeStep(geom: BoardGeometry): number {
+  const cell = geom.cells[geom.shown?.[0] ?? 0] ?? geom.cells[0];
+  if (cell === undefined) return 1;
+  let m = Infinity;
+  const v = cell.verts;
+  for (let k = 0; k < v.length; k++) {
+    const a = v[k];
+    const b = v[(k + 1) % v.length];
+    const d = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    if (d < m) m = d;
+  }
+  return Number.isFinite(m) && m > 0 ? m / 2 : 1;
+}
+
+/**
+ * How many samples one bridge may take.
+ *
+ * A pointer that re-enters the plate far from where it left would otherwise ask
+ * for a point test per half-cell across the whole figure. `onPointerLeave`
+ * already drops the anchor so that jump cannot normally happen; this is the
+ * bound for the ones it cannot see, and it is generous enough that no real
+ * stroke reaches it — a corner-to-corner sweep of a depth-7 plate is some 650
+ * steps.
+ */
+export const BRIDGE_CAP = 2048;
+
 /** A completed zero-drag tap: which cell, and when it was let go. */
 export interface Tap {
   cell: number;
@@ -543,6 +824,20 @@ interface Props {
   candidateClass: string;
   /** Ditto: the dim layer's fade, which `prefers-reduced-motion` turns off. */
   dimClass: string;
+  /**
+   * Ditto: the POINTER OVERLAY's box — absolutely positioned over the plate.
+   *
+   * A second `<svg>`, a sibling of the plate inside `canvasHold`, holding
+   * everything that follows the pointer. It exists for one measured reason:
+   * WebKit re-rasterises the whole of a layer on any invalidation of it, and at
+   * depth 6 the plate layer is 12.5 s of compositing against 120 ms of script.
+   * A cursor inside the plate therefore repaints 24,576 cells to move a
+   * three-sided outline. Outside it, a hover invalidates a layer holding a
+   * dozen elements and the plate is not touched at all.
+   *
+   * The page owns the CSS module, exactly as it owns `className` beside this.
+   */
+  overlayClass: string;
   onHover: (i: number | null) => void;
   onPaint: (i: number) => void;
   onStrokeEnd: () => void;
@@ -598,10 +893,86 @@ export const TILE = "#201c19";
 export const SEAM = "rgba(236,230,220,.16)";
 export const PAINT_SEAM = "rgba(10,9,8,.34)";
 
+/** The empty answer from `crossed`, hoisted so it is one object and not many. */
+const NO_CELLS: readonly number[] = [];
+
 const points = (c: { readonly verts: readonly (readonly [number, number])[] }) =>
   c.verts.map((v) => `${v[0]},${v[1]}`).join(" ");
 
 const line = (p: readonly [number, number]) => `${p[0]},${p[1]}`;
+
+/**
+ * MANY CELLS, ONE `d`.
+ *
+ * A polygon's `points` list is already valid path data after an `M`: every pair
+ * following a moveto is an implicit lineto, and `Z` closes it exactly as the
+ * polygon element does. A curved cell arrives as a `d` that already opens with
+ * `M` and ends with `Z`, so it is concatenated verbatim.
+ *
+ * WHY THE FILL IS THE SAME PICTURE. `nonzero` over the whole path, and these
+ * cells are a TILING — no two of them overlap, so every interior point has
+ * winding ±1 and is filled, and no point is inside two subpaths of opposite
+ * winding where the rule could cancel. The hexagon constructor throws on two
+ * cells sharing a lattice key, and the curvature field gives a shared edge to
+ * ONE wall object held by both cells, so the tiling property is enforced at both
+ * sources rather than assumed here.
+ *
+ * ── AND THE SEAMS ARE NOT THE SAME PICTURE. MEASURED, NOT ASSUMED. ──────
+ *
+ * This change was made believing it was pixel-identical, on the argument that
+ * every cell already strokes its own outline so a shared edge is double-stroked
+ * either way. THAT ARGUMENT IS WRONG, and the refutation is a two-triangle case
+ * measured in both Chromium and WebKit. Sharing one vertical edge, stroke-width
+ * 2, `rgba(236,230,220,.16)` over `#201c19`:
+ *
+ *   two polygons  x−1 = (91,87,81)   x = (64,60,55)
+ *   one path      x−1 = (64,60,55)   x = (64,60,55)
+ *
+ * Two elements are painted in order, so the SECOND cell's opaque fill erases the
+ * half of the FIRST cell's stroke that lies on its side, and the surviving ink
+ * is asymmetric about the edge — brighter on one side, a whole pass missing on
+ * the other. One path fills everything and then strokes everything, so no fill
+ * ever lands on a stroke and the seam is symmetric. Outer boundary edges are
+ * byte-identical under both.
+ *
+ * Over a whole depth-4 plate: 10.87% of pixels differ, 69,574 of them brighter
+ * against 589 dimmer, mean plate value +0.73 of 255, largest single-channel
+ * delta 31. The tiling reads very slightly more present, because the hairline
+ * that was being partly erased no longer is.
+ *
+ * IT IS KEPT, and the reason is not the node count on its own. The old
+ * appearance was an artefact of PAINT ORDER — interior seams brighter than
+ * boundary seams, by an amount nobody chose and no constant could have stated —
+ * and there is no stroke alpha that reproduces it, because matching the interior
+ * would then over-brighten the rim. The new seam is the one the `SEAM` constant
+ * actually says.
+ *
+ * WHAT IT COSTS, stated: `emit.ts` writes the tiling as one shape per cell and
+ * `identify.ts` COUNTS those shapes to recognise a file, so the exported file
+ * still carries the old artefact and the canvas no longer matches it hairline
+ * for hairline. Nothing about geometry, colour or the payload moved; the file is
+ * byte-for-byte what it was. Whether the file should follow is a question for
+ * the format, not for the board.
+ *
+ * WHAT IT BUYS. One element instead of one per cell: 1,536 fewer nodes at depth
+ * 4, 24,576 fewer at depth 6 and 98,304 fewer at depth 7, for a layer that is a
+ * single flat colour and could never have been addressed per cell anyway.
+ */
+export const onePath = (
+  pts: readonly string[],
+  curved: boolean,
+  order: readonly number[],
+  skip?: ReadonlySet<number>
+): string => {
+  let d = "";
+  for (const i of order) {
+    if (skip !== undefined && skip.has(i)) continue;
+    const p = pts[i];
+    if (p === undefined) continue;
+    d += curved ? p : `M${p}Z`;
+  }
+  return d;
+};
 
 /**
  * The tiling. Renders once per figure — and, with the relief on, once per ring
@@ -629,13 +1000,7 @@ const TileLayer = memo(function TileLayer({
       strokeWidth={geom.seamWidth}
       pointerEvents="none"
     >
-      {order.map((i) =>
-        curved ? (
-          <path key={i} d={pts[i]} />
-        ) : (
-          <polygon key={i} points={pts[i]} />
-        )
-      )}
+      <path d={onePath(pts, curved, order)} />
     </g>
   );
 });
@@ -925,24 +1290,49 @@ const DimLayer = memo(function DimLayer({
       fillOpacity={DIM}
       pointerEvents="none"
     >
-      {order.map((i) =>
-        focused.has(i) ? null : curved ? (
-          <path key={i} d={pts[i]} />
-        ) : (
-          <polygon key={i} points={pts[i]} />
-        )
-      )}
+      {/* ONE PATH, for the reason `onePath` gives — and the scrim is the layer
+          that most needed it: it is the complement of the focus, which at a
+          drilled-in sector is five sixths of the plate. 1,280 elements at
+          depth 4, measured, against one.
+
+          AND IT IS ALSO NOT PIXEL-IDENTICAL, for the neighbouring reason. Each
+          polygon's ANTIALIASED edge covers only part of a boundary pixel, so
+          two of them meeting there composited to less than full coverage and
+          the scrim carried a faint bright grid along every seam — the tiling
+          underneath showing through a scrim that was supposed to be flat. A
+          single path has no interior edges to antialias, so the coverage is
+          solid. Measured over a drilled-in depth-4 plate: 8.44% of pixels
+          differ, 44,507 of them DIMMER against 7,450 brighter, which is the
+          pinholes closing. `fillOpacity` still multiplies the same way; it was
+          never the alpha that differed, it was the coverage. */}
+      <path d={onePath(pts, curved, order, focused)} />
     </g>
   );
 });
 
 /**
- * Transparent, topmost, and the only thing the pointer ever hits.
+ * Transparent, topmost, and what the pointer hits WHEN A WARP IS ON.
  *
  * It carries the SAME deformed points as everything else, so a click lands on
  * the cell that is under the finger rather than on the cell that would have been
  * there with the relief off. A lens the pointer does not go through is a lens
  * that has broken the drawing program.
+ *
+ * ── AND IT IS NOT RENDERED WHEN NO WARP IS ON ───────────────────────────
+ *
+ * Which is nearly always. The relief and the curve are the only two things that
+ * move a cell away from its lattice position; with both off, the outline the
+ * pointer can see IS the outline `geom.cells[i].verts` states, and
+ * `makeCellIndex` answers the same question from the geometry with no elements
+ * at all. Under a warp it cannot: the DOM hit is POST-warp and the lattice test
+ * is PRE-warp, and answering pre-warp for a plate that is drawn warped would put
+ * the paint somewhere the user did not point. So the layer exists exactly when
+ * the two answers differ, and the N elements exist exactly when a warp does.
+ *
+ * `docs/spec-curvature.md` L2 says no warped coordinate reaches a decision, and
+ * this is the one place the warp is on the deciding side of that line — it was
+ * already, before this split; the split only names it. Whether the right answer
+ * is instead to invert the warp and keep deciding on the lattice is MATH-129.
  */
 const HitLayer = memo(function HitLayer({
   pts,
@@ -1253,6 +1643,7 @@ export default function DrawBoard({
   className,
   candidateClass,
   dimClass,
+  overlayClass,
   onHover,
   onPaint,
   onStrokeEnd,
@@ -1308,12 +1699,41 @@ export default function DrawBoard({
     [geom]
   );
 
+  /**
+   * WHICH HIT TEST ANSWERS. The DOM's under a warp, the lattice's otherwise.
+   *
+   * See `HitLayer` for the whole of the argument. It is one boolean because the
+   * two things that warp the plate are mutually exclusive at the source and
+   * neither of them is on in the ordinary case.
+   */
+  const hitDom = relief !== null || curve !== null;
+  /**
+   * The geometric hit test, rebuilt with the figure and the frame.
+   *
+   * `makeCellIndex` builds nothing until it is first asked, so a board that is
+   * rendered and never pointed at — and a board under a warp, which asks the DOM
+   * instead — pays nothing for this at all.
+   */
+  const index = useMemo(() => makeCellIndex(geom, order), [geom, order]);
+  /** Half a cell edge: the step a fast drag's gaps are filled in at. */
+  const step = useMemo(() => bridgeStep(geom), [geom]);
+
   const drawing = useRef(false);
   const proposing = useRef(false);
   /** A press that landed inside the standing candidate: a tap here commits. */
   const armed = useRef(false);
   const moved = useRef(false);
   const last = useRef<number | null>(null);
+  /**
+   * Where the pointer was at the last sample of a live free-draw stroke, in
+   * CANVAS UNITS, or `null` when there is nothing to bridge from.
+   *
+   * Units and not client pixels, because the thing bridged across is a segment
+   * of the LATTICE and the hand's pixels are at whatever zoom the view is.
+   * Cleared on release and on leaving the plate — see `onPointerLeave`, where
+   * the reason is a stroke that must not be joined up across the outside.
+   */
+  const lastPt = useRef<readonly [number, number] | null>(null);
   /** The cell an anchored gesture started at, or `null` when none is running. */
   const anchor = useRef<number | null>(null);
   /** The last client point of a pan drag, or `null` when none is running. */
@@ -1406,6 +1826,12 @@ export default function DrawBoard({
       tapFrom.current = null;
       tapDrag.current = false;
 
+      // The stroke's bridging anchor belongs to the gesture and to nothing
+      // else. Dropped on EVERY release, cancel included, so the next press
+      // starts from its own press point rather than from wherever the last one
+      // ended — which would otherwise draw a line between two strokes.
+      lastPt.current = null;
+
       if (panFrom.current !== null) {
         panFrom.current = null;
       } else if (anchor.current !== null) {
@@ -1443,20 +1869,107 @@ export default function DrawBoard({
   }, [end]);
 
   /**
-   * Client pixels to canvas units.
-   *
-   * FLOAT, and legitimately: this converts a mouse delta into a scroll offset.
-   * It never chooses a cell — the hit layer does that, by `data-i`, and it does
-   * it under whatever `viewBox` is in force without knowing there is one.
+   * Client pixels to canvas units, as a DELTA. This one converts a mouse drag
+   * into a scroll offset. `unitsBy` is the arithmetic; the element's box is the
+   * only thing this adds.
    */
-  const toUnits = (dx: number, dy: number): [number, number] => {
+  const toUnits = (dx: number, dy: number): readonly [number, number] => {
     const el = svg.current;
     if (el === null) return [0, 0];
-    const rect = el.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return [0, 0];
-    const w = view === null ? geom.width : view.w;
-    const h = view === null ? geom.height : view.h;
-    return [(dx * w) / rect.width, (dy * h) / rect.height];
+    return unitsBy(el.getBoundingClientRect(), view, geom, dx, dy);
+  };
+
+  /**
+   * The plate's box, or `null`. Read ONCE per event and handed down.
+   *
+   * `getBoundingClientRect` on an element whose subtree was just mutated forces
+   * a synchronous layout, and a stroke mutates the subtree on every frame. Once
+   * per event is a cost the pan already paid; once per coalesced sample would be
+   * a dozen forced layouts per frame, which is the shape of bug this whole wave
+   * is about.
+   */
+  const boxNow = (): BoardRect | null =>
+    hitDom ? null : svg.current?.getBoundingClientRect() ?? null;
+
+  /**
+   * WHICH CELL — the one door both `down` and `move` go through.
+   *
+   * Under a warp it is the DOM's answer, off `data-i`, exactly as it always
+   * was. Otherwise it is the geometry's, and the `HitLayer` is not in the
+   * document to be asked. See `HitLayer` for why the two are not interchangeable.
+   */
+  const resolveCell = (
+    e: { target: EventTarget | null; clientX: number; clientY: number },
+    box: BoardRect | null
+  ): number | null => {
+    if (hitDom) return indexOf(e.target);
+    if (box === null) return null;
+    const p = unitsAt(box, view, geom, e.clientX, e.clientY);
+    return p === null ? null : index.cellAt(p[0], p[1]);
+  };
+
+  /**
+   * EVERY CELL THE POINTER CROSSED since the last move, in the order it crossed
+   * them.
+   *
+   * Two things the old one-cell-per-event read could not do, and both were in
+   * the field reports.
+   *
+   * COALESCED SAMPLES. A pointer reports at up to 120 Hz and the browser
+   * delivers one `pointermove` per animation frame with the rest folded into it;
+   * `getCoalescedEvents` is the folded ones, and reading only the dispatched
+   * event throws away most of a fast stroke's positions before anything has
+   * looked at them.
+   *
+   * BRIDGING. Even with every sample, a hand moving faster than a cell per
+   * sample leaves holes — the samples land in cells that are not adjacent, and
+   * a brush that skips cells is a brush that cannot draw a line. So the segment
+   * between two consecutive positions is walked at half a cell edge and every
+   * cell it passes through is laid, in order.
+   *
+   * Bridging is why this cannot be done on the DOM path: a coalesced event has
+   * no `target` to read `data-i` from, and a point the pointer never visited has
+   * no target at all. Under a warp this returns the single cell the dispatched
+   * event named, which is what the board did before — stated here as a branch
+   * rather than hidden as a fallback, because it means a fast drag still skips
+   * cells while the relief or the curve is on. That is MATH-129's to close.
+   */
+  const crossed = (
+    e: React.PointerEvent<SVGSVGElement>,
+    box: BoardRect | null
+  ): readonly number[] => {
+    if (box === null) {
+      const i = resolveCell(e, box);
+      return i === null ? NO_CELLS : [i];
+    }
+    const raw = e.nativeEvent.getCoalescedEvents?.();
+    const samples = raw !== undefined && raw.length > 0 ? raw : [e.nativeEvent];
+    const out: number[] = [];
+    const take = (i: number | null) => {
+      if (i !== null && out[out.length - 1] !== i) out.push(i);
+    };
+    let from = lastPt.current;
+    for (const s of samples) {
+      const to = unitsAt(box, view, geom, s.clientX, s.clientY);
+      if (to === null) continue;
+      if (from === null) {
+        take(index.cellAt(to[0], to[1]));
+      } else {
+        const dx = to[0] - from[0];
+        const dy = to[1] - from[1];
+        const n = Math.max(
+          1,
+          Math.min(BRIDGE_CAP, Math.ceil(Math.hypot(dx, dy) / step))
+        );
+        for (let k = 1; k <= n; k++) {
+          const t = k / n;
+          take(index.cellAt(from[0] + dx * t, from[1] + dy * t));
+        }
+      }
+      from = to;
+    }
+    lastPt.current = from;
+    return out;
   };
 
   const down = (e: React.PointerEvent<SVGSVGElement>) => {
@@ -1484,10 +1997,17 @@ export default function DrawBoard({
       return;
     }
 
-    const i = indexOf(e.target);
+    const box = boxNow();
+    const i = resolveCell(e, box);
     if (i === null) return;
     const el = e.target as Element;
     if (el.hasPointerCapture?.(e.pointerId)) el.releasePointerCapture(e.pointerId);
+    // WHERE the press landed, in units, so the first move of the stroke has
+    // something to bridge FROM. Set for every press that names a cell, in every
+    // mode, because the mode can change under a live pointer and an anchor that
+    // only some modes set would be an anchor some other mode inherited.
+    lastPt.current =
+      box === null ? null : unitsAt(box, view, geom, e.clientX, e.clientY);
 
     tapCell.current = i;
     tapFrom.current = { x: e.clientX, y: e.clientY };
@@ -1572,7 +2092,11 @@ export default function DrawBoard({
     // on the way across either.
     if (focusArmed.current !== null) return;
 
-    const i = indexOf(e.target);
+    // Measured ONCE for this event and handed to both resolutions below — the
+    // single cell every branch but the last one wants, and the whole coalesced
+    // run the last one does.
+    const box = boxNow();
+    const i = resolveCell(e, box);
 
     if (anchor.current !== null) {
       // `alt` is read HERE and not at the press: releasing Option mid-drag has
@@ -1605,10 +2129,17 @@ export default function DrawBoard({
       onHover(i);
       return;
     }
-    if (i === null || i === last.current) return;
-    last.current = i;
-    onHover(i);
-    onPaint(i);
+    // ONE GESTURE, EVERY CELL IT CROSSED. `crossed` already drops consecutive
+    // repeats within an event; the test against `last` drops the one that spans
+    // two events, which is the test this branch made when it read one cell.
+    // `onPaint` is called once per new cell, in order along the stroke, which is
+    // the contract the page's `paintAt` was already given by a slow drag.
+    for (const c of crossed(e, box)) {
+      if (c === last.current) continue;
+      last.current = c;
+      onHover(c);
+      onPaint(c);
+    }
   };
 
   const key = (e: React.KeyboardEvent<SVGSVGElement>) => {
@@ -1634,15 +2165,14 @@ export default function DrawBoard({
   };
 
   const cursorPoints = cursor === null ? undefined : pts[cursor];
+  /** ONE EXPRESSION, read by the plate and by the overlay. See `viewBoxOf`. */
+  const vbox = viewBoxOf(geom, view);
 
   return (
+    <>
     <svg
       ref={svg}
-      viewBox={
-        view === null
-          ? `0 0 ${geom.width} ${geom.height}`
-          : `${view.x} ${view.y} ${view.w} ${view.h}`
-      }
+      viewBox={vbox}
       className={className}
       data-gesture={panning ? "pan" : shape === "free" ? undefined : shape}
       role="application"
@@ -1650,7 +2180,13 @@ export default function DrawBoard({
       tabIndex={0}
       onPointerDown={down}
       onPointerMove={move}
-      onPointerLeave={() => onHover(null)}
+      onPointerLeave={() => {
+        onHover(null);
+        // AND THE BRIDGE'S ANCHOR GOES WITH IT. A pointer that leaves the plate
+        // at one edge and comes back at another has not drawn the chord between
+        // them, and a bridge from the point it left would lay exactly that.
+        lastPt.current = null;
+      }}
       onKeyDown={key}
     >
       <defs>
@@ -1719,6 +2255,40 @@ export default function DrawBoard({
         />
       )}
 
+      {/* THE HIT LAYER EXISTS EXACTLY WHEN A WARP DOES. See `HitLayer`: with
+          the plate undeformed the geometry answers the same question with no
+          elements at all, and the elements were 98,304 of them at depth 7. */}
+      {hitDom && <HitLayer pts={pts} curved={curved} order={order} />}
+    </svg>
+
+    {/* ── THE POINTER OVERLAY ────────────────────────────────────────────
+        Everything that changes at the speed of the hand, in a layer of its
+        own, so that moving it invalidates a dozen elements instead of the
+        whole plate. WebKit re-rasterises a layer whole; the measurement that
+        put this here is in `overlayClass`.
+
+        THE SAME WINDOW AND THE SAME BOX, by construction and not by two
+        rules that agree. `vbox` is the one expression both `viewBox`es read,
+        and `className` — the PLATE's class — is the one rule both boxes are
+        sized by; `overlayClass` adds positioning to it and nothing else.
+        Anything less than that was measured wrong: an overlay given its own
+        `inset: 0` box came out 13% oversize, because an absolutely positioned
+        replaced element takes its height from the intrinsic ratio rather than
+        from `bottom`. See `.canvasOverlay`.
+
+        WHAT IS HERE AND WHAT IS NOT. The cursor and the ghosts move with the
+        pointer — the hover ghost changes on EVERY hover, which is the
+        invalidation the 270 ms hover frame was made of. The GUIDES do not
+        move, and they stay on the plate for a reason that is not cost: they
+        are drawn UNDER the dim scrim so that the axes fade out with the cells
+        they cross, and nothing in an overlay can be under anything on the
+        plate. The stacking here is otherwise exactly what it was — ghosts
+        over the scrim, cursor over the ghosts. */}
+    <svg
+      className={`${className} ${overlayClass}`}
+      viewBox={vbox}
+      aria-hidden="true"
+    >
       {preview && (
         <Ghost
           geom={geom}
@@ -1739,11 +2309,9 @@ export default function DrawBoard({
           WHAT THIS COSTS, stated rather than optimised away. `Ghost` is
           memoised, but the page rebuilds the whole spec list each time the drag
           gathers one more application, so every standing ghost re-renders on
-          every new seed — O(seeds × orbit) polygons per pointer move. That is
-          inside a budget this component already spends: a PAINT drag re-renders
-          `PaintLayer` over the entire plate on every application, which at depth
-          4 is 1536 polygons, and a proposal a finger could plausibly gather is
-          well under that. If it is ever measured to matter, the fix is an
+          every new seed — O(seeds × orbit) polygons per pointer move. That is a
+          dozen elements in a layer of its own now, rather than a dozen elements
+          that dirtied the plate. If it is ever measured to matter, the fix is an
           identity cache in the page keyed by seed, so an unchanged spec keeps
           its object and this `memo` bails out. It has not been measured, so it
           has not been written. */}
@@ -1769,8 +2337,7 @@ export default function DrawBoard({
           pointerEvents="none"
         />
       )}
-
-      <HitLayer pts={pts} curved={curved} order={order} />
     </svg>
+    </>
   );
 }
