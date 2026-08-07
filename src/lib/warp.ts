@@ -26,6 +26,12 @@
  *
  *   R   for which apex angles is the FlowAngle apex an exact element of ℤ[√3]?
  *
+ * AMENDED (spec-curvature increment 1): Q1's vertex table and Q2's descent
+ * algebra have been PROMOTED into `src/lib/vertices.ts` and are re-exported from
+ * here, because they stopped being measurements and became a feature. Nothing
+ * about what this file DECIDES changed, and `test/warp.test.ts` is unmodified —
+ * see the promotion note under the imports.
+ *
  * ── WHERE THE FLOAT IS ───────────────────────────────────────────────────
  *
  * NOWHERE IN THIS FILE. There is no `Math.` call, no `/` on numbers, and no
@@ -58,13 +64,45 @@
  * basis. Section R is where √3 genuinely enters, and it is carried exactly.
  */
 
-import {
-  REP9_ALPHABET,
-  type Convention,
-  type Digit,
-  type IVec,
-} from "./figure";
-import { baryToLat, rotK, type Lat } from "./hexagon";
+import { type Lat } from "./hexagon";
+import { vertexCensus as tableCensus, tableFromTriples } from "./vertices";
+
+/**
+ * ── PROMOTED, 2026-08 (spec-curvature increment 1) ───────────────────────
+ *
+ * Q1's vertex table and Q2's descent-as-matrix-product were the two parts of this
+ * instrument that turned out to be the beginnings of a FEATURE rather than a
+ * measurement, and `docs/warp-findings.md`'s "first honest increment" is exactly
+ * them. Their bodies now live in `src/lib/vertices.ts`; the names below are
+ * re-exports, so there is ONE derivation and one table constructor in `src/`, and
+ * every assertion in `test/warp.test.ts` — which is the record of the published
+ * measurement — still decides the same question against the same code, unmodified.
+ *
+ * `buildVertexTable` is re-exported under `vertices.tableFromTriples`'s body:
+ * that is this instrument's constructor, the one that interns ALREADY-KNOWN
+ * triangles. The feature's constructor is the other one — `vertices.
+ * buildVertexTable(spec)`, which reads a canvas spec and no geometry at all —
+ * and the whole point of the increment is that the two agree.
+ *
+ * The only thing that did not move is `vertexCensus`'s `ratio`, because it is a
+ * `Rat` and `Rat` is instrument. `vertices.vertexCensus` reports the integers;
+ * the wrapper below adds the exact ratio for the tables that print it.
+ */
+export {
+  REP4_APEX,
+  REP4_IFS,
+  REP9_MAPS,
+  composeWeights,
+  deriveCell,
+  digitMap,
+  latTriples,
+  tableFromTriples as buildVertexTable,
+  type BaryCell,
+  type DerivedCell,
+  type DigitMap,
+  type VertexTable,
+  type Weights,
+} from "./vertices";
 
 // ═════════════════════════════════════════════════════════════════════════
 // EXACT RATIONALS OVER `number`, WITH A HARD GUARD
@@ -286,6 +324,11 @@ export const qCentroid = (t: readonly QPt[]): QPt => {
 // gap between the ratio and 6 is exactly the boundary's degree deficit and
 // nothing else.
 
+// PROMOTED. The table, the interning and the degree histogram are now
+// `src/lib/vertices.ts`; `latTriples` and `BaryCell` are re-exported at the head
+// of this file. What remains here is the one thing that could not travel — the
+// RATIO, which is a `Rat`, and `Rat` is instrument.
+
 export interface VertexCensus {
   /** Triangles in the canvas. */
   readonly cells: number;
@@ -301,227 +344,34 @@ export interface VertexCensus {
   readonly degrees: ReadonlyMap<number, number>;
 }
 
-/** Anything with three exact barycentric vertices. `Cell` and `Rep9Cell` both do. */
-export interface BaryCell {
-  readonly bary: readonly [IVec, IVec, IVec];
-}
-
-/**
- * The lattice-vertex triples of a canvas.
- *
- * `sectors = 1` is the triangle canvas; `sectors = 6` is the hexagon, built the
- * way `hexagon.buildHexagon` builds it — the base figure's barycentrics mapped to
- * the lattice and rotated by R^s. Using `rotK` rather than a second copy of the
- * rotation is deliberate: the hexagon's vertex identifications are the thing
- * being counted, so they must come from the module that ships them.
- */
-export function latTriples(
-  cells: readonly BaryCell[],
-  sectors = 1
-): Lat[][] {
-  const out: Lat[][] = [];
-  for (let s = 0; s < sectors; s++) {
-    for (const c of cells) {
-      out.push(c.bary.map((b) => rotK(baryToLat(b), s)));
-    }
-  }
-  return out;
-}
-
 export function vertexCensus(triples: readonly (readonly Lat[])[]): VertexCensus {
-  const seen = new Map<string, number>();
-  let slots = 0;
-  for (const tri of triples) {
-    for (const v of tri) {
-      const k = `${v[0]},${v[1]}`;
-      seen.set(k, (seen.get(k) ?? 0) + 1);
-      slots++;
-    }
-  }
-  const degrees = new Map<number, number>();
-  for (const d of seen.values()) degrees.set(d, (degrees.get(d) ?? 0) + 1);
-  const distinct = seen.size;
-  return {
-    cells: triples.length,
-    slots,
-    distinct,
-    ratio: rat(slots, distinct),
-    deficit: 6 * distinct - slots,
-    degrees,
-  };
+  const c = tableCensus(tableFromTriples(triples));
+  return { ...c, ratio: rat(c.slots, c.distinct) };
 }
 
 // ═════════════════════════════════════════════════════════════════════════
 // Q2 — LOG VERSUS LINEAR: THE DESCENT AS A PRODUCT OF AFFINE MAPS
 // ═════════════════════════════════════════════════════════════════════════
 //
-// An address is a descent path and each digit is an affine map, so a cell's
-// geometry is a product of d maps applied to the root: O(d) time, O(1) space.
-// The alternative is a materialised vertex table: O(V) space, O(1) lookup.
+// PROMOTED, IN FULL. An address is a descent path and each digit is an affine
+// map, so a cell's geometry is a product of d maps applied to the root: O(d)
+// time, O(1) space. The alternative is a materialised vertex table: O(V) space,
+// O(1) lookup. Q2's verdict was that they are not competitors — the table is a
+// CACHE of the derivation and the derivation is what makes the cache
+// reconstructible — and that verdict is now a module rather than a measurement.
 //
-// ── The representation, and why it stays in ℤ ────────────────────────────
+// `src/lib/vertices.ts` holds all of it: `REP4_APEX`, `REP4_IFS`, `REP9_MAPS`,
+// `digitMap`, `composeWeights`, `deriveCell`, and the table constructors. Every
+// name is re-exported at the head of this file, so `test/warp.test.ts` still
+// decides Q2 against the same code it always did, and there is exactly one
+// derivation in `src/` for the curvature increments to build on.
 //
-// A child of a triangle with vertex triple V = (V₀, V₁, V₂) has vertices
-//
-//     child_i = Σ_j W[i][j] · V_j / k
-//
-// for an INTEGER matrix W whose rows sum to k, k the edge division. Composing two
-// levels multiplies the matrices — with the deeper digit on the LEFT, because it
-// acts on the child's frame:
-//
-//     (W_inner ∘ W_outer)[i][m] = Σ_j W_inner[i][j] · W_outer[j][m]
-//
-// and the denominators multiply. So after d levels the accumulator is an integer
-// 3×3 matrix over the denominator ∏ k_i = `scaleOfWord(addr)`, and the cell's
-// vertices in `figure.ts`'s own convention (integer numerators over `scale`) are
-// LITERALLY THE ROWS of that accumulator — because `figure.ts` starts the walk at
-// ([scale,0,0], [0,scale,0], [0,0,scale]), so V_j = scale·e_j and the scale
-// cancels.
-//
-// THE ANSWER TO "does the derived path stay exact" IS THEREFORE STRUCTURAL: the
-// product of integer matrices is an integer matrix, and the denominator is the
-// product of the edge divisions and nothing more. A rep-9 map has denominator 3
-// and it does NOT accumulate a growing common factor: 3 per rep-9 level, 2 per
-// rep-4 level, exactly `rep-tile-findings.md` Q4's cost law. Contrast fold-re
-// §11's curve path, where D_k = D0·8^k — three bits per level, forced by the
-// CUBIC degree. Affine descent costs log₂(k) bits per level; Bézier subdivision
-// costs 3. They are different laws and the difference is the degree.
-
-/** Rows are the child's vertices as integer weights in the parent's vertices. */
-export type Weights = readonly [IVec, IVec, IVec];
-
-export interface DigitMap {
-  /** Edge division applied at this digit. */
-  readonly k: number;
-  readonly w: Weights;
-}
-
-/**
- * The four rep-4 maps in the `apex` convention, WRITTEN OUT from `figure.ts`'s
- * documented recursion rather than extracted from it.
- *
- *   A → walk(PA,  MAB, MAC)      B → walk(PB,  MBC, MAB)
- *   C → walk(PC,  MAC, MBC)      X → walk(MBC, MAC, MAB)
- *
- * with M_PQ = (P + Q)/2. That transcription is the whole of the claim being
- * tested in Q2 — if it is wrong the derived cells will not match `buildFigure`'s,
- * cell for cell, and the test says so at 4^6 cells.
- */
-export const REP4_APEX: Readonly<Record<Digit, DigitMap>> = {
-  A: { k: 2, w: [[2, 0, 0], [1, 1, 0], [1, 0, 1]] },
-  B: { k: 2, w: [[0, 2, 0], [0, 1, 1], [1, 1, 0]] },
-  C: { k: 2, w: [[0, 0, 2], [1, 0, 1], [0, 1, 1]] },
-  X: { k: 2, w: [[0, 1, 1], [1, 0, 1], [1, 1, 0]] },
-};
-
-/** The `ifs` convention: only B and C differ, and only in ROLE ORDER. */
-export const REP4_IFS: Readonly<Record<Digit, DigitMap>> = {
-  A: REP4_APEX.A,
-  B: { k: 2, w: [[1, 1, 0], [0, 2, 0], [0, 1, 1]] },
-  C: { k: 2, w: [[1, 0, 1], [0, 1, 1], [0, 0, 2]] },
-  X: REP4_APEX.X,
-};
-
-/**
- * The nine rep-9 maps, taken from `figure.REP9_ALPHABET[..].weights`.
- *
- * STATED AS A DEPENDENCY, because it is one: unlike the rep-4 table above, this
- * is not an independent transcription — the rep-9 alphabet is itself derived
- * inside `figure.ts` from the geometry, and re-deriving it here would be a second
- * place for it to be wrong rather than a second opinion. What IS independent is
- * the check `test/warp.test.ts` runs on the result: the depth-d rep-9 cell set
- * produced by composing these maps is compared, as a set of canonical point-set
- * keys, against `reptile.descend`'s own subdivision — a module that knows nothing
- * about letters, frames or `figure.ts`.
- */
-export const REP9_MAPS: ReadonlyMap<string, DigitMap> = new Map(
-  REP9_ALPHABET.map((l) => [l.name, { k: 3, w: l.weights } as DigitMap])
-);
-
-export function digitMap(ch: string, convention: Convention): DigitMap {
-  const nine = REP9_MAPS.get(ch);
-  if (nine) return nine;
-  const four = (convention === "ifs" ? REP4_IFS : REP4_APEX)[ch as Digit];
-  if (!four) throw new Error(`warp: ${ch} is not an address letter`);
-  return four;
-}
-
-/** inner ∘ outer, as integer matrices. See the section header for the order. */
-export function composeWeights(inner: Weights, outer: Weights): Weights {
-  const row = (i: number): IVec => {
-    const out: [number, number, number] = [0, 0, 0];
-    for (let m = 0; m < 3; m++) {
-      let acc = 0;
-      for (let j = 0; j < 3; j++) acc += inner[i][j] * outer[j][m];
-      if (!Number.isSafeInteger(acc)) throw new Error("warp: descent overflow");
-      out[m] = acc;
-    }
-    return out;
-  };
-  return [row(0), row(1), row(2)];
-}
-
-export interface DerivedCell {
-  /** Integer barycentric numerators over `scale`, in role order. */
-  readonly verts: Weights;
-  /** Product of the edge divisions along the address. */
-  readonly scale: number;
-}
-
-const IDENTITY_W: Weights = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
-
-/**
- * DERIVE-ON-DEMAND. O(d) time in 3×3 integer multiplies, O(1) space — one
- * accumulator, no table, no figure, no tree.
- *
- * The signature takes only the word and the convention, which is `scale.ts`'s
- * constraint restated: the radix must be a pure function of the address, and it
- * is, because `digitMap` reads one character.
- */
-export function deriveCell(addr: string, convention: Convention = "apex"): DerivedCell {
-  let acc = IDENTITY_W;
-  let scale = 1;
-  for (const ch of addr) {
-    const m = digitMap(ch, convention);
-    acc = composeWeights(m.w, acc);
-    scale *= m.k;
-  }
-  return { verts: acc, scale };
-}
-
-/**
- * MATERIALISE. One shared vertex array, one index per distinct lattice point,
- * three indices per cell: O(V) space, O(1) lookup.
- *
- * This is the other side of Q2's trade and it is deliberately the SIMPLEST thing
- * that could work, because the point of the comparison is the cost of the shape
- * of the answer and not the cleverness of the implementation.
- */
-export interface VertexTable {
-  readonly vertices: readonly Lat[];
-  readonly cells: readonly (readonly [number, number, number])[];
-  readonly index: ReadonlyMap<string, number>;
-}
-
-export function buildVertexTable(triples: readonly (readonly Lat[])[]): VertexTable {
-  const index = new Map<string, number>();
-  const vertices: Lat[] = [];
-  const cells: [number, number, number][] = [];
-  for (const tri of triples) {
-    const ids = tri.map((v) => {
-      const k = `${v[0]},${v[1]}`;
-      let i = index.get(k);
-      if (i === undefined) {
-        i = vertices.length;
-        index.set(k, i);
-        vertices.push(v);
-      }
-      return i;
-    });
-    cells.push([ids[0], ids[1], ids[2]]);
-  }
-  return { vertices, cells, index };
-}
+// The measured facts that justified the promotion, unchanged and unrepeated
+// here: derived == `buildFigure` at 4,096 + 4,096 + 6,561 cells with zero
+// mismatches; the derived cell SET equals `reptile.subdivide`'s at k = 2 and
+// k = 3; the product of integer matrices leaves exactly ONE denominator, equal
+// to the scale, on rep-4, rep-9 and mixed words; one permuted role slot in the X
+// map reports 3,416 coordinate mismatches over 1,024 cells.
 
 // ═════════════════════════════════════════════════════════════════════════
 // WARPS
