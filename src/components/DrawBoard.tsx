@@ -733,7 +733,23 @@ export interface PaintNode {
  * exactly (0.5 × 0.5 read back as red at 0.25), which is what makes the nested
  * form correct rather than merely different. `emit.ts` writes the identical
  * nesting into the exported file, so the canvas and the file composite through
- * the same mechanism and cannot drift.
+ * the same mechanism.
+ *
+ * "AND CANNOT DRIFT" USED TO END THAT SENTENCE, AND IT DRIFTED. For one revision
+ * of the timeline branch `emit.emitLayers` wrote the alpha as `fill-opacity`
+ * rather than `opacity`, to escape the reveal stylesheet overriding it — and
+ * `fill-opacity` is an INHERITED property, so a child's declaration REPLACES the
+ * parent's instead of compositing with it. Re-measured in Chromium at the fix:
+ * the nested pair above samples (255,191,191) as `opacity` and (255,127,127) as
+ * `fill-opacity`, and the same-cell pair samples (255,126,126) against
+ * (255,114,63) — which is this paragraph's own "cheaper, obvious, and wrong"
+ * arriving through a door nobody was watching. `emit.ts` states the alpha in the
+ * reveal keyframes now, so the property never had to move; see `animationRules`.
+ *
+ * The claim is true again and it is no longer only a claim:
+ * `test/importlayer.test.ts` compares the tree `strata` hands this component
+ * against the `<g>` nesting `serialise` writes, own-alpha for own-alpha, and
+ * asserts the attribute is the compositing one.
  *
  * `opacity` is written only when it is not 1. A group opacity forces the
  * browser to allocate an offscreen buffer to composite through (the note on

@@ -627,6 +627,26 @@ const fmtAlpha = (n: number): string => {
   return Object.is(r, -0) ? "0" : String(r);
 };
 
+/**
+ * A layer's alpha AT THE FORMAT'S RESOLUTION, absent reading as 1.
+ *
+ * ONE ROUNDING FOR THE WHOLE MODULE, because three places ask "is this layer
+ * faded?" and they must not disagree: `opaquelyCovered` decides whether to write
+ * a tile behind it, `emitLayers` decides whether to write the attribute, and
+ * `animationRules` decides whether the keyframe ends anywhere but 1.
+ *
+ * `artfile.validateLayer` quantises to `ALPHA_QUANTUM` on the way in, and this
+ * used not to. An alpha in (0.9995, 1) was therefore FADED to the writer and
+ * OPAQUE to the reader, so `serialise` left out a tile that `read` then went
+ * looking for and refused the file over — "tiling-count", on a document this
+ * module had just written. Not reachable from the app, because
+ * `layers.canonicalAlpha` already rounds anything the model holds; reachable
+ * from a hand-built `EmitDoc`, and it degraded at LOAD time rather than at write
+ * time, which is the worst place to find out.
+ */
+const quantAlpha = (a: number | undefined): number =>
+  a === undefined ? 1 : Math.round(a * ALPHA_QUANTUM) / ALPHA_QUANTUM;
+
 // ── prototypes ───────────────────────────────────────────────────────────
 
 interface Placed {
@@ -926,12 +946,26 @@ export function flatten(layers: readonly EmitLayer[]): Map<number, string> {
  * the same mechanism" — the mechanism is the same, the thing UNDER it was not —
  * and the sentence there has been corrected rather than left standing.
  *
- * ── Alpha is INHERITED, so the whole chain has to be opaque ─────────────
+ * ── A FADE REACHES THE WHOLE SUBTREE, so the whole chain has to be clear ──
  *
- * A group's `opacity`/`fill-opacity` multiplies down its subtree, so a fully
- * opaque layer inside a faded parent is not opaque on the page. This walks with
- * the ancestors' answer in hand for that reason; asking each layer about itself
- * would have written the same wrong file one level down.
+ * A group's `opacity` is a COMPOSITING operation: the group is rendered to its
+ * own buffer and that buffer is composited at the alpha, so nested groups
+ * MULTIPLY and a fully opaque layer inside a faded parent is not opaque on the
+ * page. This walks with the ancestors' answer in hand for that reason; asking
+ * each layer about itself would have written the same wrong file one level down.
+ *
+ * This paragraph used to say "`opacity`/`fill-opacity` multiplies", and that is
+ * only true of the first. `fill-opacity` is an INHERITED property, so a child's
+ * declaration REPLACES the parent's rather than compounding with it — measured,
+ * see `emitLayers`. The distinction does not change this function's answer, which
+ * is why it survived being written down wrongly: either way a descendant of a
+ * faded layer is not opaque, so `clear` is still the right thing to track. It is
+ * corrected because it is the sentence somebody would reason from next.
+ *
+ * ONE-SIDED BY CONSTRUCTION, and worth stating: this can only ever OVER-tile. A
+ * tile under paint that turns out to be opaque is invisible; a missing tile under
+ * paint that turns out to be faded is the wrong colour. Any doubt resolves
+ * towards writing the tile.
  *
  * ── One function, both directions ──────────────────────────────────────
  *
@@ -948,7 +982,9 @@ export function opaquelyCovered(layers: readonly EmitLayer[]): Set<number> {
   const rec = (list: readonly EmitLayer[], clear: boolean) => {
     for (const l of list) {
       if (l.hidden === true) continue;
-      const here = clear && (l.opacity === undefined || l.opacity === 1);
+      // QUANTISED, so this and `artfile.validateLayer` call the same layers
+      // faded. See `quantAlpha` for the file the disagreement produced.
+      const here = clear && quantAlpha(l.opacity) === 1;
       if (here && l.paint !== undefined) for (const i of l.paint.keys()) out.add(i);
       if (l.children !== undefined) rec(l.children, here);
     }
@@ -1200,44 +1236,61 @@ function emitLayers(
     if (l.hidden === true) attrs.push(`display="none"`);
     if (l.locked === true) attrs.push(`data-locked="1"`);
     /**
-     * `fill-opacity` AND NOT `opacity`, and it was a real defect before it was a
-     * comment — the same one `DrawBoard`'s dim scrim already carries the fix for,
-     * in the same words, in the same pull request.
+     * `opacity`, WHICH COMPOSITES — and the two wrong answers before it.
+     *
+     * ── One: the bare attribute, which the animation destroyed ────────────
      *
      * `animationRules` writes `#root [data-reveal] { opacity: 0; animation: … }`
      * and this is a presentation attribute on that very `<g>`. A CSS declaration
-     * beats an SVG presentation attribute of the same name, so any layer carrying
+     * beats an SVG presentation attribute of the same name, so a layer carrying
      * BOTH an alpha and a `reveal` had its alpha silently discarded: overridden to
      * the keyframe's value for the whole animation and left there by
-     * `animation-fill-mode: both`. Not "wrong in a corner" — DEAD, whenever the
-     * document is a replay, which is what this build's gesture export writes.
+     * `animation-fill-mode: both`. DEAD, whenever the document is a replay —
+     * which is what this build's gesture export writes.
      *
-     * A rule of higher specificity would not have fixed it either: a running
-     * animation's value beats every normal declaration in the cascade, whatever
-     * its specificity. Only a different property or a different element can carry
-     * the alpha, and a wrapper `<g>` is not free here — `matchLayers` pairs the
-     * payload's tree with the markup's `<g>` tree position for position, so an
-     * extra group is a reader change and a format change for a presentational
-     * fix. `fill-opacity` is neither, and the two properties MULTIPLY rather than
-     * fight, so a faded layer that also reveals now does both.
+     * ── Two: `fill-opacity`, which fixed that and broke compositing ───────
      *
-     * WHAT IT COSTS, stated: the cells of a layer are a tiling and do not
-     * overlap, so per-fill alpha and group alpha are the same picture — that is
-     * `DrawBoard`'s measurement and it holds here. Where they differ is the WELD:
-     * a `.k…` rule in weld mode also sets `stroke`, and a stroke is not a fill, so
-     * a welded seam no longer fades with the paint it welds. `stroke-opacity`
-     * beside it would fade the seam too and would then double-darken where
-     * adjacent cells' strokes overlap, which group `opacity` does not do. Neither
-     * is exact; this one is the one already argued in this codebase, and the
-     * alternative it is being compared against is an alpha that does not work at
-     * all.
+     * The first fix moved the alpha to `fill-opacity`, on `DrawBoard`'s own
+     * argument that a layer's cells are a disjoint tiling. That argument is sound
+     * FOR ONE LEAF LAYER and false for the tree these groups actually form.
+     * `fill-opacity` is an INHERITED property — a child's declaration REPLACES the
+     * inherited value for its subtree — while `opacity` is a COMPOSITING operation
+     * that multiplies. So the file stopped agreeing with the board the moment a
+     * faded layer had children, which is the suite's own fixture.
+     *
+     * MEASURED IN CHROMIUM, red over white, both divergences:
+     *
+     *   NESTED FADE, disjoint cells. Two groups at 0.5. Nested `opacity` samples
+     *   (255,191,191) — red at 0.25. Nested `fill-opacity` samples (255,127,127) —
+     *   red at 0.5, the child's declaration having replaced the parent's.
+     *
+     *   ONE CELL, painted by a faded parent AND a child inside it. `opacity`
+     *   samples (255,126,126): the group composites first, so the child's paint
+     *   OCCLUDES the parent's and the result is red at a half. `fill-opacity`
+     *   samples (255,114,63) — red over gold over white, both visible. Those are
+     *   `DrawBoard`'s own numbers, and its header already calls the second one
+     *   "cheaper, obvious, and wrong".
+     *
+     * ── So the alpha stays on `opacity`, and the ANIMATION gives way ──────
+     *
+     * The property is not the thing that had to move; the CLASH was. A revealing
+     * layer's keyframe now ends at THAT LAYER'S OWN ALPHA rather than at 1, so the
+     * stylesheet states the alpha instead of destroying it — see `animationRules`,
+     * where the rule is written and the measurement is repeated. Both values are
+     * then compositing operations on the same property, so they multiply down the
+     * tree exactly as the board does, and `DrawBoard`'s claim that the two cannot
+     * drift is true again.
      *
      * Nothing reads it back: `parse` takes `opacity` from the payload, where the
      * layer states its own. This is how the file DRAWS.
+     *
+     * QUANTISED, because `artfile.validateLayer` quantises on the way in. Writing
+     * the raw value let an alpha in (0.9995, 1) count as faded here and as opaque
+     * there, so `opaquelyCovered` wrote a tiling the reader then refused as
+     * "tiling-count". One rounding, used by everything in this module.
      */
-    if (l.opacity !== undefined && l.opacity !== 1) {
-      attrs.push(`fill-opacity="${fmtAlpha(l.opacity)}"`);
-    }
+    const alpha = quantAlpha(l.opacity);
+    if (alpha !== 1) attrs.push(`opacity="${fmtAlpha(alpha)}"`);
     // The gesture, for a reader that is not this program. See the header.
     //
     // ABSENT, never defaulted and never empty: a `data-mode=""` on every group
@@ -1347,6 +1400,34 @@ const WELD = 3;
  * a still export — see the header — so a file whose out point dropped the last
  * three strokes must still say that those three strokes were six-fold. The cut
  * is what the file DRAWS; the markup is what it MEANS.
+ *
+ * ── A FADED LAYER'S REVEAL ENDS AT ITS ALPHA, NOT AT 1 ──────────────────
+ *
+ * These rules and `emitLayers`' alpha are the same CSS property on the same
+ * element, and this side wins: a running animation beats every normal
+ * declaration in the cascade, whatever its specificity, and `animation-fill-mode:
+ * both` leaves the final keyframe in force for ever after. So a layer that
+ * carried both an alpha and a `reveal` came up at FULL STRENGTH and stayed there.
+ *
+ * The fix is not to move the alpha off `opacity` — that was tried, with
+ * `fill-opacity`, and it broke compositing for nested layers; `emitLayers`
+ * carries the Chromium numbers. It is for THESE rules to state the alpha, since
+ * they are the ones that win. A layer with an alpha gets its own keyframe ending
+ * at that alpha and its own `#id` rule pointing at it.
+ *
+ * MEASURED IN CHROMIUM, red over white, against the board's nested `<g opacity>`:
+ * two layers at 0.5 both revealing sample (255,191,191) under this scheme and
+ * (255,191,191) on the board; a cell painted by a faded parent and an opaque
+ * child samples (255,126,126) under both. An `#id` selector beats `[data-reveal=
+ * "k"]` for `animation-name`, confirmed by `getComputedStyle` rather than assumed.
+ *
+ * ── The uncut, unfaded file is still byte for byte the file it was ──────
+ *
+ * Every rule below is gated on a layer HAVING an alpha, and `quantAlpha` says no
+ * for every layer of every document this program can currently produce — nothing
+ * in `src/` writes a layer alpha; see `layers.setOpacity`. So a drawing with no
+ * fade emits exactly the rules it emitted before, in the same order, and
+ * `test/byteidentity.test.ts` is the check on that rather than this sentence.
  */
 function animationRules(doc: EmitDoc, root: string): string[] {
   const a = doc.animation as EmitAnimation;
@@ -1361,8 +1442,13 @@ function animationRules(doc: EmitDoc, root: string): string[] {
   const hi = bounded ? (a.out as number) : a.steps - 1;
   const cycle = Math.max(1, (hi - lo + 1) * a.stepMs + a.holdMs);
   const reveals = new Set<number>();
+  /** Layers that both reveal AND fade — the ones these rules must not flatten. */
+  const faded: { id: string; reveal: number; alpha: number }[] = [];
   walkLayers(doc.layers, (l) => {
-    if (l.reveal !== undefined) reveals.add(l.reveal);
+    if (l.reveal === undefined) return;
+    reveals.add(l.reveal);
+    const alpha = quantAlpha(l.opacity);
+    if (alpha !== 1) faded.push({ id: l.id, reveal: l.reveal, alpha });
   });
   // Scoped, and the keyframe names carry the document id as a PREFIX because
   // `@keyframes` has one global namespace per document and `@scope` does not
@@ -1391,8 +1477,39 @@ function animationRules(doc: EmitDoc, root: string): string[] {
     }
     rules.push(`${at}[data-reveal="${k}"] { animation-name: ${root}-r${k} }`);
   }
-  for (const k of order) {
-    if (before(k) || after(k)) continue;
+
+  /**
+   * THE FADED LAYERS, one `#id` rule each, on top of the generic one.
+   *
+   * BY ID rather than by a second attribute, because an alpha is a fact about
+   * ONE layer while `data-reveal` is shared by every layer of that step — two
+   * layers can reveal together and fade differently, and an attribute selector
+   * has no way to say which is which. An id selector also outranks
+   * `[data-reveal="k"]`, which is what makes these win; measured with
+   * `getComputedStyle` rather than assumed.
+   *
+   * The keyframe name carries the alpha AT THE FORMAT'S QUANTUM, so two layers
+   * fading identically at the same step share one `@keyframes` block and nothing
+   * is emitted twice. It is an integer by construction — `quantAlpha` rounds to
+   * thousandths — so the name is a plain CSS identifier with no decimal point in
+   * it, which `@keyframes` would not take.
+   */
+  const wanted = new Map<string, { reveal: number; alpha: number }>();
+  for (const f of faded) {
+    if (after(f.reveal)) continue; // the base rule already holds it at 0
+    if (before(f.reveal)) {
+      // The ground, AT ITS OWN STRENGTH. The generic rule above says `opacity: 1`
+      // for this step, which for a faded layer is the flattening all over again.
+      rules.push(`${at}#${f.id} { animation: none; opacity: ${fmtAlpha(f.alpha)} }`);
+      continue;
+    }
+    const name = `${root}-r${f.reveal}a${Math.round(f.alpha * ALPHA_QUANTUM)}`;
+    wanted.set(name, { reveal: f.reveal, alpha: f.alpha });
+    rules.push(`${at}#${f.id} { animation-name: ${name} }`);
+  }
+
+  /** One `@keyframes` block, given the step it lights at and its end value. */
+  const frames = (name: string, k: number, end: number): string => {
     // Rebased on the in point, so a drawing of a hundred gestures cut to five
     // plays a five-step cycle with the first of them lit at zero.
     const on0 = (k - lo) * a.stepMs;
@@ -1400,10 +1517,19 @@ function animationRules(doc: EmitDoc, root: string): string[] {
     const lit = (100 * Math.min(on0 + Math.max(1, a.fadeMs), cycle)) / cycle;
     // The first step reveals at 0, where `0%, 0%` would be a duplicate selector.
     const dark = on <= 0 ? "0%" : `0%, ${fmtAlpha(on)}%`;
-    rules.push(
-      `@keyframes ${root}-r${k} { ${dark} { opacity: 0 } ${fmtAlpha(lit)}%, 100% { opacity: 1 } }`
+    return (
+      `@keyframes ${name} { ${dark} { opacity: 0 } ` +
+      `${fmtAlpha(lit)}%, 100% { opacity: ${fmtAlpha(end)} } }`
     );
+  };
+
+  for (const k of order) {
+    if (before(k) || after(k)) continue;
+    rules.push(frames(`${root}-r${k}`, k, 1));
   }
+  // The faded blocks after the plain ones, so an unfaded document's stylesheet is
+  // unchanged to the byte and a faded one appends rather than interleaves.
+  for (const [name, { reveal, alpha }] of wanted) rules.push(frames(name, reveal, alpha));
   // The app's own chrome honours this preference; the thing it EXPORTS — the
   // one that ends up on somebody else's screen, with no settings panel and no
   // way to stop it — did not. An infinite loop is exactly what the preference
@@ -1416,11 +1542,18 @@ function animationRules(doc: EmitDoc, root: string): string[] {
   // — a reduced-motion reader would be the only one seeing a different drawing,
   // which is the one thing an accessibility rule must not do. Same specificity,
   // written after, so it wins.
+  //
+  // AND THE FADED LAYERS KEEP THEIR ALPHA HERE TOO, by the same argument one
+  // step further: `opacity: 1` is the finished plate for an opaque layer and is
+  // a DIFFERENT DRAWING for a faded one. A reduced-motion reader must get the
+  // same picture as everybody else, minus the motion — not a flattened one.
   const cut = order.filter(after);
+  const still = faded.filter((f) => !after(f.reveal));
   rules.push(
     `@media (prefers-reduced-motion: reduce) { ${at}[data-reveal] ` +
       `{ animation: none; opacity: 1 }` +
       cut.map((k) => ` ${at}[data-reveal="${k}"] { opacity: 0 }`).join("") +
+      still.map((f) => ` ${at}#${f.id} { opacity: ${fmtAlpha(f.alpha)} }`).join("") +
       ` }`
   );
   return rules;

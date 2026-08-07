@@ -473,8 +473,15 @@ describe("Q2 — log versus linear", () => {
       expect(tbl.vertices.length).toBe(vertexCensus(triples).distinct);
       // space: the table holds fewer vertices than the cells hold slots
       expect(tbl.vertices.length * 3).toBeLessThan(fig.cells.length * 3);
-      // O(1) lookup really is orders faster than O(d) derivation
-      expect(tLookup * 10).toBeLessThan(tDerive);
+      // O(1) lookup really is faster than O(d) derivation. The MEASURED gap is
+      // ~130x (recorded in docs/warp-findings.md); the ASSERTED bound is only
+      // 2x, because this is a wall-clock comparison on a shared CI machine and
+      // a tight factor is a flake, not a theorem — this line failed once under
+      // parallel suite load at 10x and passed three re-runs, which is exactly
+      // the bandcolour-timeout failure mode. The structural facts above (cell
+      // and vertex counts) are the exact claims; this line only pins the
+      // DIRECTION of the asymmetry.
+      expect(tLookup * 2).toBeLessThan(tDerive);
       log.push(
         `d=${d} cells=${fig.cells.length} V=${tbl.vertices.length} derive=${tDerive.toFixed(2)}ms build=${tBuild.toFixed(2)}ms lookup=${tLookup.toFixed(3)}ms`
       );
