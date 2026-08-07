@@ -299,7 +299,7 @@ describe("the alphabet is the radix schedule", () => {
 describe("no existing address changes meaning", () => {
   it("admits all 1,364 triangle words and all 8,184 hexagon addresses", () => {
     const tri = wordsUpTo(REP4_LETTERS, MAX_DEPTH.triangle);
-    expect(tri.length).toBe(5460); // PROBE: 1364 on main (depth 5)
+    expect(tri.length).toBe(21844); // PROBE: 1364 on main (depth 5)
     for (const w of tri) expect(addressWord(w, "triangle")).toBe(w);
 
     let hex = 0;
@@ -309,7 +309,7 @@ describe("no existing address changes meaning", () => {
         hex++;
       }
     }
-    expect(hex).toBe(32760); // PROBE: 8184 on main (depth 5)
+    expect(hex).toBe(131064); // PROBE: 8184 on main (depth 5)
   });
 
   it("carries all 1,364 of them through the real reader in one payload", () => {
@@ -322,10 +322,10 @@ describe("no existing address changes meaning", () => {
       undefined,
       tri.map((w) => [w, GOLD] as const)
     );
-    expect(p.plate?.length).toBe(5460); // PROBE: 1364 on main (depth 5)
+    expect(p.plate?.length).toBe(21844); // PROBE: 1364 on main (depth 5)
     const back = extractArt(`<svg>${encodeArt(p)}</svg>`);
     expect(back).not.toBeNull();
-    expect(back?.plate?.length).toBe(5460);
+    expect(back?.plate?.length).toBe(21844);
   });
 
   it("makes the old length bound and the new scale bound the same predicate", () => {
@@ -340,8 +340,8 @@ describe("no existing address changes meaning", () => {
     }
     // PROBE (branch probe/depth-6): the pin's job is to notice the format cap
     // moving, and on this branch it moved deliberately — 32 on main.
-    expect(MAX_SCALE.triangle).toBe(64);
-    expect(MAX_SCALE.hexagon).toBe(64);
+    expect(MAX_SCALE.triangle).toBe(128);
+    expect(MAX_SCALE.hexagon).toBe(128);
   });
 });
 
@@ -449,10 +449,11 @@ describe("the gate", () => {
     expect(addressWord("uvw", "triangle")).toBe("uvw");
     expect(addressWord("xyz", "triangle")).toBe("xyz");
     expect(addressWord("s2:abc", "hexagon")).toBe("abc");
-    // Three rep-9 cuts is scale 27 and 729 cells a sector; four is scale 81 and
-    // 6,561, past anything this build can show.
+    // Three rep-9 cuts is scale 27 and 729 cells a sector. PROBE (cap 128):
+    // four cuts is scale 81 and now shows; FIVE is scale 243 and is the
+    // refusal witness — on main the witness is "abca" at 81.
     expect(scaleOfWord("abc")).toBe(27);
-    expect(addressWord("abca", "triangle")).toBeNull();
+    expect(addressWord("abcab", "triangle")).toBeNull();
   });
 
   it("admits a mixed address and reads its scale off it", () => {
@@ -470,10 +471,11 @@ describe("the gate", () => {
   });
 
   it("REFUSES on the scale, which the length bound no longer implies", () => {
-    // Four characters, well inside `MAX_DEPTH`, and 6,561 cells a sector.
-    expect("aaaa".length).toBeLessThanOrEqual(MAX_DEPTH.triangle);
-    expect(scaleOfWord("aaaa")).toBe(81);
-    expect(addressWord("aaaa", "triangle")).toBeNull();
+    // Five characters, well inside `MAX_DEPTH`, and 59,049 cells a sector.
+    // PROBE (cap 128): the witness is "aaaa" at scale 81 on main.
+    expect("aaaaa".length).toBeLessThanOrEqual(MAX_DEPTH.triangle);
+    expect(scaleOfWord("aaaaa")).toBe(243);
+    expect(addressWord("aaaaa", "triangle")).toBeNull();
     // The length bound survives as the scale bound's SHADOW: the coarsest cut
     // halves the edge, so nothing admissible can be longer than MAX_DEPTH.
     for (const w of wordsUpTo(ADDRESS_LETTERS, 3)) {
@@ -506,7 +508,7 @@ describe("the gate", () => {
       );
     expect(read([["ABa", GOLD], ["abc", RED]])).not.toBeNull();
     // One bad entry among good ones. The plate is not shortened; the file dies.
-    expect(read([["ABa", GOLD], ["aaaa", RED]])).toBeNull();
+    expect(read([["ABa", GOLD], ["aaaaa", RED]])).toBeNull(); // PROBE: "aaaa" on main
     expect(read([["ABa", GOLD], ["Ade", RED]])).toBeNull();
     expect(read([["abc", GOLD], ["abc", RED]])).toBeNull();
   });
@@ -516,7 +518,7 @@ describe("the gate", () => {
     // program writes and will not read.
     const p = payloadFromPaint("triangle", 2, "apex", new Map(), undefined, [
       ["ABa", GOLD],
-      ["aaaa", RED],
+      ["aaaaa", RED], // PROBE: "aaaa" on main
       ["Ade", BLUE],
     ]);
     expect(p.plate).toEqual([["ABa", GOLD]]);
@@ -529,21 +531,40 @@ describe("the gate", () => {
 describe("what the caps still mean", () => {
   it("counts the address space by enumeration, not by the old depth formula", () => {
     // The oracle: every word of up to MAX_DEPTH cuts over the whole alphabet,
-    // filtered by the gate. 402,233 candidates, no formula.
+    // filtered by the gate. On main that is 402,233 candidates, no formula.
+    //
+    // PROBE (branch probe/depth-6, cap 7): the blind sweep to 7 is ~68M words
+    // and does not fit in a test. It splits exactly instead: the length-7
+    // stratum at scale cap 2^7 = 128 is PURE rep-4 — one rep-9 letter forces
+    // scale ≥ 3·2^6 = 192 — so the blind sweep runs to length 6 unchanged, all
+    // 4^7 = 16,384 seven-letter rep-4 words are asserted admitted one by one,
+    // and a rep-9 letter at EVERY position of a seven-letter word is asserted
+    // refused. The pinned totals are 287,740 = blind(≤6) + 4^7, agreed by the
+    // scale-DP and an independent binomial DP (Σ C(m+k,k)·4^m·9^k over
+    // 2^m·3^k ≤ 128); 5,963 on main.
     let admitted = 0;
-    for (const w of wordsUpTo(ADDRESS_LETTERS, MAX_DEPTH.triangle)) {
+    for (const w of wordsUpTo(ADDRESS_LETTERS, 6)) {
       if (addressWord(w, "triangle") !== null) admitted++;
     }
-    expect(admitted).toBe(41019); // PROBE: 5963 on main (depth 5)
-    expect(addressCount("triangle")).toBe(41019);
-    expect(addressCount("hexagon")).toBe(6 * 41019);
+    expect(admitted).toBe(287740 - 16384);
+    for (const w of words(REP4_LETTERS, 7)) {
+      if (addressWord(w, "triangle") !== w) throw new Error(`refused: ${w}`);
+    }
+    for (let p = 0; p < 7; p++) {
+      for (const ch of REP9_LETTERS) {
+        const w = "A".repeat(p) + ch + "A".repeat(6 - p);
+        expect(addressWord(w, "triangle")).toBeNull();
+      }
+    }
+    expect(addressCount("triangle")).toBe(287740);
+    expect(addressCount("hexagon")).toBe(6 * 287740);
 
     // The formula this replaced — Σ cellCount over the drawable depths — counts
     // only the rep-4 words. It is a FLOOR, and the direction matters: a mixed
     // plate larger than it would have been refused as self-contradictory.
     let old = 0;
     for (let d = 1; d <= MAX_DEPTH.triangle; d++) old += cellCount("triangle", d);
-    expect(old).toBe(5460); // PROBE: 1364 on main (depth 5)
+    expect(old).toBe(21844); // PROBE: 1364 on main (depth 5)
     expect(addressCount("triangle")).toBeGreaterThan(old);
   });
 

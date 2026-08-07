@@ -266,8 +266,8 @@ describe("extractArt is total", () => {
      */
     [
       "a hexagon depth past the hexagon's own ceiling",
-      // PROBE (branch probe/depth-6): 6 became legal, so the row steps out to 7.
-      wrap(JSON.stringify({ ...good, canvas: "hexagon", depth: 7 })),
+      // PROBE (branch probe/depth-6): 6 and 7 became legal, so the row steps out to 8.
+      wrap(JSON.stringify({ ...good, canvas: "hexagon", depth: 8 })),
     ],
     ["a NaN depth", wrap('{"canvas":"triangle","depth":null,"convention":"apex","cells":[]}')],
     [
@@ -950,8 +950,8 @@ describe("format constants", () => {
    */
   it("declares a depth ceiling for each canvas", () => {
     // PROBE (branch probe/depth-6): 5 on main.
-    expect(MAX_DEPTH.triangle).toBe(6);
-    expect(MAX_DEPTH.hexagon).toBe(6);
+    expect(MAX_DEPTH.triangle).toBe(7);
+    expect(MAX_DEPTH.hexagon).toBe(7);
     expect(MAX_DEPTH.hexagon).toBeGreaterThanOrEqual(MAX_DEPTH.triangle);
   });
 });

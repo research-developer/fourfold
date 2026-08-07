@@ -392,10 +392,12 @@ export const MIN_DEPTH = 1;
  * `test/view.test.ts` measures what that costs; `page.tsx` says what it means
  * for the two views.
  */
-// PROBE (branch probe/depth-6): raised 5 → 6 to test a deeper canvas. Not a
-// format decision — a depth-6 file writes scale 64 and a MAX_DEPTH-5 reader
-// refuses it, which is exactly what the cap exists to make loud.
-export const MAX_DEPTH: Record<CanvasKind, number> = { triangle: 6, hexagon: 6 };
+// PROBE (branch probe/depth-6): raised 5 → 7 to test a deeper canvas. Not a
+// format decision — a deep file writes scale 64/128 and a MAX_DEPTH-5 reader
+// refuses it, which is exactly what the cap exists to make loud. Depth 7 is
+// 98,304 hexagon cells; the SVG plate is expected to hurt, and finding out
+// where it breaks is the probe's whole purpose.
+export const MAX_DEPTH: Record<CanvasKind, number> = { triangle: 7, hexagon: 7 };
 
 /**
  * Cells in a canvas: one wedge of scale², six of them on the hexagon.
