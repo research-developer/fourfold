@@ -216,11 +216,13 @@
  *   data-orbit    how many cells the orbit actually held
  *
  * Only `data-reveal` is load bearing for the picture; the stylesheet selects on
- * it. The other two are for a reader that is not this program. A `<g>` in
- * Illustrator or Inkscape is a compound path with no indication of what produced
- * it, and these two words make one addressable — every six-fold stroke, every
- * orbit that came out short — which is the whole reason this format writes
- * layers rather than a flattened plate.
+ * it — and it is what an in point and an out point are stated against, so a
+ * replay cut to part of the drawing is a change to the STYLESHEET and never to
+ * these three words. See `EmitAnimation`. The other two are for a reader that
+ * is not this program. A `<g>` in Illustrator or Inkscape is a compound path
+ * with no indication of what produced it, and these two words make one
+ * addressable — every six-fold stroke, every orbit that came out short — which
+ * is the whole reason this format writes layers rather than a flattened plate.
  *
  * They are therefore written for a STILL export too. A gesture's symmetry is a
  * fact about the gesture and not about whether anything is being played back,
@@ -259,6 +261,7 @@ import {
   formatRanges,
   parseRanges,
   cellCount,
+  ALPHA_QUANTUM,
   LAYER_ID,
   MAX_ART_BYTES,
   MAX_LAYER_DEPTH,
@@ -316,6 +319,55 @@ export interface EmitLayer {
    * brush. See the header.
    */
   orbit?: number;
+  /**
+   * The nested-timeline compositions this layer's beat sits inside, outermost
+   * first, space separated — `timeline.compMark` of its trail.
+   *
+   * ABSENT AT THE ROOT, which is every drawing that has never been grouped, so
+   * a file with no groups writes no field and its bytes are the bytes it wrote
+   * before this existed. `test/artfile.test.ts` pins that on the exact payload
+   * rather than on a re-encode, which would agree if both sides gained a key.
+   *
+   * A TRAIL RATHER THAN A PARENT POINTER, because a trail CAN be read without a
+   * journal: `timeline.treeFromTrails` rebuilds the whole tree from the trails
+   * alone, where a parent id would need a second pass to discover which layer
+   * each id belonged to and would have no answer for a composition whose own
+   * beats were all merged away.
+   *
+   * THE READER IS NOT WIRED, and this used to describe it as though it were.
+   * Nothing in `src/` calls `treeFromTrails` — only `test/timeline.test.ts` and
+   * `test/gestureexport.test.ts` — and `composer.stackFromEmit`, which is the one
+   * path a file's layers take into a `Composition`, does not carry `nest` onto a
+   * `Layer` at all. So `nest` is WRITE-ONLY today: this program states a drawing's
+   * timeline grouping in every gesture file it writes, and drops it on the way
+   * back in.
+   *
+   * Recorded rather than fixed here, because the two halves are not the same
+   * size. Writing it is an assignment; reading it back means deciding where a
+   * rebuilt tree lands relative to the timeline the session already holds — a
+   * loaded file resets the journal, so the tree it rebuilds has to replace one,
+   * and "replace the timeline on import" is a decision about the document rather
+   * than a wiring job. The field is the durable half and it is correct, which is
+   * what makes leaving the reader for a later pass safe rather than lossy: the
+   * grouping is IN the file, and a future reader gets it.
+   *
+   * WRITTEN BY THE GESTURE PATH ONLY, which is the whole of what a trail can
+   * honestly be about. `provenance.gestureLayers` takes the trails as
+   * `GestureOptions.trails` and puts `compTrails(tree)[k]` on the layer it gives
+   * `reveal: k` — the two lists are the same beats in the same order, so the
+   * writer is an assignment. `composer.emitLayersOf` sets nothing: an EDITOR
+   * layer is not a beat, many gestures paint into one, and a layer that claimed
+   * a composition boundary would be picking one of them to be true about. That
+   * is the same "one number is a lie about the others" argument `provenance.ts`
+   * makes about `orbit`, one field along.
+   *
+   * SO AN UNGROUPED DRAWING AND EVERY STILL EXPORT STILL WRITE NO FIELD, and
+   * their bytes are the bytes they wrote before this existed — `compTrails`
+   * answers `undefined` at the root, and `toArtLayer` omits an absent or empty
+   * trail. Pinned on the exact payload in `test/artfile.test.ts` and on the
+   * exact still document in `test/gestureexport.test.ts`.
+   */
+  nest?: string;
 }
 
 /**
@@ -342,8 +394,116 @@ export interface EmitAnimation {
   holdMs: number;
   /** How long a layer takes to come up. Short — it reads as a stroke landing. */
   fadeMs: number;
-  /** How many reveal steps the cycle has. */
+  /** How many reveal steps the DRAWING has. The cycle's is `out - in + 1`. */
   steps: number;
+  /**
+   * The in point and the out point: which reveal steps actually play.
+   *
+   * CLOSED and inclusive, indices into the same reveal space `EmitLayer.reveal`
+   * uses, so `{in: 3, out: 7}` plays five steps and both ends are seen.
+   * `replay.InOut` is the same pair in the model and its header carries the
+   * argument for closed over half-open; `artfile.ArtAnimation` is where the
+   * file states them.
+   *
+   * HONOURED IN THE STYLESHEET, not by dropping markup. A layer whose reveal
+   * falls before the in point is written exactly as it always was and is simply
+   * given `opacity: 1` from the first frame — it is the ground, and the ground
+   * needs no new mechanism. A layer past the out point keeps its `opacity: 0`
+   * and is never named by a keyframe, so it is in the file and not in the
+   * picture. Both matter: `data-reveal`, `data-mode` and `data-orbit` are
+   * PROVENANCE and are written even for a still export, so a cut must not be
+   * allowed to delete the record of what made the gesture — see the header.
+   *
+   * Absent means the whole drawing plays, and `animationRules` reduces to
+   * exactly the bytes it wrote before this existed when they are.
+   */
+  in?: number;
+  /** The last reveal step that plays. Closed with `in`; both or neither. */
+  out?: number;
+}
+
+/**
+ * A layer that reveals BEFORE something it sits inside. See `revealBreak`.
+ *
+ * Both ends are named because the message a caller writes has to say which two
+ * layers disagree — "layer g7 reveals at 4 but the group g2 it sits in reveals
+ * at 9" is actionable and "invalid reveal order" is not.
+ */
+export interface RevealBreak {
+  /** The id of the layer whose reveal is too early. */
+  readonly layer: string;
+  /** The step that layer asks to come up at. */
+  readonly reveal: number;
+  /** The nearest enclosing layer that comes up later, and the step it does. */
+  readonly ancestor: string;
+  readonly at: number;
+}
+
+/**
+ * The first layer that reveals before an ancestor of it does, or `null`.
+ *
+ * ── MEASURED IN A BROWSER, and it is a silent failure without this ──────
+ *
+ * SVG composites group opacity MULTIPLICATIVELY, so a nested element is visible
+ * only when every ancestor is: the threshold of a product is the product's LATEST
+ * threshold, at the MAX. Sampled on a flat 3200 ms cycle with a nested DOM, the
+ * half-opacity crossing relative to the cycle:
+ *
+ *   parent 800 × child 1200        →  1200 ms     (max)
+ *   parent 800 × child 1600        →  1601 ms     (max)
+ *   three levels, 400/1200/1600    →  1601 ms     (max composes down a chain)
+ *   parent 800 × child  400        →   801 ms     (max — NOT 400)
+ *
+ * THE LAST ROW IS THE DEFECT. A child asking for 400 came up at 801 and nothing
+ * anywhere said so: the file animated differently from the model that wrote it,
+ * the number was still in the markup as `data-reveal`, and the only way to find
+ * out was to sample opacity in a browser. `nested.wellOrdered` predicts exactly
+ * this and its header carries the same numbers; this is the emitter's half of
+ * it, because the invariant is ultimately about what gets WRITTEN.
+ *
+ * ── The floor is the running MAX, not the nearest ancestor ──────────────
+ *
+ * A grandchild at 6 inside a child at 7 inside a parent at 5 satisfies its
+ * grandparent and is still clamped, to 7. So the walk carries the greatest
+ * reveal seen on the way down. It is monotone by construction — a layer is only
+ * allowed past the check when its own reveal is at least the floor, at which
+ * point its reveal IS the new floor — so one number suffices and no maximum has
+ * to be recomputed.
+ *
+ * A layer with NO `reveal` neither raises the floor nor breaks it. Both halves
+ * are deliberate: an ungated ancestor runs no opacity animation at all, so it
+ * clamps nothing; and a child with no reveal is gated entirely by its ancestors
+ * and states no time of its own to disagree with them. That is precisely the
+ * shape `provenance.gestureLayers` writes — the gesture carries the reveal, the
+ * orbits under it carry `mode` and `orbit` and no time — which is why no file
+ * this program has ever produced can trip this.
+ *
+ * EXPORTED, so a UI-facing caller can ASK before it writes. `serialise` and
+ * `parse` both refuse a document that fails this, and a panel that would rather
+ * clamp a reveal visibly — moving the number where the person can see it move —
+ * needs a way to find the pair to clamp without provoking the refusal.
+ */
+export function revealBreak(layers: readonly EmitLayer[]): RevealBreak | null {
+  const walk = (
+    list: readonly EmitLayer[],
+    floor: { id: string; at: number } | null
+  ): RevealBreak | null => {
+    for (const l of list) {
+      let under = floor;
+      if (l.reveal !== undefined) {
+        if (floor !== null && l.reveal < floor.at) {
+          return { layer: l.id, reveal: l.reveal, ancestor: floor.id, at: floor.at };
+        }
+        under = { id: l.id, at: l.reveal };
+      }
+      if (l.children !== undefined) {
+        const hit = walk(l.children, under);
+        if (hit !== null) return hit;
+      }
+    }
+    return null;
+  };
+  return walk(layers, null);
 }
 
 // ── the document ─────────────────────────────────────────────────────────
@@ -466,6 +626,26 @@ const fmtAlpha = (n: number): string => {
   const r = Math.round(n * 1000) / 1000;
   return Object.is(r, -0) ? "0" : String(r);
 };
+
+/**
+ * A layer's alpha AT THE FORMAT'S RESOLUTION, absent reading as 1.
+ *
+ * ONE ROUNDING FOR THE WHOLE MODULE, because three places ask "is this layer
+ * faded?" and they must not disagree: `opaquelyCovered` decides whether to write
+ * a tile behind it, `emitLayers` decides whether to write the attribute, and
+ * `animationRules` decides whether the keyframe ends anywhere but 1.
+ *
+ * `artfile.validateLayer` quantises to `ALPHA_QUANTUM` on the way in, and this
+ * used not to. An alpha in (0.9995, 1) was therefore FADED to the writer and
+ * OPAQUE to the reader, so `serialise` left out a tile that `read` then went
+ * looking for and refused the file over — "tiling-count", on a document this
+ * module had just written. Not reachable from the app, because
+ * `layers.canonicalAlpha` already rounds anything the model holds; reachable
+ * from a hand-built `EmitDoc`, and it degraded at LOAD time rather than at write
+ * time, which is the worst place to find out.
+ */
+const quantAlpha = (a: number | undefined): number =>
+  a === undefined ? 1 : Math.round(a * ALPHA_QUANTUM) / ALPHA_QUANTUM;
 
 // ── prototypes ───────────────────────────────────────────────────────────
 
@@ -745,17 +925,129 @@ export function flatten(layers: readonly EmitLayer[]): Map<number, string> {
 }
 
 /**
+ * The cells the visible stack paints OPAQUELY — the ones nothing needs to be
+ * drawn behind.
+ *
+ * ── Not the same question as `flatten`, and the difference was a wrong file ──
+ *
+ * `serialise` writes a background tile for every shown cell the stack does not
+ * cover, and it asked `flatten` which those were. `flatten` reads `hidden` and
+ * has never read `opacity` — deliberately; `layers.ts` argues at length that the
+ * composite must stay an OCCLUSION returning colours some layer verbatim holds,
+ * and a faded layer still holds its colour. So a cell under a HALF-TRANSPARENT
+ * layer counted as covered and got no tile, and the exported file composited that
+ * paint straight onto the page background while the editor composited it onto the
+ * tile. Measured on a depth-1 hexagon, 24 shown cells, one painted: 23 tiles in
+ * the file where the board draws 24, and the one cell reads ≈`#702a22` on screen
+ * against ≈`#652119` in the file. `DrawBoard`'s `TileLayer` draws every shown cell
+ * unconditionally, which is why the board is the one that is right.
+ *
+ * That refutes `layers.ts`'s "Both renderers show it the same way, because it is
+ * the same mechanism" — the mechanism is the same, the thing UNDER it was not —
+ * and the sentence there has been corrected rather than left standing.
+ *
+ * ── A FADE REACHES THE WHOLE SUBTREE, so the whole chain has to be clear ──
+ *
+ * A group's `opacity` is a COMPOSITING operation: the group is rendered to its
+ * own buffer and that buffer is composited at the alpha, so nested groups
+ * MULTIPLY and a fully opaque layer inside a faded parent is not opaque on the
+ * page. This walks with the ancestors' answer in hand for that reason; asking
+ * each layer about itself would have written the same wrong file one level down.
+ *
+ * This paragraph used to say "`opacity`/`fill-opacity` multiplies", and that is
+ * only true of the first. `fill-opacity` is an INHERITED property, so a child's
+ * declaration REPLACES the parent's rather than compounding with it — measured,
+ * see `emitLayers`. The distinction does not change this function's answer, which
+ * is why it survived being written down wrongly: either way a descendant of a
+ * faded layer is not opaque, so `clear` is still the right thing to track. It is
+ * corrected because it is the sentence somebody would reason from next.
+ *
+ * ONE-SIDED BY CONSTRUCTION, and worth stating: this can only ever OVER-tile. A
+ * tile under paint that turns out to be opaque is invisible; a missing tile under
+ * paint that turns out to be faded is the wrong colour. Any doubt resolves
+ * towards writing the tile.
+ *
+ * ── One function, both directions ──────────────────────────────────────
+ *
+ * `read` counts the tiling shapes against exactly this set, so writer and reader
+ * ask one question. Two spellings of "which cells need a tile" would be a file
+ * this module writes and refuses to read.
+ *
+ * COSTS NOTHING ON AN ORDINARY DRAWING: with no alpha anywhere this returns what
+ * `flatten` returned, key for key, so every existing file's bytes are unchanged —
+ * which `test/byteidentity.test.ts` is the check on.
+ */
+export function opaquelyCovered(layers: readonly EmitLayer[]): Set<number> {
+  const out = new Set<number>();
+  const rec = (list: readonly EmitLayer[], clear: boolean) => {
+    for (const l of list) {
+      if (l.hidden === true) continue;
+      // QUANTISED, so this and `artfile.validateLayer` call the same layers
+      // faded. See `quantAlpha` for the file the disagreement produced.
+      const here = clear && quantAlpha(l.opacity) === 1;
+      if (here && l.paint !== undefined) for (const i of l.paint.keys()) out.add(i);
+      if (l.children !== undefined) rec(l.children, here);
+    }
+  };
+  rec(layers, true);
+  return out;
+}
+
+/**
  * The composition, or one layer of it, as an SVG document.
  *
  * Throws only for a caller error the program itself can make — an unknown layer
- * id, or a cell that has to be drawn and has no geometry. Untrusted input goes
- * the other way, through `parse`, which never throws.
+ * id, a cell that has to be drawn and has no geometry, or a child that reveals
+ * before something it sits inside. Untrusted input goes the other way, through
+ * `parse`, which never throws.
+ *
+ * ── WHY THE THIRD ONE IS A REFUSAL AND NOT A CLAMP ──────────────────────
+ *
+ * Because the clamp is the bug. A child revealing before its ancestor is held
+ * back to the ancestor's time by the renderer — measured, 400 ms asked for and
+ * 801 ms delivered, see `revealBreak` — so the file animates differently from
+ * the document that wrote it and the number it disagrees with is sitting in its
+ * own markup. Writing it and clamping it silently is the only available way to
+ * lose that quietly, and this codebase's rule is that a decline is a counted
+ * precondition and never a fallback.
+ *
+ * CHECKED ON THE SCOPED DOCUMENT, so a layer exported alone is checked as the
+ * standalone composition it becomes — which is also the escape hatch: scoping to
+ * the offending child drops the ancestor that gated it, and the export succeeds
+ * because the thing it was lying about is no longer in the file.
+ *
+ * NOT GATED ON `doc.animation`, and that is the module's own argument rather
+ * than a new one. `data-reveal` is written for a STILL export too, because "a
+ * gesture's symmetry is a fact about the gesture and not about whether anything
+ * is being played back" — see the header. A still export therefore states the
+ * same reveal order, and a document that states an impossible one is not one to
+ * write down whether or not this particular export animates it.
+ *
+ * NO EXISTING FILE BECOMES UNWRITABLE. The two producers in this repo are
+ * `provenance.gestureLayers`, which puts the reveal on the GESTURE and leaves
+ * the orbits under it with no time of their own, and `composer.emitLayersOf`,
+ * which copies `Layer.reveal` one for one — and a `Layer` only ever acquires one
+ * by IMPORT, because nothing in the editor mints reveals. `test/emit.test.ts`
+ * measures the first of those directly. The one way to build a violating
+ * document is to paste an imported low-reveal layer inside an imported
+ * high-reveal one, which is exactly the case that used to animate wrongly.
  */
 export function serialise(doc: EmitDoc, scope?: EmitScope): string {
   const scoped = scopeOf(doc, scope);
 
+  const broken = revealBreak(scoped.layers);
+  if (broken !== null) {
+    throw new Error(
+      `emit: layer ${broken.layer} reveals at step ${broken.reveal} but ` +
+        `${broken.ancestor}, which contains it, reveals at ${broken.at} — a child ` +
+        `cannot come up before the group that gates it`
+    );
+  }
+
   const shownSet = new Set(scoped.shown);
-  const composite = flatten(scoped.layers);
+  // OPAQUE cover and not `flatten`'s cover: a tile goes behind a faded cell,
+  // because the board puts one there. See `opaquelyCovered`.
+  const composite = opaquelyCovered(scoped.layers);
 
   // Everything the document will draw, so the prototypes and the palette are
   // read off what is actually emitted and a scoped export carries neither a
@@ -943,9 +1235,62 @@ function emitLayers(
     // layer states its own. This is how the file DRAWS.
     if (l.hidden === true) attrs.push(`display="none"`);
     if (l.locked === true) attrs.push(`data-locked="1"`);
-    if (l.opacity !== undefined && l.opacity !== 1) {
-      attrs.push(`opacity="${fmtAlpha(l.opacity)}"`);
-    }
+    /**
+     * `opacity`, WHICH COMPOSITES — and the two wrong answers before it.
+     *
+     * ── One: the bare attribute, which the animation destroyed ────────────
+     *
+     * `animationRules` writes `#root [data-reveal] { opacity: 0; animation: … }`
+     * and this is a presentation attribute on that very `<g>`. A CSS declaration
+     * beats an SVG presentation attribute of the same name, so a layer carrying
+     * BOTH an alpha and a `reveal` had its alpha silently discarded: overridden to
+     * the keyframe's value for the whole animation and left there by
+     * `animation-fill-mode: both`. DEAD, whenever the document is a replay —
+     * which is what this build's gesture export writes.
+     *
+     * ── Two: `fill-opacity`, which fixed that and broke compositing ───────
+     *
+     * The first fix moved the alpha to `fill-opacity`, on `DrawBoard`'s own
+     * argument that a layer's cells are a disjoint tiling. That argument is sound
+     * FOR ONE LEAF LAYER and false for the tree these groups actually form.
+     * `fill-opacity` is an INHERITED property — a child's declaration REPLACES the
+     * inherited value for its subtree — while `opacity` is a COMPOSITING operation
+     * that multiplies. So the file stopped agreeing with the board the moment a
+     * faded layer had children, which is the suite's own fixture.
+     *
+     * MEASURED IN CHROMIUM, red over white, both divergences:
+     *
+     *   NESTED FADE, disjoint cells. Two groups at 0.5. Nested `opacity` samples
+     *   (255,191,191) — red at 0.25. Nested `fill-opacity` samples (255,127,127) —
+     *   red at 0.5, the child's declaration having replaced the parent's.
+     *
+     *   ONE CELL, painted by a faded parent AND a child inside it. `opacity`
+     *   samples (255,126,126): the group composites first, so the child's paint
+     *   OCCLUDES the parent's and the result is red at a half. `fill-opacity`
+     *   samples (255,114,63) — red over gold over white, both visible. Those are
+     *   `DrawBoard`'s own numbers, and its header already calls the second one
+     *   "cheaper, obvious, and wrong".
+     *
+     * ── So the alpha stays on `opacity`, and the ANIMATION gives way ──────
+     *
+     * The property is not the thing that had to move; the CLASH was. A revealing
+     * layer's keyframe now ends at THAT LAYER'S OWN ALPHA rather than at 1, so the
+     * stylesheet states the alpha instead of destroying it — see `animationRules`,
+     * where the rule is written and the measurement is repeated. Both values are
+     * then compositing operations on the same property, so they multiply down the
+     * tree exactly as the board does, and `DrawBoard`'s claim that the two cannot
+     * drift is true again.
+     *
+     * Nothing reads it back: `parse` takes `opacity` from the payload, where the
+     * layer states its own. This is how the file DRAWS.
+     *
+     * QUANTISED, because `artfile.validateLayer` quantises on the way in. Writing
+     * the raw value let an alpha in (0.9995, 1) count as faded here and as opaque
+     * there, so `opaquelyCovered` wrote a tiling the reader then refused as
+     * "tiling-count". One rounding, used by everything in this module.
+     */
+    const alpha = quantAlpha(l.opacity);
+    if (alpha !== 1) attrs.push(`opacity="${fmtAlpha(alpha)}"`);
     // The gesture, for a reader that is not this program. See the header.
     //
     // ABSENT, never defaulted and never empty: a `data-mode=""` on every group
@@ -1030,12 +1375,80 @@ function styleRules(
 /** How much wider than a hairline a weld stroke is. `strokes.WELD_WIDTH`. */
 const WELD = 3;
 
+/**
+ * The reveal rules, cut to the in and out points when the document states them.
+ *
+ * ── Why the uncut file is byte for byte the file it always was ──────────
+ *
+ * `lo` and `hi` default to the ends, so every formula below reduces to the one
+ * it replaced: the cycle is `(steps-1 - 0 + 1) · stepMs + holdMs`, which is
+ * `steps · stepMs + holdMs`, and a keyframe sits at `(k - 0) · stepMs`, which is
+ * `k · stepMs`. Nothing is written that was not written before.
+ *
+ * The two EXTRA rules are gated on the marks being present rather than on `k`
+ * falling outside `lo … hi`, and that is not belt and braces. A document may
+ * carry a reveal index past its own `steps` — nothing validates one against the
+ * other, deliberately, because `steps` is the drawing's length and a reveal is a
+ * layer's own statement — and such a layer animates today. Gating on the marks
+ * keeps it animating, so this change cannot alter a file that never asked to be
+ * cut.
+ *
+ * ── Why a cut layer keeps its markup ────────────────────────────────────
+ *
+ * Neither branch removes a `<g>` or a `data-*`. `data-reveal`, `data-mode` and
+ * `data-orbit` are the record of what MADE the gesture and are written even for
+ * a still export — see the header — so a file whose out point dropped the last
+ * three strokes must still say that those three strokes were six-fold. The cut
+ * is what the file DRAWS; the markup is what it MEANS.
+ *
+ * ── A FADED LAYER'S REVEAL ENDS AT ITS ALPHA, NOT AT 1 ──────────────────
+ *
+ * These rules and `emitLayers`' alpha are the same CSS property on the same
+ * element, and this side wins: a running animation beats every normal
+ * declaration in the cascade, whatever its specificity, and `animation-fill-mode:
+ * both` leaves the final keyframe in force for ever after. So a layer that
+ * carried both an alpha and a `reveal` came up at FULL STRENGTH and stayed there.
+ *
+ * The fix is not to move the alpha off `opacity` — that was tried, with
+ * `fill-opacity`, and it broke compositing for nested layers; `emitLayers`
+ * carries the Chromium numbers. It is for THESE rules to state the alpha, since
+ * they are the ones that win. A layer with an alpha gets its own keyframe ending
+ * at that alpha and its own `#id` rule pointing at it.
+ *
+ * MEASURED IN CHROMIUM, red over white, against the board's nested `<g opacity>`:
+ * two layers at 0.5 both revealing sample (255,191,191) under this scheme and
+ * (255,191,191) on the board; a cell painted by a faded parent and an opaque
+ * child samples (255,126,126) under both. An `#id` selector beats `[data-reveal=
+ * "k"]` for `animation-name`, confirmed by `getComputedStyle` rather than assumed.
+ *
+ * ── The uncut, unfaded file is still byte for byte the file it was ──────
+ *
+ * Every rule below is gated on a layer HAVING an alpha, and `quantAlpha` says no
+ * for every layer of every document this program can currently produce — nothing
+ * in `src/` writes a layer alpha; see `layers.setOpacity`. So a drawing with no
+ * fade emits exactly the rules it emitted before, in the same order, and
+ * `test/byteidentity.test.ts` is the check on that rather than this sentence.
+ */
 function animationRules(doc: EmitDoc, root: string): string[] {
   const a = doc.animation as EmitAnimation;
-  const cycle = Math.max(1, a.steps * a.stepMs + a.holdMs);
+  // BOTH gated on the pair being whole, and not one defaulted per mark. A
+  // half-stated pair — `in` with no `out`, which the payload refuses but an
+  // in-memory document can still hold — took `lo = 2, hi = steps - 1` and
+  // silently played a four-step cycle out of a six-step drawing that had asked
+  // for no cut at all. `test/inout.test.ts` measured that; the pair is whole or
+  // it does not exist.
+  const bounded = a.in !== undefined && a.out !== undefined;
+  const lo = bounded ? (a.in as number) : 0;
+  const hi = bounded ? (a.out as number) : a.steps - 1;
+  const cycle = Math.max(1, (hi - lo + 1) * a.stepMs + a.holdMs);
   const reveals = new Set<number>();
+  /** Layers that both reveal AND fade — the ones these rules must not flatten. */
+  const faded: { id: string; reveal: number; alpha: number }[] = [];
   walkLayers(doc.layers, (l) => {
-    if (l.reveal !== undefined) reveals.add(l.reveal);
+    if (l.reveal === undefined) return;
+    reveals.add(l.reveal);
+    const alpha = quantAlpha(l.opacity);
+    if (alpha !== 1) faded.push({ id: l.id, reveal: l.reveal, alpha });
   });
   // Scoped, and the keyframe names carry the document id as a PREFIX because
   // `@keyframes` has one global namespace per document and `@scope` does not
@@ -1047,27 +1460,101 @@ function animationRules(doc: EmitDoc, root: string): string[] {
       `animation-fill-mode: both }`,
   ];
   const order = [...reveals].sort((x, y) => x - y);
+  const before = (k: number) => bounded && k < lo;
+  const after = (k: number) => bounded && k > hi;
   for (const k of order) {
+    // BEFORE THE IN POINT is the ground: up from the first frame, no animation
+    // to run. AFTER THE OUT POINT is not shown at all; the base rule above
+    // already left it at zero and this says so where a reader will look for it.
+    // Same specificity as that rule and written after it, so both win.
+    if (before(k)) {
+      rules.push(`${at}[data-reveal="${k}"] { animation: none; opacity: 1 }`);
+      continue;
+    }
+    if (after(k)) {
+      rules.push(`${at}[data-reveal="${k}"] { animation: none; opacity: 0 }`);
+      continue;
+    }
     rules.push(`${at}[data-reveal="${k}"] { animation-name: ${root}-r${k} }`);
   }
-  for (const k of order) {
-    const on0 = k * a.stepMs;
+
+  /**
+   * THE FADED LAYERS, one `#id` rule each, on top of the generic one.
+   *
+   * BY ID rather than by a second attribute, because an alpha is a fact about
+   * ONE layer while `data-reveal` is shared by every layer of that step — two
+   * layers can reveal together and fade differently, and an attribute selector
+   * has no way to say which is which. An id selector also outranks
+   * `[data-reveal="k"]`, which is what makes these win; measured with
+   * `getComputedStyle` rather than assumed.
+   *
+   * The keyframe name carries the alpha AT THE FORMAT'S QUANTUM, so two layers
+   * fading identically at the same step share one `@keyframes` block and nothing
+   * is emitted twice. It is an integer by construction — `quantAlpha` rounds to
+   * thousandths — so the name is a plain CSS identifier with no decimal point in
+   * it, which `@keyframes` would not take.
+   */
+  const wanted = new Map<string, { reveal: number; alpha: number }>();
+  for (const f of faded) {
+    if (after(f.reveal)) continue; // the base rule already holds it at 0
+    if (before(f.reveal)) {
+      // The ground, AT ITS OWN STRENGTH. The generic rule above says `opacity: 1`
+      // for this step, which for a faded layer is the flattening all over again.
+      rules.push(`${at}#${f.id} { animation: none; opacity: ${fmtAlpha(f.alpha)} }`);
+      continue;
+    }
+    const name = `${root}-r${f.reveal}a${Math.round(f.alpha * ALPHA_QUANTUM)}`;
+    wanted.set(name, { reveal: f.reveal, alpha: f.alpha });
+    rules.push(`${at}#${f.id} { animation-name: ${name} }`);
+  }
+
+  /** One `@keyframes` block, given the step it lights at and its end value. */
+  const frames = (name: string, k: number, end: number): string => {
+    // Rebased on the in point, so a drawing of a hundred gestures cut to five
+    // plays a five-step cycle with the first of them lit at zero.
+    const on0 = (k - lo) * a.stepMs;
     const on = (100 * on0) / cycle;
     const lit = (100 * Math.min(on0 + Math.max(1, a.fadeMs), cycle)) / cycle;
     // The first step reveals at 0, where `0%, 0%` would be a duplicate selector.
     const dark = on <= 0 ? "0%" : `0%, ${fmtAlpha(on)}%`;
-    rules.push(
-      `@keyframes ${root}-r${k} { ${dark} { opacity: 0 } ${fmtAlpha(lit)}%, 100% { opacity: 1 } }`
+    return (
+      `@keyframes ${name} { ${dark} { opacity: 0 } ` +
+      `${fmtAlpha(lit)}%, 100% { opacity: ${fmtAlpha(end)} } }`
     );
+  };
+
+  for (const k of order) {
+    if (before(k) || after(k)) continue;
+    rules.push(frames(`${root}-r${k}`, k, 1));
   }
+  // The faded blocks after the plain ones, so an unfaded document's stylesheet is
+  // unchanged to the byte and a faded one appends rather than interleaves.
+  for (const [name, { reveal, alpha }] of wanted) rules.push(frames(name, reveal, alpha));
   // The app's own chrome honours this preference; the thing it EXPORTS — the
   // one that ends up on somebody else's screen, with no settings panel and no
   // way to stop it — did not. An infinite loop is exactly what the preference
   // is about, so the finished plate is what a reader who asked for less motion
   // gets: every layer up, nothing moving.
+  //
+  // "The finished plate" is the plate AT THE OUT POINT when there is one, so
+  // the layers the cut drops are held down inside this block too. Without that
+  // line the preference would quietly restore three strokes the author had cut
+  // — a reduced-motion reader would be the only one seeing a different drawing,
+  // which is the one thing an accessibility rule must not do. Same specificity,
+  // written after, so it wins.
+  //
+  // AND THE FADED LAYERS KEEP THEIR ALPHA HERE TOO, by the same argument one
+  // step further: `opacity: 1` is the finished plate for an opaque layer and is
+  // a DIFFERENT DRAWING for a faded one. A reduced-motion reader must get the
+  // same picture as everybody else, minus the motion — not a flattened one.
+  const cut = order.filter(after);
+  const still = faded.filter((f) => !after(f.reveal));
   rules.push(
     `@media (prefers-reduced-motion: reduce) { ${at}[data-reveal] ` +
-      `{ animation: none; opacity: 1 } }`
+      `{ animation: none; opacity: 1 }` +
+      cut.map((k) => ` ${at}[data-reveal="${k}"] { opacity: 0 }`).join("") +
+      still.map((f) => ` ${at}#${f.id} { opacity: ${fmtAlpha(f.alpha)} }`).join("") +
+      ` }`
   );
   return rules;
 }
@@ -1128,6 +1615,13 @@ function compositionOf(doc: EmitDoc): ArtComposition {
           holdMs: doc.animation.holdMs,
           fadeMs: doc.animation.fadeMs,
           steps: doc.animation.steps,
+          // BOTH OR NEITHER, and last, so a document with no in and out points
+          // writes the same four keys in the same order it always wrote them
+          // and the bytes are unchanged. `artfile`'s validator builds the same
+          // object in the same order, which is what keeps the re-encode exact.
+          ...(doc.animation.in === undefined || doc.animation.out === undefined
+            ? {}
+            : { in: doc.animation.in, out: doc.animation.out }),
         };
   return {
     shown: formatRanges(doc.shown),
@@ -1145,10 +1639,19 @@ function toArtLayer(l: EmitLayer): ArtLayer {
   if (l.name !== undefined) out.name = l.name;
   if (l.hidden === true) out.hidden = true;
   if (l.locked === true) out.locked = true;
-  if (l.opacity !== undefined && l.opacity !== 1) out.opacity = l.opacity;
+  // ROUNDED TO THE FORMAT'S QUANTUM, the same one `fmtAlpha` writes into the
+  // markup a few lines away. Written raw, this stated `0.1234567` in the payload
+  // beside `fill-opacity="0.123"` in the picture — one file, two alphas. See
+  // `artfile.ALPHA_QUANTUM`, which is where the number lives.
+  if (l.opacity !== undefined && l.opacity !== 1) {
+    out.opacity = Math.round(l.opacity * ALPHA_QUANTUM) / ALPHA_QUANTUM;
+  }
   if (l.reveal !== undefined) out.reveal = l.reveal;
   if (l.mode !== undefined) out.mode = l.mode;
   if (l.orbit !== undefined) out.orbit = l.orbit;
+  // After `orbit` and before `cells`, because `encodeArt` writes keys in
+  // insertion order and `test/artfile.test.ts` pins the payload byte for byte.
+  if (l.nest !== undefined && l.nest.length > 0) out.nest = l.nest;
   if (l.paint !== undefined && l.paint.size > 0) {
     out.cells = sortedKeys(l.paint).map(
       (i) => [i, l.paint?.get(i) as string] as [number, string]
@@ -1196,38 +1699,150 @@ const withoutComments = (text: string): string =>
   text.replace(/<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>/g, (m) => " ".repeat(m.length));
 
 /**
- * An SVG document this module wrote, back as the value it was written from.
+ * WHY A DOCUMENT WAS NOT VOUCHED FOR — and why this is an enum and not a bare
+ * `null`.
  *
- * `null` for: anything that is not a string, anything past `MAX_ART_BYTES`, a
- * document with no payload or a payload this build will not vouch for, a
- * document with no layer composition in that payload, markup that nests past
- * `MAX_LAYER_DEPTH`, a `<use>` naming a prototype the file does not define, a
- * layer whose drawn cells do not line up with what the payload says it paints,
- * and anything that makes the reader throw. It throws for nothing.
+ * `parse` had FIFTEEN distinct ways to answer `null` and exactly one of them —
+ * `"no-composition"` — means "an old drawing from before layers existed". Its
+ * caller could not tell them apart, so it treated all fifteen as that one: a file
+ * that DID carry a composition and was refused arrived as a single flat layer
+ * holding the finished plate, announced as a successful paste. The picture
+ * survived, so the loss was invisible until somebody went looking for their
+ * history — by which time the flattened version was the one they had saved.
+ *
+ * It is reachable by the route this build's keystone feature invites: EXPORT
+ * GESTURES, open the file in Inkscape (`page.tsx` says to), save, re-import.
+ * Inkscape rewrites the `<defs>`/`<use>` structure, a count check disagrees, and
+ * several hundred gesture layers become one.
+ *
+ * ONE CASE IS ORDINARY AND THE REST ARE FAULTS, so the split has to be in the
+ * type rather than in a caller's memory of which is which. `"no-composition"` is
+ * the only member a caller may quietly fall back on.
+ */
+export type EmitRefusal =
+  /** Not a string, empty, or past `MAX_ART_BYTES`. */
+  | "not-text"
+  /** No FOURFOLD payload, or one `artfile` will not vouch for. */
+  | "no-payload"
+  /** A payload with NO LAYER TREE. The one ordinary answer: see the header. */
+  | "no-composition"
+  /** No `<svg>` root, or a root with no readable width and height. */
+  | "not-svg"
+  /** `<defs>` names one id twice, or a prototype's points do not read. */
+  | "prototypes"
+  /** A `.tile` or `.k…` rule whose stroke width is not a number this writes. */
+  | "style"
+  /** The payload's shown-cell ranges do not read against its own canvas. */
+  | "shown"
+  /** A layer reveals before one it sits inside. See `revealBreak`. */
+  | "reveal-order"
+  /** The `<g>` tree does not balance, nests too deep, or holds too many. */
+  | "markup"
+  /** The tiling shapes disagree with the cells the payload leaves unpainted. */
+  | "tiling-count"
+  /** A `.tile` rule with no tiling group to apply it to. */
+  | "tile-rule"
+  /** A shape that does not resolve — typically a `<use>` naming no prototype. */
+  | "shape"
+  /** A layer's drawn cells do not line up with what the payload says it paints. */
+  | "layer-shapes"
+  /** A wash shape whose points do not read. */
+  | "overlay"
+  /** Unreachable by construction; kept because the promise is total. */
+  | "threw";
+
+/** What a refusal is, in the words a person reads. Never names a field. */
+export function refusalSaid(why: EmitRefusal): string {
+  switch (why) {
+    case "not-text":
+      return "there is nothing to read, or the file is larger than this program will open";
+    case "no-payload":
+      return "it carries no FOURFOLD payload this build can vouch for";
+    case "no-composition":
+      return "it carries no layer composition — a drawing from before layers existed";
+    case "not-svg":
+      return "its root is not an SVG with a width and a height";
+    case "prototypes":
+      return "its shape definitions are ambiguous — one id is defined twice, or one does not read";
+    case "style":
+      return "its stylesheet states a width that is not a number";
+    case "shown":
+      return "its list of shown cells does not read against the canvas it declares";
+    case "reveal-order":
+      return "a layer in it is revealed before the group that gates it, so it would draw out of order";
+    case "markup":
+      return "its groups do not balance, or nest deeper or wider than a FOURFOLD file may";
+    case "tiling-count":
+      return "its background tiles do not line up with the cells its payload leaves unpainted";
+    case "tile-rule":
+      return "it styles a background tiling it does not contain";
+    case "shape":
+      return "one of its shapes does not resolve — a placed shape naming a definition the file does not have";
+    case "layer-shapes":
+      return "a layer's drawn cells disagree with the cells its payload says that layer paints";
+    case "overlay":
+      return "one of its overlay shapes has points that do not read";
+    case "threw":
+      return "the reader could not finish it";
+  }
+}
+
+/** A document read, or the reason it was not. */
+export type Parsed =
+  | { readonly ok: true; readonly doc: EmitDoc }
+  | { readonly ok: false; readonly why: EmitRefusal };
+
+/**
+ * An SVG document this module wrote, back as the value it was written from,
+ * WITH THE REASON when it is not.
  *
  * The payload is the AUTHORITY for which cells and which layers. The markup
  * supplies the picture: the shapes, the colours, the seams and the frame. So a
  * file whose markup has been tampered with either fails the count checks and is
  * refused, or differs only in pixels the payload does not claim.
+ *
+ * Every refusal below is a NAMED one — see `EmitRefusal` for the measured reason
+ * that is worth the enum. It throws for nothing.
  */
-export function parse(text: string): EmitDoc | null {
+export function parseWhy(text: string): Parsed {
   try {
     return read(text);
   } catch {
     // Unreachable by construction — every branch below returns rather than
-    // throws — and kept because "returns null for hostile input" is a promise
-    // this module makes to a drop handler, and a promise with an exception
-    // escaping through it is not one.
-    return null;
+    // throws — and kept because "answers rather than throws, for hostile input"
+    // is a promise this module makes to a drop handler, and a promise with an
+    // exception escaping through it is not one.
+    return no("threw");
   }
 }
 
-function read(text: string): EmitDoc | null {
-  if (typeof text !== "string") return null;
-  if (text.length === 0 || text.length > MAX_ART_BYTES) return null;
+/**
+ * The same read, as the nullable every existing caller and test already takes.
+ *
+ * KEPT rather than migrated. `parse` is what the byte-identity round trip is
+ * written against — `serialise(parse(t)) === t` — and changing its shape would
+ * have rewritten a great many assertions to prove nothing about this defect. The
+ * two callers that need the REASON call `parseWhy`; everything else is untouched,
+ * byte for byte.
+ */
+export function parse(text: string): EmitDoc | null {
+  const got = parseWhy(text);
+  return got.ok ? got.doc : null;
+}
+
+const no = (why: EmitRefusal): Parsed => ({ ok: false, why });
+
+function read(text: string): Parsed {
+  if (typeof text !== "string") return no("not-text");
+  if (text.length === 0 || text.length > MAX_ART_BYTES) return no("not-text");
 
   const payload = extractArt(text);
-  if (payload === null || payload.comp === undefined) return null;
+  if (payload === null) return no("no-payload");
+  // THE ONE SPLIT THE CALLER LIVES OR DIES BY. A payload with no `comp` is an
+  // old drawing and its caller may fall back to reading it as one flat layer; a
+  // payload WITH a `comp` that anything below refuses is a drawing whose history
+  // exists and would be destroyed by that same fallback.
+  if (payload.comp === undefined) return no("no-composition");
   const comp = payload.comp;
   // The composition is lifted OUT of the payload and into `layers`, so there is
   // one place a layer lives and the two cannot drift.
@@ -1248,10 +1863,10 @@ function read(text: string): EmitDoc | null {
   // inside the payload — in a layer's name, say — has already been blanked, so
   // the first one found is the real root and not one somebody smuggled.
   const head = /<svg(?=[\s/>])([^>]*?)\/?>/.exec(markup);
-  if (head === null) return null;
+  if (head === null) return no("not-svg");
   const width = num(attrOf(head[1], "width"));
   const height = num(attrOf(head[1], "height"));
-  if (width === null || height === null) return null;
+  if (width === null || height === null) return no("not-svg");
 
   // `<title>` now carries an id, for `aria-labelledby`.
   const titleAt = /<title(?=[\s>])[^>]*>([\s\S]{0,4096}?)<\/title>/.exec(markup);
@@ -1259,7 +1874,7 @@ function read(text: string): EmitDoc | null {
 
   // ── prototypes ──
   const protos = readProtos(markup);
-  if (protos === null) return null;
+  if (protos === null) return no("prototypes");
 
   // ── style ──
   const styleAt = /<style(?=[\s>])[^>]*>([\s\S]{0,1048576}?)<\/style>/.exec(markup);
@@ -1273,7 +1888,7 @@ function read(text: string): EmitDoc | null {
     if (tile[2] !== undefined) {
       tileSeam = tile[2];
       const w = num(tile[3]);
-      if (w === null) return null;
+      if (w === null) return no("style");
       seamWidth = w;
     }
   }
@@ -1285,7 +1900,7 @@ function read(text: string): EmitDoc | null {
     if (m[3] !== undefined) {
       weldPaint = true;
       const w = num(m[4]);
-      if (w === null) return null;
+      if (w === null) return no("style");
       if (tile === null || tile[2] === undefined) seamWidth = w / WELD;
     }
   }
@@ -1296,17 +1911,29 @@ function read(text: string): EmitDoc | null {
 
   // ── the drawing ──
   const body = readBody(markup);
-  if (body === null) return null;
+  if (body === null) return no("markup");
 
   const shown =
     comp.shown === undefined
       ? Array.from({ length: cellCount(payload.canvas, payload.depth) }, (_, i) => i)
       : parseRanges(comp.shown, cellCount(payload.canvas, payload.depth));
-  if (shown === null) return null;
+  if (shown === null) return no("shown");
   const shownSet = new Set(shown);
 
   const layers = fromArtLayers(comp.layers);
-  const composite = flatten(layers);
+  // THE WHOLE FILE, REFUSED, on the same rule as every other disagreement here:
+  // the payload is the authority, and a payload that states a reveal order the
+  // renderer cannot honour is a file that would draw something other than what
+  // it says. `artfile.ts` validates each `reveal` as a whole non-negative step
+  // in ISOLATION and cannot see this, because it is a relation BETWEEN two
+  // layers and the validator walks one at a time. So it is checked here, where
+  // the tree exists. `serialise` refuses the same document; see `revealBreak`
+  // for the browser measurement that makes it a refusal rather than a clamp.
+  if (revealBreak(layers) !== null) return no("reveal-order");
+  // THE SAME QUESTION `serialise` ASKED when it wrote the tiling, and it has to
+  // be the same function: this counts the tiling shapes against it. See
+  // `opaquelyCovered`.
+  const composite = opaquelyCovered(layers);
 
   const cells = new Map<number, ArtCell>();
   const place = (i: number, s: Shape): boolean => {
@@ -1321,26 +1948,28 @@ function read(text: string): EmitDoc | null {
   if (body.tiling !== null) {
     const want: number[] = [];
     for (const i of shown) if (!composite.has(i)) want.push(i);
-    if (want.length !== body.tiling.length) return null;
-    for (let k = 0; k < want.length; k++) if (!place(want[k], body.tiling[k])) return null;
+    if (want.length !== body.tiling.length) return no("tiling-count");
+    for (let k = 0; k < want.length; k++) {
+      if (!place(want[k], body.tiling[k])) return no("shape");
+    }
   } else if (unpainted !== null) {
     // A `.tile` rule with nothing to apply it to. Harmless in a renderer and a
     // disagreement here, so it is refused rather than half-believed.
-    return null;
+    return no("tile-rule");
   }
 
   const paintSeam = body.paintSeam;
   if (body.paintSeamWidth !== null && !weldPaint) seamWidth = body.paintSeamWidth;
 
-  if (!matchLayers(layers, body.layers, shownSet, place)) return null;
+  if (!matchLayers(layers, body.layers, shownSet, place)) return no("layer-shapes");
 
   const overlay: ArtOverlayGroup[] = [];
   for (const g of body.overlay) {
     const shapes: [number, number][][] = [];
     for (const s of g.shapes) {
-      if (s.points === null) return null;
+      if (s.points === null) return no("overlay");
       const verts = readPoints(s.points);
-      if (verts === null) return null;
+      if (verts === null) return no("overlay");
       shapes.push(verts);
     }
     overlay.push({ fill: g.fill, opacity: g.opacity, shapes });
@@ -1354,24 +1983,32 @@ function read(text: string): EmitDoc | null {
           holdMs: comp.anim.holdMs,
           fadeMs: comp.anim.fadeMs,
           steps: comp.anim.steps,
+          // The validator has already refused a half-stated pair, so these are
+          // both present or both absent by the time they get here.
+          ...(comp.anim.in === undefined || comp.anim.out === undefined
+            ? {}
+            : { in: comp.anim.in, out: comp.anim.out }),
         };
 
   return {
-    width,
-    height,
-    cells,
-    shown,
-    background,
-    unpainted,
-    tileSeam,
-    paintSeam,
-    seamWidth,
-    weldPaint,
-    title,
-    layers,
-    overlay,
-    animation,
-    payload: rest,
+    ok: true,
+    doc: {
+      width,
+      height,
+      cells,
+      shown,
+      background,
+      unpainted,
+      tileSeam,
+      paintSeam,
+      seamWidth,
+      weldPaint,
+      title,
+      layers,
+      overlay,
+      animation,
+      payload: rest,
+    },
   };
 }
 
@@ -1651,6 +2288,7 @@ function fromArtLayers(list: readonly ArtLayer[]): EmitLayer[] {
     if (l.reveal !== undefined) out.reveal = l.reveal;
     if (l.mode !== undefined) out.mode = l.mode;
     if (l.orbit !== undefined) out.orbit = l.orbit;
+    if (l.nest !== undefined) out.nest = l.nest;
     if (l.cells !== undefined) out.paint = new Map(l.cells);
     if (l.children !== undefined) out.children = fromArtLayers(l.children);
     return out;

@@ -56,6 +56,7 @@ import {
   MIN_DEPTH,
   payloadFromPaint,
 } from "@/lib/artfile";
+import { armCellsAtScale, cellsAtScale, gasketAtDepth } from "@/lib/scale";
 import {
   addressBook,
   planPlateEdits,
@@ -63,6 +64,7 @@ import {
   plateFromArtPayload,
   plateIntoSector,
   resolvePlate,
+  strandedCount,
   type Address,
   type AddressBook,
   type PlateEdit,
@@ -163,8 +165,69 @@ import {
   animationCensus,
   animationSteps,
   animationTiming,
+  boundAnimation,
   type AnimationStep,
 } from "@/lib/replay";
+import {
+  actAfterMerge,
+  actAtStep,
+  beatsOf,
+  compTrails,
+  cutForFrame,
+  GROUND,
+  lostSaid,
+  markIn,
+  markOut,
+  mergeSaid,
+  minter,
+  nameAtStep,
+  nameSpan,
+  rangeOfSpan,
+  rebaseSaid,
+  redoSaid,
+  refusedSaid,
+  resolveSpan,
+  sameCommitted,
+  sameJournal,
+  spanSaid,
+  stepAtAct,
+  syncSaid,
+  syncTree,
+  undoSaid,
+  type Beats,
+  type NamedSpan,
+  type ResolvedSpan,
+  type Synced,
+} from "@/lib/timeline";
+/**
+ * THE THREE MODEL FILES THIS PASS WIRED, and nothing here is new work.
+ *
+ * `frames.ts` and `nested.ts` were built, tested and called by nothing. Every
+ * decision they record — a rewrite is a REBASE and not a truncation, a merged
+ * frame whose modes disagree carries no mark at all, a frame edit is undone by
+ * REVISION because no `Act` can describe a change to the list of acts, a beat is
+ * addressed by a minted NAME because only a name survives an insertion — is
+ * theirs, argued at length in their headers, and this file's job is to make them
+ * reachable and to say what they report.
+ */
+import {
+  editFrame,
+  mergeFrames,
+  NO_REVISIONS,
+  recolourAct,
+  redoRevision,
+  remember,
+  undoRevision,
+  type Revisions,
+} from "@/lib/frames";
+/**
+ * `Timeline` is ALIASED because this file already has one: the strip under the
+ * plate, exported from `LayersPanel`. The two are a tree and a control, they sit
+ * fifty lines apart in the imports, and TypeScript would take the second and
+ * leave the first — so the model's is renamed at the door rather than the
+ * component's, which is the name the JSX below reads.
+ */
+import { groupFor, rebaseTree, type Timeline as TimelineTree } from "@/lib/nested";
 import { gifSteps } from "@/lib/gif";
 import {
   act as journalAct,
@@ -191,10 +254,13 @@ import {
   renameLayer,
   select as selectLayer,
   soleLayer,
+  strata,
   switchesOf,
   toggleLocked,
   toggleVisible,
   undo as undoSession,
+  walk as walkLayers,
+  type Act,
   type Composition,
   type Layer,
   type LayerGesture,
@@ -213,7 +279,28 @@ import {
   stackFromEmit,
   stepComposition,
 } from "@/lib/composer";
-import { parse as parseEmit, serialise as serialiseEmit } from "@/lib/emit";
+import {
+  parseWhy as parseEmitWhy,
+  refusalSaid,
+  serialise as serialiseEmit,
+  type EmitDoc,
+} from "@/lib/emit";
+/**
+ * THE GESTURE TREE, which until now was built, tested and called by nothing.
+ *
+ * `provenance.gestureLayers` reads the journal as one layer per BEAT — each
+ * carrying the brush symmetry it was made under, the orbit that symmetry
+ * actually realised, and its place in the reveal order. `emitLayersOf` reads the
+ * COMPOSITION as the layers a person built. Both are legitimate and they answer
+ * different questions, so the export picks by what the document is FOR: see
+ * `gestureDoc`.
+ */
+import {
+  gestureAnimation,
+  gestureLayers,
+  layerBudget,
+  provenanceCensus,
+} from "@/lib/provenance";
 import {
   SCHEMES,
   SCHEME_NAMES,
@@ -237,7 +324,17 @@ import {
 } from "@/lib/strokes";
 import BrushDial from "./BrushDial";
 import ColourWell from "./ColourWell";
-import LayersPanel from "./LayersPanel";
+/**
+ * `Timeline` comes out of `LayersPanel` and is NOT in the layers panel.
+ *
+ * It was, for one pass; the owner then asked for it "in the top of the bottom
+ * toolbar", so it is mounted below, in the band under the plate. The code stayed
+ * in that file because this pass had a five-file lane and a new component file
+ * was not in it — the module name is stale, deliberately and visibly, rather
+ * than the placement being wrong. `LayersPanel`'s header says the same thing
+ * from the other end.
+ */
+import LayersPanel, { Timeline } from "./LayersPanel";
 import SectorDial, { SectorGlyph } from "./SectorDial";
 import styles from "./draw.module.css";
 
@@ -537,6 +634,26 @@ interface Rewind {
    */
   comp: Composition;
   playing: boolean;
+  /**
+   * The beat list this preview's PLAYHEAD reads — which act produced each
+   * animation step, in the frame that was on screen when the preview opened.
+   *
+   * IT RIDES ON THE PREVIEW rather than beside it, and that is what makes it
+   * safe to hold at all. Counting the beats means flattening every state of the
+   * journal — measured at ~205 ms for a depth-5 plate with 256 acts, and it does
+   * not cache, because `everyComposition` mints fresh compositions on every call
+   * — so it cannot be kept warm across strokes. It does not have to be: the
+   * brush is switched off while a preview stands (`previewing` gates every
+   * write), so the journal this was counted from cannot move underneath it.
+   *
+   * `frame` is the one thing that CAN change while a preview is up — the depth,
+   * the view and the sector are not gated on `previewing` — so it is recorded
+   * and compared rather than trusted. A stale frame closes the playhead rather
+   * than reporting a step count for a picture nobody is looking at; see
+   * `frameKey` and `standPlayhead`.
+   */
+  beats: Beats;
+  frame: string;
 }
 
 /**
@@ -1180,6 +1297,131 @@ export default function DrawPage() {
    * at a dozen call sites.
    */
   const [rewind, setRewind] = useState<Rewind | null>(null);
+  /**
+   * The in point and the out point — which part of the drawing a replay plays.
+   *
+   * `null` IS "NO MARKS", and it is the whole replay. That is `clampSpan`'s own
+   * reading of an absent span — "so a drawing with no marks set behaves exactly
+   * as it did before this existed" — so the resting value here and the resting
+   * value in the model are the same value, and nothing has to translate.
+   *
+   * STORED AS NAMES, and this is the change this pass made to it. They used to
+   * be indices into `AnimationStep[]`; they are now a pair of `nested.StepId`s
+   * into `timeline` below, resolved back to that index space by
+   * `timeline.resolveSpan` wherever an index is what a consumer wants.
+   *
+   * WHY, measured rather than argued: `test/nested.test.ts` runs one probe
+   * against five insertion sites and tabulates which address survives each. The
+   * flat index survives three of them, a positional path survives a different
+   * three, and only the MINTED NAME survives all five. A mark is exactly a stored
+   * address into the beat list, so an index-valued mark names a different gesture
+   * the moment anything is inserted before it — and this program can already
+   * reach that without any holds at all, because the beat list is per-FRAME and
+   * step 5 of the hexagon's list and step 5 of a sector's are different gestures.
+   * `timeline.syncTree` carries a name across that change by act; nothing can
+   * carry an index across it.
+   *
+   * OUTLIVES THE PREVIEW, deliberately and still. A cut is a property of the
+   * drawing — it is what the two exports will write — and not of the panel that
+   * happens to be open. That is what forces `timeline` below to outlive the
+   * preview too: the names have to have something to resolve against.
+   *
+   * A NAME CAN DANGLE, which an index could not, and that is the price. The
+   * answer is `timeline.resolveSpan`, which falls back to the whole replay AND
+   * REPORTS having done so — see `playCut`, where the sentence is produced.
+   *
+   * NAMED `playSpan` and not `span`, because this file already has one: the
+   * BAND span, how many orbit positions a striped brush lays. Two things called
+   * `span` in a 7000-line component is how a colour rail comes to be indexed by
+   * an out point.
+   */
+  const [playSpan, setPlaySpan] = useState<NamedSpan | null>(null);
+  /**
+   * THE NESTED TIMELINE — one named beat per animation step of the frame the
+   * playhead was last stood up in, plus any compositions grouping them.
+   *
+   * ── Why the page holds it, and why it is nullable ──────────────────────
+   *
+   * `nested.ts` keeps this tree BESIDE the journal rather than inside `Session`,
+   * on `frames.ts`'s own argument run one step further: a `Move` cannot reach the
+   * journal, and putting the tree inside a `Session` would put it somewhere a
+   * `Move` could reach, at which point undo becomes recursive. So it is a second
+   * value the page holds, and `frames.Revision` is the pair of the two — which is
+   * why every revision below remembers `{ session, timeline }` and not a session.
+   *
+   * `null` IS THE ORDINARY RESTING STATE, exactly as `rewind.beats` is absent
+   * until a playhead is stood up: building it means counting the beats, and
+   * counting the beats means flattening every state of the journal (~205 ms at
+   * depth 5 with 256 acts — see `frameBeats`). So it is minted at the same moment
+   * the beats are, by `standTree`, and then KEPT: it outlives the preview because
+   * the marks name into it and the marks outlive the preview.
+   */
+  const [timeline, setTimeline] = useState<TimelineTree | null>(null);
+  /**
+   * A source of fresh step names, monotone for the life of the page.
+   *
+   * A REF and not state, because minting a name is not a render: `timeline.minter`
+   * hands back a closure over a counter and the counter must not roll back, on
+   * exactly the rule `layers.act` keeps for `nextId` — "rolling the counter back
+   * would mean a layer added after an undo could mint an id a rung in the journal
+   * still names". A revision restores an old tree holding old names; a name
+   * minted after that must not collide with one of them.
+   */
+  const mintStep = useRef(minter());
+  /**
+   * THE SECOND UNDO STACK: whole revisions, remembered before a frame edit.
+   *
+   * `frames.ts` proves this cannot be a rung of the journal — `applyMove` has the
+   * type `(Composition, Move, direction) → Composition`, the journal is not in a
+   * `Composition`, so no `Act` can describe a change to the list of acts. It is
+   * therefore a second stack, and a second stack under ONE keystroke is how ⌘Z
+   * becomes ambiguous. `revisionMark` below is what stops it.
+   */
+  const [revisions, setRevisions] = useState<Revisions>(NO_REVISIONS);
+  /**
+   * WHAT THE LAST FRAME EDIT LEFT STANDING — the session it produced, and what
+   * to call it. `null` when no frame edit has happened, or when one has been
+   * undone all the way back.
+   *
+   * ── This is the whole of the ⌘Z disambiguation ─────────────────────────
+   *
+   * The routing question is "has the journal moved since the frame edit?" and
+   * `timeline.sameJournal` answers it against this mark:
+   *
+   *   NOT MOVED → the frame edit is the most recent thing that happened, so ⌘Z
+   *   takes back the frame edit.
+   *   MOVED → a stroke was drawn, undone or redone since, so ⌘Z takes that back.
+   *
+   * The two are mutually exclusive, the test is total, and it is exactly LIFO
+   * rather than an approximation: undoing the strokes made after a frame edit
+   * brings the journal back to the state the edit left it in — the same rungs,
+   * which are the same objects, because every `Act` is immutable and shared — at
+   * which point the next ⌘Z reaches the edit. See `timeline.sameJournal`.
+   *
+   * ── The two names, and why one of them is sometimes generic ────────────
+   *
+   * A `frames.Revision` deliberately carries no note: it is `{ session, timeline
+   * }`, the two things a rewrite moves, and a sentence is not one of them. But
+   * the strip has to be able to SAY what ⌘Z will take back before it is pressed —
+   * a routing rule nobody can see is a surprise the first time it fires — so the
+   * words live here, beside the mark that decides.
+   *
+   * `undo` and `redo` are the top of each branch. They are EXACT for the edit
+   * that just happened, because this file made it and knows what it was, and
+   * deliberately GENERIC for anything deeper: a parallel stack of notes shadowing
+   * `Revisions` would be two stacks maintained by remembering, which is precisely
+   * the arrangement `layers.Act.events` was moved into the journal to destroy —
+   * "an invariant maintained by four call sites remembering is not an invariant".
+   * A slightly vaguer sentence is a much better trade than a note stack that can
+   * come out of step with the revisions it names.
+   */
+  const [revisionMark, setRevisionMark] = useState<{
+    session: Session;
+    /** What ⌘Z takes back while the journal has not moved. `null` when nothing. */
+    undo: string | null;
+    /** What ⇧⌘Z puts back on the same terms. `null` when nothing. */
+    redo: string | null;
+  } | null>(null);
   const [stepMs, setStepMs] = useState(STEP_MS_DEFAULT);
   const [gifWidth, setGifWidth] = useState(GIF_WIDTH_DEFAULT);
   /**
@@ -1539,6 +1781,41 @@ export default function DrawPage() {
    */
   const docCensus = useMemo(() => census(comp), [comp]);
   /**
+   * HOW MANY OF THOSE ADDRESSES THIS CANVAS CANNOT DRAW.
+   *
+   * `census.addresses` counts every entry of every plate, and it has to: it knows
+   * about layers and nothing about resolution, and adding a book to it would make
+   * a tree measurement depend on which canvas happened to be on screen. But an
+   * address whose scale neither refines nor is refined by this book's — `s0:ab`,
+   * a rep-9 first cut, in a rep-4 book — buckets under a key no cell has and
+   * resolves nowhere. `plate.buildView` argues why carrying it unchanged is
+   * right; this is the number that stops the export sentence claiming it as paint.
+   *
+   * Reachable from a FILE and not only from a mixed-radix experiment:
+   * `artfile.validatePlate` deliberately does not cross-check an address against
+   * the payload's depth, so such an entry loads, survives a full-sector wash, and
+   * is re-exported forever.
+   *
+   * Summed over the tree with `plate.strandedCount`, which is memoised on the
+   * same (plate, book) pair `resolvePlate` already caches — so on the ordinary
+   * drawing this is a walk of the layer tree and a map lookup per layer, and the
+   * answer is 0.
+   */
+  const strandedAddresses = useMemo(() => {
+    let n = 0;
+    for (const v of walkLayers(comp)) n += strandedCount(v.layer.plate, book);
+    return n;
+  }, [comp, book]);
+  /** " · 3 addresses this canvas cannot draw are carried through unchanged". */
+  const strandedSaid =
+    strandedAddresses === 0
+      ? ""
+      : ` · ${strandedAddresses} address${
+          strandedAddresses === 1 ? "" : "es"
+        } this canvas cannot draw ${
+          strandedAddresses === 1 ? "is" : "are"
+        } carried through unchanged`;
+  /**
    * Standing at a state the drawing is no longer in.
    *
    * Derived rather than stored, so there is exactly one thing to test and no
@@ -1562,6 +1839,37 @@ export default function DrawPage() {
    */
   const paint = useMemo(
     () => flattenComposition(rewind === null ? comp : rewind.comp, book),
+    [comp, rewind, book]
+  );
+
+  /**
+   * The same stack, as a TREE, when — and only when — something is faded.
+   *
+   * `paint` above is the composite and it is what everything reads: the ghost,
+   * the readouts, the relief, the adjust brush. It cannot express a fade,
+   * because `flatten` OCCLUDES rather than mixes and must keep doing so — that
+   * closure is what guarantees the adjust brush is never handed a colour no
+   * scheme named (`layers.ts`, the amended NO BLENDING note).
+   *
+   * So a fade is a DISPLAY fact and travels beside the composite, never inside
+   * it. `strata` answers `null` when every layer is opaque, and on `null` the
+   * board renders through the one `PaintLayer` it always did — so an unfaded
+   * document takes the old code path rather than a new one that happens to
+   * agree with it.
+   *
+   * A TREE and not a flat list with the alphas multiplied out, which was
+   * measured in Chromium rather than assumed: a group's opacity applies to the
+   * group's COMPOSITED result, so gold under red inside one `opacity="0.5"`
+   * renders (255,128,128) — the gold gone entirely — where the multiplied-out
+   * list renders (255,115,64). Disjoint cells do multiply exactly; overlapping
+   * ones do not. `emit.ts` writes the same nesting, so the canvas and the file
+   * cannot drift.
+   *
+   * Mirrors `paint`'s preview substitution exactly, so a fade is visible while
+   * scrubbing for the same reason the drawing is.
+   */
+  const strataTree = useMemo(
+    () => strata(rewind === null ? comp : rewind.comp, book),
     [comp, rewind, book]
   );
 
@@ -1674,8 +1982,14 @@ export default function DrawPage() {
     return new Set(held.filter((i) => canvas.inView(i)));
   }, [focus, resolvers, hex, canvas]);
 
-  /** `(4^d − 1)/3` — the size §D predicts for one arm of one sector. */
-  const armSize = (4 ** depth - 1) / 3;
+  /**
+   * `(scale² − 1)/3` — the size §D predicts for one arm of one sector.
+   *
+   * Through `scale.armCellsAtScale`, which `arms.ts` also calls. It used to be
+   * written out here AND there, in depth, which is two chances to disagree about
+   * one number; the depth→scale pass found them and joined them.
+   */
+  const armSize = armCellsAtScale(hex.scale);
 
   /**
    * Which sectors the axis overlay draws in.
@@ -2154,6 +2468,25 @@ export default function DrawPage() {
     // The event log is the journal, and `newSession` empties it — so there is
     // no second stack here to remember to clear.
     setSession(newSession(next));
+    /**
+     * THE TIMELINE GOES WITH THE JOURNAL, all four pieces of it.
+     *
+     * A `Beat` names an index into `Journal.past` and a revision holds a whole
+     * session, so a tree or a revision that outlived a wipe would name rungs of a
+     * journal that no longer exists — which is the same argument this function
+     * already makes about the undo stacks, one value further out.
+     *
+     * THE MARKS GO TOO, and that is a CHANGE. They used to survive a wipe, and
+     * the seam would then read "in 2 and out 4 are set" over an empty drawing —
+     * true of the state and false of the drawing, because `clampSpan` resolves
+     * them to nothing the moment anything reads them. Now that they are names
+     * into a tree that has just been emptied there is no honest reading left at
+     * all, so they are cleared where everything else they depended on is.
+     */
+    setTimeline(null);
+    setRevisions(NO_REVISIONS);
+    setRevisionMark(null);
+    setPlaySpan(null);
     setProgOrigin(0);
     setHover(null);
     setCursor(null);
@@ -2545,7 +2878,7 @@ export default function DrawPage() {
       reframe();
       setAnnounce(
         next === "sector"
-          ? `sector ${sector} framed — ${4 ** depth} of ${cellCount(
+          ? `sector ${sector} framed — ${cellCount("triangle", depth)} of ${cellCount(
               "hexagon",
               depth
             )} cells, apex at the plate's centre. Nothing was cleared; the other five sectors keep their paint${
@@ -2570,7 +2903,7 @@ export default function DrawPage() {
       if (mode === 12) setMode(6);
       reframe();
       setAnnounce(
-        `sector ${s} framed — ${4 ** depth} cells; the plate is whole and nothing was cleared`
+        `sector ${s} framed — ${cellCount("triangle", depth)} cells; the plate is whole and nothing was cleared`
       );
     },
     [sector, viewMode, mode, depth, reframe]
@@ -2897,63 +3230,104 @@ export default function DrawPage() {
   );
 
   /**
-   * ONE undo, over paint and over the shape of the tree alike.
+   * ONE undo, over paint and over the shape of the tree alike — AND, since this
+   * pass, over the frame edits that are not in the journal at all.
    *
-   * `layers.undo` walks the journal that `endStroke`, the panel and the presets
-   * all push to, so ⌘Z takes back whatever was actually done last — a stroke, a
-   * new layer, a reorder, a paste — in the order it happened. The alternative,
-   * a paint stack beside a layer stack, would have made the same keystroke mean
-   * two things depending on which the person had in mind.
-   *
-   * The EVENT LOG only moves for an act that painted. It shadows the journal so
-   * the progression index is recoverable, and a reorder spends no colour, so
-   * popping it for a structural act would slide every future stroke's hue.
+   * The two halves are `doUndo` and `doRedo`, and they live further down the file
+   * now, next to the frame edits they had to learn about: they depend on
+   * `restage`, which depends on the beat count, so they cannot be declared above
+   * it. See "editing the past".
    */
-  const doUndo = useCallback(() => {
-    if (previewing) {
-      setAnnounce("a preview is standing — close it before undoing");
-      return;
-    }
-    const step = undoSession(session);
-    if (step.act === null) {
-      setAnnounce("nothing to undo");
-      return;
-    }
-    compRef.current = step.session.composition;
-    setSession(step.session);
-    // Nothing to do for the event log: it IS the journal, so it moved with it.
-    // This used to be a guarded `setEvents(undoEvents(events))`, and the guard
-    // was the bug — an act nobody counted popped somebody else's rung.
-    setAnnounce(
-      `undid ${step.act.note} — ${
-        flattenComposition(step.session.composition, book).size
-      } cells on the plate`
-    );
-  }, [previewing, session, book]);
-
-  const doRedo = useCallback(() => {
-    if (previewing) {
-      setAnnounce("a preview is standing — close it before redoing");
-      return;
-    }
-    const step = redoSession(session);
-    if (step.act === null) {
-      setAnnounce("nothing to redo");
-      return;
-    }
-    compRef.current = step.session.composition;
-    setSession(step.session);
-    setAnnounce(
-      `redid ${step.act.note} — ${
-        flattenComposition(step.session.composition, book).size
-      } cells on the plate`
-    );
-  }, [previewing, session, book]);
 
   // ── the past, previewed ─────────────────────────────────────────────────
 
   /** How many acts the journal holds. The scrub's upper stop. */
   const steps = past.length;
+
+  /**
+   * WHICH PICTURE the beats were counted for.
+   *
+   * `animationSteps` drops a gesture that changed nothing IN THIS FRAME, so the
+   * beat list is a fact about the journal AND about what is on screen: the same
+   * drawing framed as sector 3 has fewer beats than the whole hexagon, and a
+   * depth change re-resolves every address. The depth, the view and the sector
+   * are NOT gated on `previewing` — `pickDepth`, `pickView` and `pickSector` all
+   * run while a preview stands — so this is compared rather than assumed.
+   *
+   * The book's own id already carries the kind and the depth; the frame adds
+   * which sector is on screen. `showTiling` is deliberately absent: it decides
+   * the fill an erase is drawn IN, and `changedCells` never looks at it.
+   */
+  const frameKey = `${book.id}|${canvas.view.mode}|${
+    canvas.view.mode === "sector" ? canvas.view.sector : "-"
+  }`;
+
+  /**
+   * The beat list for the frame on screen — one entry per animation step,
+   * holding the act that produced it.
+   *
+   * THE EXPENSIVE CALL IN THIS FILE, and it is deliberately not a `useMemo`.
+   * Measured at depth 5 with 256 acts: `everyComposition` 17 ms, flattening its
+   * 257 states 172 ms, and the walk itself 16 ms — about 205 ms, none of which
+   * caches, because `everyComposition` mints fresh compositions every time and
+   * `layers.flatten`'s memo is keyed on their identity. A `useMemo` on `[comp,
+   * past]` would therefore pay all of it again on every committed stroke, which
+   * is a fifth of a second of hitch on every press of the brush.
+   *
+   * So it is called ONCE, by `standPlayhead`, at the moment a person asks for a
+   * playhead — and the answer is then valid for as long as it is up, because the
+   * brush is off while a preview stands.
+   *
+   * Nothing here is new: these are the first three lines of `animationModel`,
+   * without the baked frame and the polygons, which the playhead does not need.
+   */
+  const beatsFor = useCallback(
+    (at: Composition, journal: readonly Act[]): number[] => {
+      const shown = canvas.view.mode === "sector" ? canvas.shown : undefined;
+      return beatsOf(
+        everyComposition(at, journal).map((c) => flattenComposition(c, book)),
+        shown
+      );
+    },
+    [canvas, book]
+  );
+
+  /**
+   * The same walk over the LIVE session.
+   *
+   * Split from `beatsFor` above because a frame edit has to count the beats of a
+   * journal that `setSession` has been handed but React has not yet rendered —
+   * the state variables in this closure are still the old ones at that moment, so
+   * the rewrite passes its own composition and journal in explicitly. One walk,
+   * two ways of naming what to walk.
+   */
+  const frameBeats = useCallback(
+    (): number[] => beatsFor(comp, past),
+    [beatsFor, comp, past]
+  );
+
+  /**
+   * The named tree brought into step with a beat list, and kept.
+   *
+   * CALLED WHEREVER THE BEATS ARE COUNTED and nowhere else, because the tree is
+   * exactly a naming of that list and the two must not be able to disagree.
+   * `timeline.syncTree` does the work and returns the same object when nothing
+   * moved, which is what keeps this out of the render loop: the ordinary case —
+   * a playhead stood up twice on an unchanged drawing — sets no state at all.
+   *
+   * The sentence is the CALLER's to say. A rebuild drops the tree's groups and
+   * holds and `syncSaid` names that, but this is called from three places with
+   * three different things to announce, and a helper that announced on its own
+   * would talk over all of them.
+   */
+  const standTree = useCallback(
+    (beats: Beats) => {
+      const sync = syncTree(timeline, beats, mintStep.current);
+      if (sync.tree !== timeline) setTimeline(sync.tree);
+      return sync;
+    },
+    [timeline]
+  );
 
   /**
    * Open a preview, or move an open one to the other instrument.
@@ -2966,6 +3340,17 @@ export default function DrawPage() {
    * Everything that names a cell of the live plate is dropped on the way in: a
    * standing candidate is a promise about a plate that is no longer on screen,
    * and committing it would paint onto a state nobody is looking at.
+   *
+   * ── The beats are counted HERE, and the cost is on purpose ─────────────
+   *
+   * `frameBeats()` runs on the way in, so the playhead in the layers panel is
+   * live for every way of opening a preview — P, M, the two deck buttons and the
+   * panel's own PLAYHEAD — rather than for one of them. It costs up to ~205 ms
+   * on the largest drawing this program will hold (see `frameBeats`), spent once
+   * on a deliberate press that is about to show an animation, which is the one
+   * place in this file where a fifth of a second is not a hitch. Every
+   * alternative that avoided it made the panel and the preview disagree about
+   * whether there was a playhead.
    */
   const openRewind = useCallback(
     (kind: "replay" | "history") => {
@@ -2980,19 +3365,27 @@ export default function DrawPage() {
       setProposal(EMPTY_PROPOSAL);
       setHover(null);
       const index = kind === "replay" ? 0 : steps;
+      const beats = frameBeats();
       setRewind({
         kind,
         index,
         comp: stepComposition(compRef.current, past, steps, index),
         playing: kind === "replay",
+        beats,
+        frame: frameKey,
       });
-      setAnnounce(
+      // The tree is named for the SAME beat list the preview is about to read,
+      // in the same breath, so a mark set a moment later cannot name a beat the
+      // playhead does not have.
+      const sync = standTree(beats);
+      const said =
         kind === "replay"
           ? `replay — ${steps} gesture${steps === 1 ? "" : "s"} at ${stepMs} ms each; the plate is a preview and nothing is being changed`
-          : `history — ${steps} gesture${steps === 1 ? "" : "s"}; drag the scrub to preview an earlier state. Nothing is changed until REVERT`
-      );
+          : `history — ${steps} gesture${steps === 1 ? "" : "s"}; drag the scrub to preview an earlier state. Nothing is changed until REVERT`;
+      const note = syncSaid(sync);
+      setAnnounce(note === null ? said : `${said}. ${note}`);
     },
-    [steps, past, disarm, stepMs]
+    [steps, past, disarm, stepMs, frameBeats, frameKey, standTree]
   );
 
   const closeRewind = useCallback((why: string) => {
@@ -3078,6 +3471,674 @@ export default function DrawPage() {
     }, stepMs);
     return () => window.clearTimeout(id);
   }, [rewind, steps, past, stepMs]);
+
+  // ── the playhead ────────────────────────────────────────────────────────
+
+  /**
+   * THE PLAYHEAD IS NOT A SECOND SCRUB. It is the SAME position, read in the
+   * space the animation is actually written in.
+   *
+   * There is one preview in this program and one index in it — `rewind.index`,
+   * a count of committed ACTS — and everything below leaves that as the
+   * authority for what is on the plate. What the panel shows is that same
+   * position mapped through `rewind.beats` into STEP space, and what the two
+   * marks are stored in is step space, because that is the space `replay.InOut`,
+   * `boundAnimation` and `emit.EmitLayer.reveal` all live in.
+   *
+   * Building a second position would have meant two things that can disagree
+   * about what the plate is showing. Building the playhead in ACT space instead
+   * would have been simpler and wrong: `animationSteps` drops a gesture that
+   * changed nothing in this frame, so an act index is not an animation step,
+   * marks made on it would name beats the replay does not have, and they would
+   * name different ones the moment the view changed. `lib/timeline.ts` carries
+   * the argument in full.
+   *
+   * THE OLD SCRUB STAYS, in the rewind bar, in act space. It is not the same
+   * reading and it should not be: it can stand on a rename or a reorder, which
+   * the animation has no beat for, and REVERT counts in exactly those acts.
+   */
+  /**
+   * Is there a beat list, and was it counted for the picture that is on screen?
+   *
+   * Both halves matter. No preview means no beats at all — they are only ever
+   * counted on the way into one. A STALE frame means beats that describe a
+   * different picture, and reporting their count beside a plate they were not
+   * counted from is the one lie this strip could tell, so a frame change closes
+   * the playhead and offers to count again.
+   */
+  const playFresh = rewind !== null && rewind.frame === frameKey;
+  const playSteps = playFresh ? rewind.beats.length : 0;
+  const playAt = playFresh ? stepAtAct(rewind.beats, rewind.index) : null;
+
+  /**
+   * Stand the playhead up — the panel's own way in.
+   *
+   * Three cases, and the third is the one worth having: a preview is already up
+   * but the FRAME has moved under it (a depth change, a flip to sector view),
+   * so the beats were counted for a picture nobody is looking at. Recount in
+   * place rather than reopening, which would jump the plate.
+   */
+  const standPlayhead = useCallback(() => {
+    if (steps === 0) {
+      setAnnounce("no playhead — no gesture has been committed yet");
+      return;
+    }
+    if (rewind === null) {
+      // HISTORY rather than REPLAY: it opens at the live state, so standing the
+      // playhead up does not jump the picture. `openRewind` argues that split.
+      openRewind("history");
+      return;
+    }
+    const beats = frameBeats();
+    setRewind((r) => (r === null ? r : { ...r, beats, frame: frameKey }));
+    const note = syncSaid(standTree(beats));
+    const said = `playhead — ${beats.length} animation step${
+      beats.length === 1 ? "" : "s"
+    } in this frame, over ${steps} committed gesture${steps === 1 ? "" : "s"}`;
+    setAnnounce(note === null ? said : `${said}. ${note}`);
+  }, [steps, rewind, openRewind, frameBeats, frameKey, standTree]);
+
+  /**
+   * Move the playhead to a rail position, and the one preview with it.
+   *
+   * `GROUND` is a rail position and not a step — it is the plate the animation
+   * opens on, which in act space is state 0 — so it is the one value that does
+   * not go through `actAtStep`.
+   */
+  const seekPlayhead = useCallback(
+    (to: number) => {
+      if (rewind === null) return;
+      const beats = rewind.beats;
+      const step = Math.min(Math.max(GROUND, Math.round(to)), beats.length - 1);
+      seekRewind(step <= GROUND ? 0 : actAtStep(beats, step), false);
+      setAnnounce(
+        step <= GROUND
+          ? `before step 0 — the plate the replay opens on, ${beats.length} step${
+              beats.length === 1 ? "" : "s"
+            } to come`
+          : `step ${step} of ${beats.length - 1}`
+      );
+    },
+    [rewind, seekRewind]
+  );
+
+  /**
+   * THE CUT IN FORCE FOR THE PLAYHEAD THAT IS STANDING, in step space.
+   *
+   * ── This used to claim to be the only resolution. It cannot be ─────────
+   *
+   * The comment here said "ONE PLACE RESOLVES, and everything downstream reads
+   * the number", and every export did read this number. That was WRONG, and
+   * silently so. `timeline.resolveSpan` answers in the step space of the tree it
+   * is handed, `timeline` is a naming of ONE frame's beat list, and `reframe`
+   * moves the frame while leaving both the tree and the marks alone. So a person
+   * who marked six steps over the hexagon and then framed a sector exported a cut
+   * whose two numbers were positions in a list that is no longer there —
+   * `clampSpan` pulled them inside the new length without remapping them, `lost`
+   * stayed `"none"` because the names still resolved in the stale tree, and
+   * `lostSaid` never fired. Six marked gestures became one, in the animated SVG,
+   * the GIF and the gesture document alike.
+   *
+   * ── So the division of labour is now stated, and it is not "one place" ──
+   *
+   * THIS memo serves the PLAYHEAD: the strip, the seam, `setMark` and the merge.
+   * Every one of them is gated on `playFresh` or on `rewind`, and a fresh preview
+   * is precisely the state in which `standTree` has already brought `timeline`
+   * into step with `rewind.beats` in the same breath as counting them — so here
+   * the tree and the frame agree by construction and resolving against it is
+   * right.
+   *
+   * THE EXPORTS serve a FRAME, and they may be pressed with no preview open at
+   * all. They call `timeline.cutForFrame` instead, which brings the tree into step
+   * with the beat list it is about to write and THEN resolves — one function, so
+   * the two steps cannot be spelled in the wrong order at two call sites. It
+   * costs nothing extra: both export paths have already walked the journal, so
+   * the beat list is in hand.
+   *
+   * What is NOT done here, deliberately: resolving this memo against a synced
+   * tree. That would need `frameBeats()` on every render that touches the
+   * journal — ~205 ms on the largest drawing this program holds, per stroke, for
+   * a number only a standing playhead reads. See `openRewind` for the measurement.
+   *
+   * `lost` IS NOT AN ERROR STATE. A name dangles when the beat it named has left
+   * this frame — merged away, undone, or dropped by a reframe — and
+   * `timeline.resolveSpan` answers with the whole replay plus a reason rather
+   * than refusing, because a save is not the moment to discover that a mark set
+   * an hour ago no longer names anything. The reason is drawn in the strip and
+   * announced when it is acted on; it is never swallowed.
+   */
+  const playCut = useMemo(() => resolveSpan(timeline, playSpan), [timeline, playSpan]);
+
+  /**
+   * Set a mark where the playhead stands.
+   *
+   * `timeline.markIn`/`markOut` route every edit through `replay.clampSpan`, so
+   * the panel cannot form a span the payload writer would refuse and an inverted
+   * pair collapses the way the model says it does. The announcement reports the
+   * span that RESULTED rather than the one that was asked for, which is the only
+   * way a person learns that setting an out point before their own in point gave
+   * them a one-step replay.
+   *
+   * THE ARITHMETIC STAYS IN INDEX SPACE and only the storage is named: resolve,
+   * clamp, then name the result. Doing the clamping over names would mean
+   * re-deriving `clampSpan`'s two rules — a mark off the end lands on the end, an
+   * inverted pair collapses by pulling OUT back — in a second vocabulary, which
+   * is exactly the second opinion about one number that `markIn`'s header refuses.
+   */
+  const setMark = useCallback(
+    (end: "in" | "out") => {
+      if (rewind === null || playAt === null || playSteps === 0) return;
+      const next =
+        end === "in"
+          ? markIn(playCut.span, playAt, playSteps)
+          : markOut(playCut.span, playAt, playSteps);
+      const named = nameSpan(timeline, next);
+      if (named === null && next !== null) {
+        // Unreachable while the tree is stood up with the beats — `standTree`
+        // runs in the same breath as the count — and said out loud rather than
+        // dropped, because a mark that silently did not take is the one failure
+        // this strip cannot report any other way.
+        setAnnounce(
+          `the ${end} point could not be set — the timeline does not name step ${playAt} in this frame`
+        );
+        return;
+      }
+      setPlaySpan(named);
+      setAnnounce(`${end} point at step ${playAt} — ${spanSaid(next, playSteps)}`);
+    },
+    [rewind, playAt, playSteps, playCut, timeline]
+  );
+
+  const clearMarks = useCallback(() => {
+    setPlaySpan(null);
+    setAnnounce(
+      "in and out points cleared — the replay and both animated exports play the whole drawing"
+    );
+  }, []);
+
+  // ── editing the past ────────────────────────────────────────────────────
+
+  /**
+   * A rewritten journal put on screen, with the preview kept where it stands.
+   *
+   * THE ONE PLACE A FRAME EDIT LANDS, shared by the rewrite, the merge and both
+   * directions of the revision stack, because all four leave the same problem
+   * behind: the journal has changed under a preview that was reconstructed from
+   * the old one, and the beat list was counted from it.
+   *
+   * IT DOES NOT CLOSE THE PREVIEW, and that was the alternative. Closing would
+   * have been three lines and it throws away the person's place in the drawing at
+   * the exact moment they are working there — the whole point of editing a past
+   * frame is to see the change on the frame you were looking at. So the preview
+   * is REBUILT at the act it should now be standing on and the beats are counted
+   * again, which is the ~205 ms `frameBeats` documents, spent on a deliberate
+   * structural edit rather than on a stroke.
+   *
+   * `playing` GOES OFF. A replay running while the journal is spliced underneath
+   * it would step into states from two different drawings; there is no honest
+   * frame to continue from, and stopping is what every editor does when you cut
+   * the clip under the playhead.
+   *
+   * It does NOT touch the tree. Three of its four callers know something specific
+   * about what happened to the names — an edit preserves them, a merge rebases
+   * them, an undo restores an older tree wholesale — and a helper that guessed
+   * would be wrong for two of the three.
+   */
+  const restage = useCallback(
+    (next: Session, index: number): number[] => {
+      compRef.current = next.composition;
+      setSession(next);
+      const journal = next.journal.past;
+      const at = Math.min(Math.max(0, Math.round(index)), journal.length);
+      const beats = beatsFor(next.composition, journal);
+      setRewind((r) =>
+        r === null
+          ? r
+          : {
+              ...r,
+              index: at,
+              comp: stepComposition(next.composition, journal, journal.length, at),
+              playing: false,
+              beats,
+              frame: frameKey,
+            }
+      );
+      return beats;
+    },
+    [beatsFor, frameKey]
+  );
+
+  /**
+   * REWRITE THE FRAME THE PLAYHEAD STANDS ON: the same gesture, in the colour
+   * the brush is holding.
+   *
+   * ── Why recolour, out of everything a frame edit could be ──────────────
+   *
+   * `frames.editFrame` takes a FUNCTION from act to act rather than a value,
+   * deliberately — "there is no one edit a person wants to make to a past frame …
+   * a model that enumerated them would be a list to extend rather than a
+   * mechanism" — and `frames.recolourAct` is the one worked example it ships,
+   * because recolouring is the case the request actually names: the same gesture,
+   * a different colour, so the animation changes and the drawing may not.
+   *
+   * THAT LAST CLAUSE IS THE THING TO EXPECT AND IT IS MEASURED, not guessed: if a
+   * later act repaints the same cell, this changes the ANIMATION and NOT the
+   * finished drawing, because `applyEdits` writes `to` and never consults `from`.
+   * `test/frames.test.ts` asserts it. So the announcement names the frame and the
+   * colour rather than promising a visible change to the plate.
+   *
+   * ── What it costs, in the order the costs arrive ───────────────────────
+   *
+   *   A REVISION, remembered BEFORE the edit and only if the edit succeeded —
+   *   `frames.remember`'s own three-line pattern, in that order, because a
+   *   refused rewrite must not cost a revision and testing `ok` first is the only
+   *   arrangement in which it cannot.
+   *
+   *   THE REDO BRANCH, which `rewriteFrames` discards on the standard linear
+   *   history rule and reports as `discardedRedo`. `rebaseSaid` says the number.
+   *
+   *   A COMPOSITION AROUND THE STEP, on `nested.groupFor`'s policy: "any time we
+   *   try to edit something from the past, it becomes a group and we pass the
+   *   edits through". It is invisible — grouping is compile-invariant under
+   *   `"extend"`, measured in `test/nested.test.ts` — and it is what keeps a later
+   *   hold OFF the root, which is the whole mechanism by which a hold stops
+   *   renumbering the drawing. `groupFor` reuses a wrapper the step is already
+   *   alone in, so editing one frame five times gives depth 1 and not five.
+   */
+  const rewriteFrame = useCallback(() => {
+    if (rewind === null || playAt === null || timeline === null) {
+      setAnnounce(
+        "stand the playhead on a step first — a frame edit rewrites the gesture the playhead is showing"
+      );
+      return;
+    }
+    const k = rewind.beats[playAt];
+    if (k === undefined) {
+      setAnnounce("the playhead is not on a gesture this frame has");
+      return;
+    }
+    const colour = effectiveBase.hex;
+    const before = { session, timeline };
+    const done = editFrame(session, k, (a) => recolourAct(a, () => colour));
+    if (!done.ok) {
+      // LOUD, AND THE SESSION IS UNTOUCHED. `rewriteFrames` is atomic by
+      // construction — it rebuilds from the state before the splice or returns
+      // nothing at all — so the one thing this sentence has to add is that
+      // nothing happened, which the model cannot know it needs to say.
+      setAnnounce(refusedSaid("the frame edit", done.said));
+      return;
+    }
+    const note = `the recolour of frame ${k}`;
+    setRevisions(remember(revisions, before));
+    setRevisionMark({ session: done.value.session, undo: note, redo: null });
+    const beats = restage(done.value.session, rewind.index);
+    // `editFrame` replaces one act with one act, so `nested.rebaseTree` is the
+    // identity here and every name still resolves — which is why a frame edit is
+    // the cheap case and a merge is not. `syncTree` runs anyway, over the
+    // recounted beats, because a rewritten act CAN stop painting (`quiet` in the
+    // report) and a beat that has gone is a name that has to go with it.
+    const name = playAt >= 0 ? nameAtStep(timeline, playAt) : null;
+    const wrapped =
+      name === null ? null : groupFor(timeline, name, mintStep.current());
+    const sync = syncTree(wrapped?.tree ?? timeline, beats, mintStep.current);
+    setTimeline(sync.tree);
+    const grouped =
+      wrapped?.made === true
+        ? " Its step is now a composition of its own, so a hold can go beside it without renumbering the drawing."
+        : "";
+    // A rewrite CAN take a beat away — an act whose every edit became a no-op
+    // paints nothing and has no beat — and a beat that goes takes its name with
+    // it. `syncSaid` is only non-null when that happened, so this is silent in
+    // the ordinary case and loud in the one that cost something.
+    const resync = syncSaid(sync);
+    setAnnounce(
+      `frame ${k} recoloured to ${colour} — ${rebaseSaid(
+        done.value.report
+      )}.${grouped}${resync === null ? "" : ` ${resync}.`}`
+    );
+  }, [rewind, playAt, timeline, session, revisions, effectiveBase, restage]);
+
+  /**
+   * MERGE THE MARKED RANGE into one frame.
+   *
+   * ── The range is the IN AND OUT POINTS, and that is a decision ─────────
+   *
+   * DEVIATION, flagged. The brief says "select a range of frames on the
+   * timeline"; this program has exactly one range selection on the timeline
+   * already — the two marks — and it is the one a person can actually make at
+   * this density. Measured in `Timeline`'s own header: the rail is 692px over 257
+   * stops at 1512 and 250px at 390, so a second pair of draggable ends would be
+   * two more things nobody can put on a chosen beat. Adding a second selection
+   * would also mean two ranges on one strip that look identical and mean
+   * different things.
+   *
+   * The cost of reusing them is real and is stated where it happens: the marks
+   * are a PLAYBACK cut as well, so merging consumes the cut, and the cut is
+   * cleared afterwards because the range it named has become one frame. The
+   * button is disabled unless there IS a cut, so this can never fire on a drawing
+   * whose marks are merely resting at the whole replay.
+   *
+   * ── The range is WIDER than the two beats, on purpose ─────────────────
+   *
+   * `timeline.rangeOfSpan` converts two beats into a contiguous slice of the
+   * JOURNAL, which includes the acts between them that have no beat at all — a
+   * rename, a reorder, a stroke that landed outside this frame. A merge of
+   * beats-only would leave those stranded between the two halves of a coalesced
+   * gesture, and `frames.mergeActs` folds a contiguous slice because a
+   * non-contiguous one cannot be one rung. `MergeReport.frames` reports the real
+   * number and `mergeSaid` says it.
+   */
+  const mergeMarked = useCallback(() => {
+    if (rewind === null || timeline === null) return;
+    const range = rangeOfSpan(rewind.beats, playCut.span);
+    if (range === null) {
+      setAnnounce(
+        "mark an in point and an out point over two or more gestures first — a merge needs a range"
+      );
+      return;
+    }
+    const before = { session, timeline };
+    const done = mergeFrames(session, range.at, range.count);
+    if (!done.ok) {
+      setAnnounce(refusedSaid("the merge", done.said));
+      return;
+    }
+    const note = `the merge of ${range.count} frames`;
+    setRevisions(remember(revisions, before));
+    setRevisionMark({ session: done.value.session, undo: note, redo: null });
+    const beats = restage(
+      done.value.session,
+      actAfterMerge(rewind.index, range.at, range.count)
+    );
+    // `rebaseTree` FIRST and `syncTree` after, and the order is the whole reason
+    // both are called: only `rebaseTree` knows the splice's three numbers, so
+    // only it can collapse the range while keeping a HOLD the person put inside
+    // it — "a hold references no act, so it is not part of the work being
+    // coalesced". `syncTree` then checks the result against the recounted beats
+    // and repairs it if the merged act turned out to paint nothing.
+    const sync = syncTree(
+      rebaseTree(timeline, range.at, range.count, 1),
+      beats,
+      mintStep.current
+    );
+    setTimeline(sync.tree);
+    // The marks named the two ends of a range that is now ONE frame. The in
+    // point's beat survives as the merged act and the out point's does not, so
+    // half the cut would be left dangling — and half a cut has no spelling, in
+    // this program or in the file. Cleared, and said.
+    setPlaySpan(null);
+    const resync = syncSaid(sync);
+    setAnnounce(
+      `${mergeSaid(done.value.merge)} ${rebaseSaid(
+        done.value.report
+      )}. The in and out points named the range that is now one frame, so the cut is cleared.${
+        resync === null ? "" : ` ${resync}.`
+      }`
+    );
+  }, [rewind, timeline, session, revisions, playCut, restage]);
+
+  // ── ONE undo, over two stacks ───────────────────────────────────────────
+
+  /**
+   * IS THE LAST FRAME EDIT STILL THE MOST RECENT THING? — asked TWICE, because
+   * undo and redo are asking different questions.
+   *
+   * `frames.ts` proves a frame edit cannot be an `Act` — a `Move` acts on a
+   * `Composition`, the journal is not in a `Composition`, so no act can describe
+   * a change to the list of acts — so there are two stacks, and two stacks under
+   * one keystroke is how ⌘Z becomes ambiguous. These two booleans are the whole
+   * of what stops it, and each is total: the frame edit is on top, or it is not.
+   *
+   *   UNDO asks whether the edit is the most recent thing STANDING, which is
+   *   `sameCommitted`: nothing has been committed since that has not itself been
+   *   taken back. An act sitting in the redo branch is not standing on anything.
+   *
+   *   REDO asks whether the edit is the most recently UNDONE thing, which is
+   *   `sameJournal`: any journal undo since is more recent, so the redo branch
+   *   has to match too.
+   *
+   * THE DIFFERENCE IS NOT A REFINEMENT, it is a bug that was found and fixed —
+   * `timeline.sameCommitted` carries the two-keystroke sequence that shows it,
+   * where a both-halves test made ⌘Z SKIP the frame edit and undo the act
+   * beneath it. Both functions carry the reasoning and both are tested.
+   *
+   * ONE THING NEITHER SEES, stated because it is a real hole rather than a
+   * theoretical one: a layer's visible/locked SWITCHES are not journalled — they
+   * are a `Composition` field that no `Move` reaches — so toggling one does not
+   * move the journal, and a revision undone afterwards restores the switches as
+   * they stood before the edit. It is out of reach in practice (the panel is
+   * frozen while a preview stands, and a frame edit is only reachable from the
+   * playhead) and the announcement names the whole restore rather than only the
+   * frame, so nothing is claimed that is not done.
+   */
+  const undoRevisionNext =
+    revisionMark !== null &&
+    revisions.past.length > 0 &&
+    sameCommitted(session.journal, revisionMark.session.journal);
+  const redoRevisionNext =
+    revisionMark !== null &&
+    revisions.future.length > 0 &&
+    sameJournal(session.journal, revisionMark.session.journal);
+
+  /**
+   * ⌘Z. Whatever was done last, taken back — a stroke, a reorder, a paste, or a
+   * frame edit.
+   *
+   * `layers.undo` walks the journal that `endStroke`, the panel and the presets
+   * all push to. `frames.undoRevision` walks the stack the two frame edits push
+   * to. `journalStill` above says which of them is on top, and the announcement
+   * always names what was taken back, so the routing is legible after the fact as
+   * well as before it — the strip says what ⌘Z will do while it is still ⌘Z's to
+   * do (`timeline.undoSaid`).
+   *
+   * THE REVISION BRANCH IS ABOVE THE PREVIEW GUARD, deliberately. A frame edit is
+   * made FROM the playhead, so a preview is standing at the moment it happens and
+   * refusing to take it back until the preview is closed would be refusing at
+   * exactly the moment the person wants it. It is safe where the journal's own
+   * undo is not: `restage` rebuilds the preview from the restored journal rather
+   * than leaving it showing a state reconstructed from a journal that is gone.
+   *
+   * The EVENT LOG needs nothing here either way: it IS the journal, so it moves
+   * with whichever half moved.
+   */
+  const doUndo = useCallback(() => {
+    if (undoRevisionNext) {
+      const step = undoRevision(revisions, { session, timeline });
+      if (step !== null) {
+        const said = revisionMark?.undo ?? "the frame edit";
+        setRevisions(step.revisions);
+        setTimeline(step.timeline);
+        setRevisionMark({
+          session: step.session,
+          // The next one down is a frame edit this file no longer has the words
+          // for; see `revisionMark` for why a note stack was refused.
+          undo: step.revisions.past.length > 0 ? "the frame edit before it" : null,
+          redo: said,
+        });
+        restage(step.session, rewind?.index ?? step.session.journal.past.length);
+        setAnnounce(
+          `took back ${said} — the drawing and its timeline are back exactly as they stood before that edit, ${
+            step.session.journal.past.length
+          } gesture${step.session.journal.past.length === 1 ? "" : "s"} in the journal`
+        );
+        return;
+      }
+    }
+    if (previewing) {
+      setAnnounce("a preview is standing — close it before undoing");
+      return;
+    }
+    const step = undoSession(session);
+    if (step.act === null) {
+      setAnnounce("nothing to undo");
+      return;
+    }
+    compRef.current = step.session.composition;
+    setSession(step.session);
+    // Nothing to do for the event log: it IS the journal, so it moved with it.
+    // This used to be a guarded `setEvents(undoEvents(events))`, and the guard
+    // was the bug — an act nobody counted popped somebody else's rung.
+    setAnnounce(
+      `undid ${step.act.note} — ${
+        flattenComposition(step.session.composition, book).size
+      } cells on the plate`
+    );
+  }, [
+    undoRevisionNext,
+    revisions,
+    revisionMark,
+    session,
+    timeline,
+    rewind,
+    restage,
+    previewing,
+    book,
+  ]);
+
+  /** ⇧⌘Z, and the exact mirror of `doUndo` — including which stack it addresses. */
+  const doRedo = useCallback(() => {
+    if (redoRevisionNext) {
+      const step = redoRevision(revisions, { session, timeline });
+      if (step !== null) {
+        const said = revisionMark?.redo ?? "the frame edit";
+        setRevisions(step.revisions);
+        setTimeline(step.timeline);
+        setRevisionMark({
+          session: step.session,
+          undo: said,
+          redo:
+            step.revisions.future.length > 0 ? "the frame edit after it" : null,
+        });
+        restage(step.session, rewind?.index ?? step.session.journal.past.length);
+        setAnnounce(
+          `put ${said} back — ${step.session.journal.past.length} gesture${
+            step.session.journal.past.length === 1 ? "" : "s"
+          } in the journal`
+        );
+        return;
+      }
+    }
+    if (previewing) {
+      setAnnounce("a preview is standing — close it before redoing");
+      return;
+    }
+    const step = redoSession(session);
+    if (step.act === null) {
+      setAnnounce("nothing to redo");
+      return;
+    }
+    compRef.current = step.session.composition;
+    setSession(step.session);
+    setAnnounce(
+      `redid ${step.act.note} — ${
+        flattenComposition(step.session.composition, book).size
+      } cells on the plate`
+    );
+  }, [
+    redoRevisionNext,
+    revisions,
+    revisionMark,
+    session,
+    timeline,
+    rewind,
+    restage,
+    previewing,
+    book,
+  ]);
+
+  /**
+   * WHAT ⌘Z WILL TAKE BACK, for the strip to say before it is pressed.
+   *
+   * The routing above is exact; a rule nobody can see is still a surprise the
+   * first time it fires. `timeline.undoSaid` builds the sentence and
+   * `test/timeline.test.ts` holds it to the three cases, which is the only way a
+   * sentence in a component under `environment: "node"` can be tested at all.
+   */
+  const undoNext = undoSaid(
+    undoRevisionNext ? revisionMark?.undo ?? "the frame edit" : null,
+    past.length === 0 ? null : past[past.length - 1].note
+  );
+  /**
+   * And the same for ⇧⌘Z, which the HUD's two buttons need as well as the strip.
+   *
+   * ── The buttons and the keystroke MUST agree, and they did not ─────────
+   *
+   * The HUD's undo is `disabled={past.length === 0 || previewing}`, and a frame
+   * edit is made FROM the playhead — so a preview is standing at the moment a
+   * revision becomes the thing ⌘Z would take back, and the button beside the
+   * canvas was greyed out at exactly that moment. A keystroke that works while
+   * the button for it is disabled is worse than either alone: it is two controls
+   * for one action disagreeing about whether the action exists.
+   *
+   * So both buttons ask the same two booleans the keystroke does, and both carry
+   * the sentence rather than a fixed label — which is also what makes the routing
+   * legible to a pointer, where there is no strip to read.
+   */
+  const redoNext = redoSaid(
+    redoRevisionNext ? revisionMark?.redo ?? "the frame edit" : null,
+    session.journal.future.length === 0 ? null : session.journal.future[0].note
+  );
+
+  /**
+   * IS THE TIMELINE STRIP ON SCREEN — and this is the whole of what it means.
+   *
+   * ── Why it is a separate state and not derived from the preview ────────
+   *
+   * There are three things in this file that could plausibly be called "is the
+   * timeline open", and they are three:
+   *
+   *   `rewind !== null` — a preview is standing. The plate is showing a state
+   *     that is not the live drawing.
+   *   `playFresh && playSteps > 0` — there is a beat count, taken for the
+   *     picture on screen. The rail has stops.
+   *   `timelineOpen` — the strip is not folded away. FURNITURE.
+   *
+   * Only the third is this. Wiring it to either of the others was tried on
+   * paper and refused for the same reason both times: it would make the strip
+   * unfold itself. A person who presses the seam has said, in as many words,
+   * "not now" — and REPLAY, HISTORY, P and M all open a preview, so a strip that
+   * opened with the preview would reappear on the next press of any of four
+   * controls that are about something else. That is the definition of a control
+   * fighting its user, and the brief for this pass named it.
+   *
+   * The traffic in the other direction is refused too, and that half matters
+   * more: FOLDING THE STRIP AWAY MUST NOT CLOSE A PREVIEW OR CLEAR A MARK.
+   * `closeRewind`, `setPlaySpan` and the beat count are not reachable from here
+   * — the seam's only effect is this boolean — so the drawing is in exactly the
+   * same state with the strip shut as with it open, and `timeline.seamSaid` puts
+   * that state on the seam so it is not a secret. `test/timeline.test.ts` holds
+   * the sentence to it.
+   *
+   * ── Persistence, and how far it goes ───────────────────────────────────
+   *
+   * `useState` in a component that never unmounts, so it survives every render
+   * this page does — a stroke, a preview opening, a depth change, a reframe. It
+   * does NOT survive a reload, and that is deliberate rather than unfinished:
+   * every other way of persisting it (localStorage read at render) hands the
+   * server and the first client render different answers, and this program has
+   * been careful about exactly that — see `coarseOnServer` and `motionOnServer`,
+   * which lie on the server precisely because the alternative is a hydration
+   * mismatch. A strip that starts open on every load is the honest default; it
+   * is where the owner asked for it to be.
+   */
+  const [timelineOpen, setTimelineOpen] = useState(true);
+  /**
+   * NOTHING IS ANNOUNCED HERE, and that is a decision rather than an omission.
+   *
+   * Almost every control on this page pushes a sentence into the live region,
+   * and this one was written that way first — "timeline hidden; the playhead and
+   * any in and out points are kept". It was removed because it is said twice:
+   * the seam is a real `<button>` with `aria-expanded`, so a screen reader
+   * announces the state change on the press by itself, and the button's own name
+   * is `timeline.seamSaid`, which CHANGES on the press and names the playhead and
+   * the cut. Focus is on that button at the moment it is pressed, so the
+   * reassurance is delivered exactly where the hand is. A live-region sentence
+   * on top of that is the same fact a third time.
+   */
+  const toggleTimeline = useCallback(
+    () => setTimelineOpen(!timelineOpen),
+    [timelineOpen]
+  );
 
   /**
    * What reverting to the previewed state would cost, computed against the LIVE
@@ -4758,9 +5819,45 @@ export default function DrawPage() {
    * `emit.serialise`, which states the layers and carries the flattened picture
    * beside them for a reader that predates them.
    */
-  const svgText = useCallback(() => {
+  /**
+   * `serialise` REFUSES a document that lies about its own timing — a child
+   * revealing before the group that gates it (`emit.revealBreak`) — by
+   * throwing, and its message names the two layers that disagree. The refusal
+   * has to reach the announce channel rather than crash the export button: the
+   * one reachable violator is an imported low-reveal layer pasted inside a
+   * high-reveal one, and the person who built that needs the sentence, not a
+   * dead click. CAUGHT rather than pre-checked, because `serialise` scopes
+   * BEFORE it checks — a pre-check over the whole document would wrongly
+   * refuse a scoped copy whose offending layer is outside the scope. Returns
+   * `null` on refusal; every consumer aborts its action on `null`, and the
+   * announcement has already been made by then.
+   */
+  const refuseEmit = useCallback((err: unknown): null => {
+    setAnnounce(
+      err instanceof Error ? err.message : "export refused — the document is inconsistent"
+    );
+    return null;
+  }, []);
+
+  /**
+   * ANNOTATED, and the annotation is load bearing rather than decorative.
+   *
+   * The `string | null` these two answer with was INFERRED, and it survived only
+   * because `refuseEmit` is annotated `: null`. Delete that one annotation and
+   * TypeScript infers `string` for both — every `=== null` guard at every call
+   * site goes dead at the type level, with no compile error anywhere, and a
+   * refused export becomes a download of the string `"null"`. A contract four
+   * callers depend on must not rest on an annotation in a fifth function.
+   */
+  const svgText = useCallback((): string | null => {
     const sole = soleLayer(comp);
-    if (sole === null) return serialiseEmit(emitDoc());
+    if (sole === null) {
+      try {
+        return serialiseEmit(emitDoc());
+      } catch (err) {
+        return refuseEmit(err);
+      }
+    }
     const { baked, cells, overlay } = bakedFrame();
     return artworkSvg({
       width: canvas.geom.width,
@@ -4803,6 +5900,7 @@ export default function DrawPage() {
   }, [
     comp,
     emitDoc,
+    refuseEmit,
     bakedFrame,
     canvas,
     book,
@@ -4827,9 +5925,17 @@ export default function DrawPage() {
    * which makes the argument this code is the other half of.
    */
   const svgOfScope = useCallback(
-    (layer?: LayerId) =>
-      serialiseEmit(emitDoc(), layer === undefined ? undefined : { layer }),
-    [emitDoc]
+    // The try mirrors `svgText`'s and the argument lives there: the refusal is
+    // announced, never thrown at a button. The return type is written out for
+    // the reason `svgText`'s header gives.
+    (layer?: LayerId): string | null => {
+      try {
+        return serialiseEmit(emitDoc(), layer === undefined ? undefined : { layer });
+      } catch (err) {
+        return refuseEmit(err);
+      }
+    },
+    [emitDoc, refuseEmit]
   );
 
   /**
@@ -4845,6 +5951,18 @@ export default function DrawPage() {
    * A file with no layer tree — every drawing this program wrote before layers
    * existed — is read by `artfile` instead and arrives as a single layer, so
    * IMPORT accepts an old drawing rather than refusing it on a technicality.
+   *
+   * ── A REFUSED COMPOSITION IS NOT AN OLD DRAWING ────────────────────────
+   *
+   * That fallback used to run on ANY `null` from the reader, and the reader has
+   * fifteen ways to say it. Exactly one of them — `"no-composition"` — means "no
+   * layer tree". The other fourteen mean "this file HAS a history and I would not
+   * vouch for it", and running the legacy path on those flattened the whole
+   * history into one layer holding the finished plate and announced it as a
+   * successful paste. `emit.parseWhy` returns the reason so the two can be told
+   * apart, and the sentence names which check disagreed rather than just saying
+   * no — a person who round-tripped a gesture file through another editor needs
+   * to know it was the tiling count and not their drawing.
    */
   const nodeFromSvg = useCallback(
     (
@@ -4854,9 +5972,13 @@ export default function DrawPage() {
       // minted, because a `Layer` does not carry them — see `layers.Switches`.
       // `pasteInto` takes this map and `reid` re-keys it onto the fresh ids, so
       // a hidden layer imported arrives hidden.
-    ): { node: Layer; switches: ReadonlyMap<LayerId, Switches> } | null => {
-      const doc = parseEmit(text);
-      if (doc !== null && doc.layers.length > 0) {
+    ): {
+      node: Layer;
+      switches: ReadonlyMap<LayerId, Switches>;
+    } | { node: null; said: string } => {
+      const got = parseEmitWhy(text);
+      if (got.ok && got.doc.layers.length > 0) {
+        const doc = got.doc;
         // The FILE'S own book: a layer names cells by index, and an index means
         // nothing without the depth that issued it.
         const fileBook = addressBook(
@@ -4871,8 +5993,19 @@ export default function DrawPage() {
           switches: built.switches,
         };
       }
+      // THE ONE REFUSAL THE LEGACY PATH MAY ANSWER. Everything else carried a
+      // composition, and reading it flat would destroy exactly the thing the
+      // person imported the file for.
+      if (!got.ok && got.why !== "no-composition") {
+        return {
+          node: null,
+          said: `${label} was not pasted — ${refusalSaid(got.why)}. Its layers would have been flattened into one, so nothing was taken from it`,
+        };
+      }
       const legacy = extractArt(text);
-      if (legacy === null) return null;
+      if (legacy === null) {
+        return { node: null, said: `${label} is not a drawing this program can read` };
+      }
       const plate =
         legacy.canvas === "triangle"
           ? plateIntoSector(
@@ -4914,8 +6047,12 @@ export default function DrawPage() {
       let refused: string | null = null;
       for (const { text, label } of texts) {
         const arriving = nodeFromSvg(text, label);
-        if (arriving === null) {
-          refused = refused ?? `${label} is not a drawing this program can read`;
+        // THE SENTENCE COMES FROM THE READER NOW. It used to be written here —
+        // one string for every way a file could be declined — which is why a
+        // refused composition and a file that is not a drawing at all read the
+        // same. See `nodeFromSvg`.
+        if (arriving.node === null) {
+          refused = refused ?? arriving.said;
           continue;
         }
         // Re-seated on the ORIGINAL target before each graft. `pasteInto`
@@ -5034,8 +6171,10 @@ export default function DrawPage() {
     (layer?: LayerId) => {
       const name =
         layer === undefined ? null : (findLayer(comp, layer)?.name ?? null);
+      const text = svgOfScope(layer);
+      if (text === null) return; // refused, and already announced
       void toClipboard(
-        svgOfScope(layer),
+        text,
         layer === undefined
           ? `copied the whole composition — ${docCensus.total} layer${
               docCensus.total === 1 ? "" : "s"
@@ -5090,18 +6229,23 @@ export default function DrawPage() {
   /** EXPORT is COPY with a file for a destination. Same text, same call. */
   const exportComposition = useCallback(() => {
     const name = nameFor("svg", "-layers");
+    const text = svgOfScope();
+    if (text === null) return; // refused, and already announced
     download(
-      new Blob([svgOfScope()], { type: "image/svg+xml;charset=utf-8" }),
+      new Blob([text], { type: "image/svg+xml;charset=utf-8" }),
       name
     );
     setAnnounce(
+      // `docCensus.addresses` is every entry of every plate and `strandedSaid` is
+      // the part of it this canvas cannot draw. Said together because the first
+      // number alone overstates the drawing — see `strandedAddresses`.
       `exported ${name} — ${docCensus.total} layer${
         docCensus.total === 1 ? "" : "s"
       }, ${docCensus.addresses} address${
         docCensus.addresses === 1 ? "" : "es"
-      }; import it back or drop it on the canvas`
+      }${strandedSaid}; import it back or drop it on the canvas`
     );
-  }, [nameFor, svgOfScope, docCensus]);
+  }, [nameFor, svgOfScope, docCensus, strandedSaid]);
 
   /** IMPORT is PASTE with files for a source. Several at once, one journal. */
   const importFiles = useCallback(
@@ -5134,7 +6278,9 @@ export default function DrawPage() {
 
   const exportSvg = () => {
     const name = nameFor("svg");
-    download(new Blob([svgText()], { type: "image/svg+xml;charset=utf-8" }), name);
+    const text = svgText();
+    if (text === null) return; // refused, and already announced
+    download(new Blob([text], { type: "image/svg+xml;charset=utf-8" }), name);
     setAnnounce(`exported ${name}`);
   };
 
@@ -5181,16 +6327,230 @@ export default function DrawPage() {
       shown
     );
     if (frames.length === 0) return null;
-    return { baked, cells, overlay, shown, states, frames };
-  }, [comp, past, bakedFrame, canvas, book, showTiling]);
+    /**
+     * THE MARKS RESOLVED AGAINST THIS FRAME, NOT AGAINST THE LAST ONE STOOD UP.
+     *
+     * `beatsOf(states, shown)` is free here: the expensive half is the journal
+     * walk, `states` above already is it, and `beatsOf`'s own header measures the
+     * remainder at ~16 ms against ~170 ms for the walk. It is index-aligned with
+     * `frames` by construction — `animationSteps` drops exactly the acts that
+     * changed no shown cell and `beatsOf` restates that rule — so a step index
+     * resolved against a tree named for THESE beats is a step index into
+     * `frames`, which is what `boundAnimation` is about to cut.
+     *
+     * Before this, `playCut` was read here: the marks resolved against whatever
+     * frame the playhead was last stood up in. See `playCut`'s header for the
+     * measured failure. The sync is NOT kept — an export is a read, and
+     * `cutForFrame` returns the tree rather than keeping it for exactly that
+     * reason — so this cannot rebuild the document's timeline behind a person
+     * who only pressed SAVE.
+     */
+    const marks = cutForFrame(
+      timeline,
+      playSpan,
+      beatsOf(states, shown),
+      mintStep.current
+    );
+    /**
+     * THE CUT, APPLIED ONCE, HERE.
+     *
+     * `boundAnimation` is the one place the marks are read — its header says so
+     * and gives the reason: two encoders reading two marks would be two chances
+     * to be off by one, and two encoders reading one value is none. So the SVG
+     * and the GIF are each handed a `ground` and a `steps` that have already
+     * been cut, and neither of them learns what an in point is.
+     *
+     * `states[0]` is the plate the journal began from, which is what `ground`
+     * has always been; the fold of everything before the in point INTO it is
+     * `boundAnimation`'s own work. The marks are clamped there too, so a span
+     * left over from a longer drawing or a wider frame lands inside this one
+     * rather than being refused — the UI-facing rule, see `clampSpan`.
+     */
+    const cut = boundAnimation(states[0], frames, marks.span);
+    return {
+      baked,
+      cells,
+      overlay,
+      shown,
+      states,
+      /** Every beat the drawing has. What the census and the timing count. */
+      frames,
+      cut,
+      /**
+       * A mark that no longer names a beat OF THIS FRAME, for the sentence.
+       * `resolveSpan`'s header makes saying it the caller's obligation, and the
+       * caller of a file writer is the export button.
+       */
+      lost: marks.lost,
+    };
+  }, [comp, past, bakedFrame, canvas, book, showTiling, timeline, playSpan]);
+
+  /**
+   * THE SAME REPLAY AS A FOURFOLD DOCUMENT, with one layer per gesture.
+   *
+   * ── Two layer trees, and the export picks by what the file is FOR ───────
+   *
+   * `emitDoc` builds the EDITOR's layers — the containers a person made — and
+   * that is the right tree for a still: it answers "what is this drawing made
+   * of?". This builds the HISTORY's layers, one node per beat, and that is the
+   * right tree for a replay: it answers "how did this drawing happen?". Both are
+   * true at once and neither can be derived from the other, because MANY
+   * GESTURES PAINT INTO ONE LAYER and a layer outlives every gesture that
+   * touched it. Giving `layers.Layer` a `reveal` would force one of them to win,
+   * which is the same "one number is a lie about the others" error `provenance.
+   * ts` argues at length about `orbit`.
+   *
+   * So the still path is untouched — `svgText` and `svgOfScope` call `emitDoc`
+   * and get exactly the bytes they always got — and this spreads that document
+   * and replaces the two fields an animation owns.
+   *
+   * ── The reveals are in BEAT space, which is the whole of the alignment ──
+   *
+   * `frameBeats()` is `timeline.beatsOf`: the acts that actually changed a shown
+   * cell, in order, which is precisely the list `animationSteps` turns into
+   * steps and `EmitAnimation.steps` counts. Handing `past` in whole instead would
+   * put the reveals in ACT space — a rename, a reorder and a stroke that landed
+   * in another sector all occupy a position there and none of them is a beat — so
+   * the last gesture of a 40-act, 31-beat drawing would ask to be revealed at
+   * step 39 of a 31-step animation and would never come up. The strokes are
+   * therefore SELECTED BY BEAT, `beats.map(a => strokes[a])`, and every index
+   * downstream is an index into that list: the reveals, the trails, and the in
+   * and out points.
+   *
+   * ── The cut is written as a PAIR OF MARKS and not as a shorter list ─────
+   *
+   * `boundAnimation` cuts the step list for `animatedSvg` and for the GIF,
+   * because neither format can express "already on the plate" or "in the file and
+   * not in the picture" — they have to be handed a ground and a truncated list.
+   * THIS FORMAT CAN, and does it in the stylesheet: `emit.animationRules` gives a
+   * layer before the in point `opacity: 1` from the first frame and a layer past
+   * the out point `opacity: 0`, and `EmitAnimation.in`/`.out` are the marks it
+   * reads. So every gesture keeps its `<g>`, its `data-mode` and its `data-orbit`
+   * whether or not the cut plays it — which `emit.ts` states as a rule ("a file
+   * whose out point dropped the last three strokes must still say that those
+   * three strokes were six-fold; the cut is what the file DRAWS, the markup is
+   * what it MEANS") — and, load bearing for the picture, THE FOLDED GROUND IS
+   * STILL PAINT. Handing this path the bound list instead would leave the cells
+   * drawn before the in point in no layer at all, so `serialise` would put them
+   * in the tiling group wearing the unpainted fill and the exported first frame
+   * would be a different picture from the one REPLAY opens on.
+   * `test/gestureexport.test.ts` measures that difference rather than asserting
+   * it.
+   *
+   * ── What is announced rather than thrown ────────────────────────────────
+   *
+   * Both refusals are stated here because both are about the DRAWING rather than
+   * about the file: a frame in which no gesture moved a cell has no animation to
+   * write, and a gesture tree past `artfile.MAX_LAYERS` is a file `parse` would
+   * refuse on load, so it is declined before a byte is written rather than
+   * discovered by the person who tries to open it. `serialise`'s own refusal —
+   * a child revealing before its ancestor — cannot arise here and is still caught
+   * by the caller: gesture layers put the reveal on the gesture and leave the
+   * orbits under it with no time at all, which is exactly the shape
+   * `emit.revealBreak` can never fault.
+   *
+   * ── THIS FUNCTION KEEPS NOTHING. It used to, and it was a half-write ────
+   *
+   * It called `standTree`, which is `syncTree` AND `setTimeline`, and it called it
+   * ABOVE the budget check. So a decline whose whole sentence is "nothing written"
+   * had already rewritten the document's timeline — and `syncTree`'s third case
+   * REBUILDS, flattening the tree and discarding every composition and every hold.
+   * Reachable without contrivance: recolour a past frame, which mints a
+   * composition and says so; frame a sector, so the beat list becomes a
+   * subsequence; press EXPORT GESTURES. The composition was destroyed, no `nest`
+   * was written, the sentence reported the layers as though nothing had gone, and
+   * a frame edit is a `Revision` while this was not — so ⌘Z could not get it back.
+   *
+   * The sync is therefore HOISTED OUT of the decision: `timeline.cutForFrame`
+   * computes it purely and hands it back, every decline below returns before
+   * anything is kept, and `exportGestureSvg` keeps it only once the bytes exist.
+   * The pair `{ doc, sync }` is what the caller needs to do that, so the pair is
+   * what this returns.
+   *
+   * ── ONE sync serves the trails AND the cut, which it did not before ────
+   *
+   * The trails were read off the freshly synced tree and the cut off the memo,
+   * which is the PRE-sync resolution — `setTimeline` cannot land inside the render
+   * that called it — so one file could carry reveals and `nest` from the new tree
+   * and `in`/`out` from the old one. `cutForFrame` does both from one `Synced`,
+   * and there is no longer a second tree in the function to get it from.
+   */
+  const gestureDoc = useCallback((): {
+    doc: EmitDoc;
+    sync: Synced;
+    lost: ResolvedSpan["lost"];
+  } | null => {
+    if (past.length === 0) {
+      setAnnounce("nothing to animate — no committed gesture changed a cell in this frame");
+      return null;
+    }
+    const beats = frameBeats();
+    if (beats.length === 0) {
+      setAnnounce("nothing to animate — no committed gesture changed a cell in this frame");
+      return null;
+    }
+    // The tree is brought into step with the beat list HERE — a tree naming beats
+    // this frame does not have would hand `compTrails` a list of the wrong length
+    // and silently shift every composition boundary by the difference — and the
+    // marks are resolved against THAT tree, so the reveals, the `nest` trails and
+    // the in and out points of one file are all read off one naming of one frame.
+    // Nothing is kept: see the header.
+    const marks = cutForFrame(timeline, playSpan, beats, mintStep.current);
+    const trails = compTrails(marks.sync.tree);
+    const strokes = actStrokes(past);
+    const layers = gestureLayers(
+      beats.map((a) => strokes[a]),
+      book,
+      {
+        // THE ANIMATED PATH'S OWN UNPAINTED FILL, the same expression
+        // `animationModel` hands `animationSteps` and for the same reason: an
+        // erase sets a cell to nothing, a layer stack can only draw over, so an
+        // erase drawn in the fill an unpainted cell wears is what makes the
+        // stack additive and lets it reconstruct the plate. Without it a gesture
+        // that rubbed something out would leave the colour it removed on screen.
+        unpainted: showTiling ? TILE : PLATE_BG,
+        trails,
+      }
+    );
+    const budget = layerBudget(layers);
+    if (budget.said !== null) {
+      setAnnounce(budget.said);
+      return null;
+    }
+    return {
+      doc: {
+        ...emitDoc(),
+        layers,
+        animation: gestureAnimation(beats.length, stepMs, marks.span),
+      },
+      sync: marks.sync,
+      lost: marks.lost,
+    };
+  }, [
+    past,
+    frameBeats,
+    timeline,
+    playSpan,
+    book,
+    showTiling,
+    emitDoc,
+    stepMs,
+  ]);
 
   const animationText = useCallback(
     (grouping: "orbit" | "cell") => {
       const model = animationModel();
       if (model === null) return null;
-      const { baked, cells, overlay, shown, states, frames } = model;
+      const { baked, cells, overlay, shown, states, cut, lost } = model;
+      // THE CENSUS COUNTS WHAT THE FILE HOLDS, so it counts the CUT steps and
+      // not the drawing's. It is what the announcement reports as "23 gestures,
+      // one CSS rule per gesture", and a rule is written per step that plays.
       return {
-        census: animationCensus(frames),
+        census: animationCensus(cut.steps),
+        // Carried out to the button rather than said here, because this builds
+        // two files and the sentence belongs to whichever one was written.
+        // `resolveSpan` makes saying it the caller's obligation.
+        lost,
         text: animatedSvg({
           width: canvas.geom.width,
           height: canvas.geom.height,
@@ -5207,9 +6567,15 @@ export default function DrawPage() {
             canvas.view.mode === "sector"
               ? `sector ${canvas.view.sector}`
               : "hexagon"
-          }, depth ${depth}, ${frames.length} gesture${
-            frames.length === 1 ? "" : "s"
-          } at ${stepMs} ms`,
+          }, depth ${depth}, ${cut.steps.length} gesture${
+            cut.steps.length === 1 ? "" : "s"
+          } at ${stepMs} ms${
+            // The title says the drawing was CUT rather than leaving a reader to
+            // wonder why a 60-gesture plate exported an 8-gesture loop.
+            cut.folded === 0 && cut.dropped === 0
+              ? ""
+              : ` — in ${cut.span?.in ?? 0}, out ${cut.span?.out ?? 0}`
+          }`,
           // The same payload the still carries, so a replay is also a drawing:
           // dropping one back on the plate restores the finished plate exactly.
           payload: payloadFromPaint(
@@ -5223,12 +6589,19 @@ export default function DrawPage() {
               ? { sector: canvas.view.sector }
               : undefined
           ),
-          ground: states[0],
-          steps: frames,
+          // THE CUT PAIR, SPREAD TOGETHER. `boundAnimation` returns a `ground`
+          // with the prefix already folded in and a `steps` already truncated,
+          // and they only mean what they say as a pair — a folded ground with
+          // the uncut steps would draw the front of the drawing twice.
+          ground: cut.ground,
+          steps: cut.steps,
           stepMs,
           // Derived from THIS replay's step length and gesture count — see
-          // `replay.animationTiming`.
-          ...animationTiming(stepMs, frames.length),
+          // `replay.animationTiming`, which says in as many words that the count
+          // is the BOUNDED one: a hundred-gesture drawing cut to five plays a
+          // five-step cycle, and a hold scaled to the hundred would be four
+          // fifths of a loop spent on a still frame.
+          ...animationTiming(stepMs, cut.steps.length),
           grouping,
         }),
       };
@@ -5258,12 +6631,78 @@ export default function DrawPage() {
     });
     download(bytes, name);
     const { steps: n, groups, cells, orbitGroups } = built.census;
+    const dangled = lostSaid(built.lost);
     setAnnounce(
       `exported ${name} — ${n} gesture${n === 1 ? "" : "s"}, ${groups} symmetry group${
         groups === 1 ? "" : "s"
       } (${orbitGroups} recorded orbits) over ${cells} cell${
         cells === 1 ? "" : "s"
-      }, one CSS rule per gesture; ${Math.round(bytes.size / 1024)} kB`
+      }, one CSS rule per gesture; ${Math.round(bytes.size / 1024)} kB` +
+        (dangled === null ? "" : `. ${dangled}`)
+    );
+  };
+
+  /**
+   * The replay as a FOURFOLD document: the same animation, and loadable back.
+   *
+   * A THIRD FILE and not a replacement, which is a deliberate choice rather than
+   * an accretion. `animatedSvg`'s output is the smallest self-contained replay
+   * this program can write and the GIF is measured against it frame for frame;
+   * it carries no layer composition, so `emit.parse` returns `null` for it and
+   * dropping one back on the plate restores the finished drawing and none of its
+   * history. This one states the drawing AS THE HISTORY MADE IT — a `<g>` per
+   * gesture carrying `data-mode`, `data-orbit` and `data-reveal`, the timeline's
+   * own grouping as `nest`, and the payload every FOURFOLD file carries — so it
+   * animates in a browser, opens in Illustrator or Inkscape with every stroke an
+   * addressable compound path, AND comes back into this program with its
+   * gestures and its groups intact. The two answer different questions and the
+   * smaller one is not a subset of the larger.
+   *
+   * The census is the sentence's whole point: a file whose provenance can only
+   * be read by the program that wrote it is the thing this format exists not to
+   * be, so the announcement reports what a reader will find in it.
+   */
+  const exportGestureSvg = () => {
+    const built = gestureDoc();
+    // Every refusal is announced by `gestureDoc`, which is where the reason is
+    // known. Nothing further to say here.
+    if (built === null) return;
+    const { doc, sync, lost } = built;
+    let text: string;
+    try {
+      text = serialiseEmit(doc);
+    } catch (err) {
+      // Unreachable for a gesture tree — see `gestureDoc` — and caught on the
+      // same rule `svgText` keeps: a refusal is a sentence, never a dead click.
+      // NOTHING IS KEPT ON THIS PATH EITHER: `setTimeline` is below the write,
+      // so the third way out of this function is as clean as the other two.
+      refuseEmit(err);
+      return;
+    }
+    const name = nameFor("svg", "-gestures");
+    const bytes = new Blob([text], { type: "image/svg+xml;charset=utf-8" });
+    download(bytes, name);
+    // KEPT HERE AND NOWHERE EARLIER. The bytes exist, so the tree this file was
+    // written from is now the document's tree — the same order `rewriteFrame` and
+    // `mergeMarked` keep, and the reason `gestureDoc` hands the sync back instead
+    // of keeping it. A rebuild costs the timeline its groups and its holds, so it
+    // is SAID rather than assumed harmless; `syncSaid` is silent when nothing
+    // moved, which is every ordinary export.
+    setTimeline(sync.tree);
+    const resync = syncSaid(sync);
+    const dangled = lostSaid(lost);
+    const c = provenanceCensus(doc.layers);
+    const anim = doc.animation;
+    setAnnounce(
+      `exported ${name} — ${c.layers} layer${c.layers === 1 ? "" : "s"}, ${
+        c.marked
+      } carrying a brush symmetry, ${c.short} with an orbit shorter than its mode` +
+        (anim === null || anim.in === undefined || anim.out === undefined
+          ? ""
+          : `; cut to in ${anim.in}, out ${anim.out} of ${anim.steps}`) +
+        `; ${Math.round(bytes.size / 1024)} kB` +
+        (dangled === null ? "" : `. ${dangled}`) +
+        (resync === null ? "" : `. ${resync}`)
     );
   };
 
@@ -5291,7 +6730,7 @@ export default function DrawPage() {
       setAnnounce("nothing to animate — no committed gesture changed a cell in this frame");
       return;
     }
-    const { cells, overlay, shown, states, frames } = model;
+    const { cells, overlay, shown, cut, lost } = model;
     const run = gifSteps({
       viewWidth: canvas.geom.width,
       viewHeight: canvas.geom.height,
@@ -5305,17 +6744,22 @@ export default function DrawPage() {
       weldPaint: weld,
       seamWidth: canvas.geom.seamWidth,
       overlay,
-      ground: states[0],
-      steps: frames,
+      // THE SAME CUT PAIR the SVG is handed, from the same `boundAnimation`
+      // call — which is the whole reason that call lives in `animationModel`
+      // and not in either encoder. See its header.
+      ground: cut.ground,
+      steps: cut.steps,
       stepMs,
       // The SAME hold the SVG gets, so the two encodings of one replay loop at
       // the same rate. A GIF carries no fade — see the note above.
-      holdMs: animationTiming(stepMs, frames.length).holdMs,
+      holdMs: animationTiming(stepMs, cut.steps.length).holdMs,
     });
     setGifBusy(true);
     setGifAt(0);
     setAnnounce(
-      `writing a GIF — ${frames.length} frame${frames.length === 1 ? "" : "s"} at ${gifWidth} px`
+      `writing a GIF — ${cut.steps.length} frame${
+        cut.steps.length === 1 ? "" : "s"
+      } at ${gifWidth} px`
     );
 
     const channel = new MessageChannel();
@@ -5335,13 +6779,15 @@ export default function DrawPage() {
           setGifAt(1);
           const name = nameFor("gif", "-replay");
           download(new Blob([r.bytes], { type: "image/gif" }), name);
+          const dangled = lostSaid(lost);
           setAnnounce(
             `exported ${name} — ${r.frames} frame${r.frames === 1 ? "" : "s"}, ` +
               `${r.width}×${r.height}, ${(r.cycleMs / 1000).toFixed(1)} s a loop, ` +
               (r.exact
                 ? `${r.palette} colour${r.palette === 1 ? "" : "s"}, exact — no quantisation; `
                 : `${r.distinct} colours reduced to ${r.palette}, the most a GIF can hold; `) +
-              `${Math.round(r.bytes.length / 1024)} kB`
+              `${Math.round(r.bytes.length / 1024)} kB` +
+              (dangled === null ? "" : `. ${dangled}`)
           );
           return;
         }
@@ -5365,8 +6811,10 @@ export default function DrawPage() {
   ]);
 
   const exportPng = () => {
+    const text = svgText();
+    if (text === null) return; // refused, and already announced
     const url = URL.createObjectURL(
-      new Blob([svgText()], { type: "image/svg+xml;charset=utf-8" })
+      new Blob([text], { type: "image/svg+xml;charset=utf-8" })
     );
     const img = new Image();
     img.onload = () => {
@@ -5488,17 +6936,36 @@ export default function DrawPage() {
 
         // THE LAYERS, when the file states any.
         //
-        // Read back through the same `emit.parse` the panel's IMPORT uses —
-        // there is one reader, and a dropped file and a pasted clipboard take
-        // the identical path through it. A file with no layer tree, which is
-        // every file written before this one, becomes the single layer
-        // `fromPlate` has always made of it, so nothing about loading an old
-        // drawing changed.
-        const parsed = payload.comp === undefined ? null : parseEmit(text);
+        // Read back through the same reader the panel's IMPORT uses — there is
+        // one reader, and a dropped file and a pasted clipboard take the
+        // identical path through it. A file with no layer tree, which is every
+        // file written before this one, becomes the single layer `fromPlate` has
+        // always made of it, so nothing about loading an old drawing changed.
+        //
+        // ── A REFUSED COMPOSITION IS SAID, not silently flattened ──────────
+        //
+        // The same conflation `nodeFromSvg` carried lived here in a shorter
+        // spelling: `payload.comp === undefined ? null : parse(text)` asks the
+        // right question and then throws the answer away, so a file that DID
+        // carry a composition the reader would not vouch for landed as one flat
+        // layer and the sentence merely omitted its "across N layers" clause.
+        //
+        // THE PICTURE IS STILL LOADED and that is deliberate. The payload's
+        // `cells` are the finished plate and they are not in doubt — only the
+        // history is — so refusing the whole file would cost the person their
+        // drawing to protect its structure. What was missing is the WARNING, and
+        // that is what is added: the reason is named, and it is named before they
+        // save over the file and make the flattening permanent.
+        const parsed = payload.comp === undefined ? null : parseEmitWhy(text);
+        const refusedComp =
+          parsed !== null && !parsed.ok ? refusalSaid(parsed.why) : null;
         const stack =
-          parsed === null || fileBook === null || parsed.layers.length === 0
+          parsed === null ||
+          !parsed.ok ||
+          fileBook === null ||
+          parsed.doc.layers.length === 0
             ? null
-            : stackFromEmit(parsed.layers, fileBook, 1);
+            : stackFromEmit(parsed.doc.layers, fileBook, 1);
         const restored: Composition =
           stack === null
             ? fromPlate(loaded)
@@ -5539,7 +7006,25 @@ export default function DrawPage() {
               : `sector ${framed} framed`
           }, depth ${payload.depth}, ${payload.convention}${
             payload.plate === undefined ? "" : ", addressed"
-          } · history reset to the loaded drawing`
+          }${
+            // COUNTED OFF THE LOADED PLATE AND NOT OFF `strandedAddresses`,
+            // because that memo reads `comp` and `comp` is still the OLD drawing
+            // in this closure — `reset` has not rendered yet. `fileBook` is the
+            // file's own canvas, which is the book these addresses were written
+            // against and therefore the only one that can say whether this
+            // program can draw them. A triangle file has no hexagon book here and
+            // is migrated by rename rather than by resolution, so it is skipped:
+            // its addresses are this model's addresses with a tag missing.
+            fileBook === null || strandedCount(loaded, fileBook) === 0
+              ? ""
+              : ` · ${strandedCount(loaded, fileBook)} address${
+                  strandedCount(loaded, fileBook) === 1 ? "" : "es"
+                } this canvas cannot draw, carried through unchanged`
+          } · history reset to the loaded drawing${
+            refusedComp === null
+              ? ""
+              : `. ITS LAYERS WERE NOT READ — ${refusedComp} — so the picture opened as one flat layer and its layer structure is not in this session. Saving now would write the flattened drawing`
+          }`
         );
         return;
       }
@@ -5831,7 +7316,7 @@ export default function DrawPage() {
                   aria-label={
                     v === "hexagon"
                       ? "frame the whole plate — all six sectors; nothing is cleared"
-                      : `frame one sector — the triangle, ${4 ** depth} cells; nothing is cleared`
+                      : `frame one sector — the triangle, ${cellCount("triangle", depth)} cells; nothing is cleared`
                   }
                   onClick={() => pickView(v)}
                 >
@@ -5849,7 +7334,7 @@ export default function DrawPage() {
               <SectorDial
                 sector={sector}
                 onPick={pickSector}
-                perSector={4 ** depth}
+                perSector={cellsAtScale(hex.scale)}
               />
             )}
             <p className={styles.viewMeta}>
@@ -5871,9 +7356,10 @@ export default function DrawPage() {
                   type="button"
                   className={`${styles.segBtn} ${styles.depthBtn}`}
                   aria-pressed={depth === d}
-                  aria-label={`depth ${d} — ${cellCount("hexagon", d)} cells on the plate, ${
-                    4 ** d
-                  } in a sector`}
+                  aria-label={`depth ${d} — ${cellCount("hexagon", d)} cells on the plate, ${cellCount(
+                    "triangle",
+                    d
+                  )} in a sector`}
                   onClick={() => pickDepth(d)}
                 >
                   {d}
@@ -6250,7 +7736,7 @@ export default function DrawPage() {
                 </div>
                 <p className={styles.hint}>
                   The six cells your brush corresponds to sit on one exact
-                  lattice ring — <b>ring {ring}</b> of {3 * 2 ** depth}. That
+                  lattice ring — <b>ring {ring}</b> of {3 * hex.scale}. That
                   ring is the <b>template</b>: it moves, and the whole plate
                   follows, six-fold symmetric in every frame because the remap is
                   a function of the ring alone. Height is the{" "}
@@ -6262,7 +7748,7 @@ export default function DrawPage() {
                       {" "}
                       The template ring is the <i>plate&rsquo;s</i>, so in a
                       framed sector it curves about the apex —{" "}
-                      <b>{2 ** (depth + 1) - 1} rings</b> cross this sector, where
+                      <b>{2 * hex.scale - 1} rings</b> cross this sector, where
                       a standalone triangle had a height field with two values in
                       it.
                     </>
@@ -6403,7 +7889,7 @@ export default function DrawPage() {
                 6·3<sup>{depth}</sup>
               </code>{" "}
               addresses with <i>no X</i> in the colour you are holding, and leaves
-              the other {modelTotal - 6 * 3 ** depth} bare. A preset fills{" "}
+              the other {modelTotal - 6 * gasketAtDepth(depth)} bare. A preset fills{" "}
               <i>every</i> sector, so a framed one then shows exactly{" "}
               <code>
                 3<sup>{depth}</sup>
@@ -6567,68 +8053,17 @@ export default function DrawPage() {
                   </div>
                 </div>
 
-                {/* ZOOM, which shipped as `−  1×  +` with no label, no glyph
-                    and no tooltip — three unmarked buttons that a reviewer read
-                    as "I don't know what these do", which was the honest
-                    reading, because nothing on screen said. Two things change.
+                {/* ZOOM HAS LEFT THE DECK for the canvas's own bottom-left
+                    corner — see `.canvasZoom`, where the three buttons now are
+                    and where the reasoning for the move lives. It is the same
+                    journey UNDO and REDO made to the top-left in an earlier
+                    round, for the same reason and against the same three
+                    pointer hazards: a control you use WHILE looking at the
+                    artwork does not belong at the far end of a deck above it.
 
-                    It is LABELLED, in the same micro-key every other group in
-                    this deck wears, so the function is legible standing still
-                    with no pointer anywhere near it — which is the whole of the
-                    defect. And it has MOVED: it used to sit in the run that
-                    holds save, load and the button that wipes the plate, and it
-                    is not one of those. Zoom changes nothing about the drawing;
-                    it changes the window. So it sits on the seam of this deck,
-                    after the controls that say what the hand is holding and
-                    before the ones that say what has been done — belonging to
-                    neither, which is exactly right.
-
-                    The middle button is the readout AND the reset, so the
-                    factor is always on screen and 1× is always one click away.
-                    It exists so that Space-drag has something to pan, and the
-                    tooltip on `+` is where that is said. */}
-                <div className={styles.zoomGroup} role="group" aria-labelledby="zoom-key">
-                  <span className={styles.benchKey} id="zoom-key">
-                    zoom
-                  </span>
-                  <span className={styles.zoomStepper}>
-                    <button
-                      type="button"
-                      onClick={() => setZoomTo(zoom / 2)}
-                      disabled={zoom <= 1}
-                      title="zoom out — show more of the figure"
-                      aria-label="zoom out"
-                    >
-                      −
-                    </button>
-                    <button
-                      type="button"
-                      className={styles.zoomNow}
-                      onClick={() => setZoomTo(1)}
-                      disabled={zoom === 1}
-                      title="fit the whole figure"
-                      // ROUNDED FOR DISPLAY ONLY. The stepper's own factors are
-                      // powers of two and print exactly; a drill-in lands on
-                      // whatever makes the focused cells fill the frame, and
-                      // "3.4641016151377544×" is a number nobody asked to read.
-                      // The state itself is left alone — see `setZoomTo`.
-                      aria-label={`zoom ${
-                        Math.round(zoom * 10) / 10
-                      } times — click to fit the whole figure`}
-                    >
-                      {Math.round(zoom * 10) / 10}×
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setZoomTo(zoom * 2)}
-                      disabled={zoom >= ZOOM_MAX}
-                      title="zoom in — hold Space and drag to pan"
-                      aria-label="zoom in"
-                    >
-                      +
-                    </button>
-                  </span>
-                </div>
+                    Nothing else in this group moved and no key changed: `+`,
+                    `−` and `0` are still bound in the window handler and still
+                    listed under "view" in `lib/shortcuts.ts`. */}
 
                 {/* MEMORY, now one column of two: the two controls that only
                     LOOK at the drawing.
@@ -7028,6 +8463,14 @@ export default function DrawPage() {
                       >
                         save svg animation
                       </button>
+                      <button
+                        type="button"
+                        className={styles.rewindAction}
+                        onClick={exportGestureSvg}
+                        aria-label="save the replay as a layered FOURFOLD file — one group per gesture carrying its brush symmetry, the orbit it realised and its place in the timeline, animating in a browser and loading back into this program"
+                      >
+                        save layered svg
+                      </button>
 
                       <label className={styles.rewindField}>
                         <span className={styles.benchKey}>gif</span>
@@ -7118,6 +8561,12 @@ export default function DrawPage() {
                       it was. The exported animation is a{" "}
                       <b>separate file</b>: one <code>&lt;g&gt;</code> per orbit
                       carrying <i>one</i> CSS animation, not one per cell. The{" "}
+                      <b>layered svg</b> is the same replay written as a FOURFOLD
+                      document — one <code>&lt;g&gt;</code> per <i>gesture</i>,
+                      each stating the brush symmetry it was made under and the
+                      orbit that symmetry actually laid down, so a stroke is an
+                      addressable compound path in any SVG tool — and it loads
+                      back here with its gestures and its grouping intact. The{" "}
                       <b>GIF</b> is the same replay at the same step, one frame
                       per gesture, with the palette taken from the drawing
                       rather than quantised — so the colours are exact unless
@@ -7247,6 +8696,7 @@ export default function DrawPage() {
                 geom={canvas.geom}
                 relief={relief}
                 paint={paint}
+                strata={strataTree}
                 // The ghost, the standing proposal and the cursor are all
                 // promises about a plate that is not the one on screen, so a
                 // preview drops all three. The STATE is kept — the cursor comes
@@ -7361,9 +8811,13 @@ export default function DrawPage() {
                   type="button"
                   className={`${styles.iconBtn} ${styles.hudBtn}`}
                   onClick={doUndo}
-                  disabled={past.length === 0 || previewing}
-                  title="undo the last gesture (⌘Z)"
-                  aria-label="undo the last gesture"
+                  // THE SAME TWO BOOLEANS THE KEYSTROKE ASKS. A frame edit is
+                  // made while a preview stands, so a button greyed on
+                  // `previewing` would be dark at exactly the moment ⌘Z became
+                  // able to take one back. See `redoNext`.
+                  disabled={!undoRevisionNext && (past.length === 0 || previewing)}
+                  title={`${undoNext} (⌘Z)`}
+                  aria-label={undoNext}
                 >
                   <ActionGlyph name="undo" />
                 </button>
@@ -7371,9 +8825,12 @@ export default function DrawPage() {
                   type="button"
                   className={`${styles.iconBtn} ${styles.hudBtn}`}
                   onClick={doRedo}
-                  disabled={session.journal.future.length === 0 || previewing}
-                  title="redo the last undone gesture (⌘⇧Z)"
-                  aria-label="redo the last undone gesture"
+                  disabled={
+                    !redoRevisionNext &&
+                    (session.journal.future.length === 0 || previewing)
+                  }
+                  title={`${redoNext} (⌘⇧Z)`}
+                  aria-label={redoNext}
                 >
                   <ActionGlyph name="redo" />
                 </button>
@@ -7403,6 +8860,74 @@ export default function DrawPage() {
                   )
                 )}
               </div>
+
+              {/* ZOOM, ON THE ARTWORK, at the bottom left.
+                  Asked for in as many words, and it is the right corner: zoom
+                  is a fact about the WINDOW you are looking through, so it
+                  belongs on the window rather than 700px away at the end of a
+                  deck. It is the same move undo and redo made to the opposite
+                  corner, and it inherits all three of the pointer hazards that
+                  move documented — `.canvasZoom` in the stylesheet carries them
+                  one by one, including the one that bites hardest here: `−` is
+                  disabled at 1×, which is the DEFAULT state of every fresh
+                  drawing, and a disabled button that still hit-tests is a hole
+                  in the drawing surface that swallows a stroke and gives nothing
+                  back. Chrome dispatches nothing at all for a press that lands
+                  on one — not even to its ancestors — so `pointer-events: none`
+                  while disabled is the only fix.
+
+                  BOTTOM LEFT and not bottom right: the candidate bar owns the
+                  top right and its COMMIT has to stay findable, undo and redo
+                  own the top left, and the empty-plate hint is centred. The
+                  fourth corner was the one still free.
+
+                  The middle button is the readout AND the reset, exactly as it
+                  was in the deck, so the factor is always on screen and 1× is
+                  always one click away. */}
+              <div
+                className={styles.canvasZoom}
+                role="group"
+                aria-label="zoom the view"
+              >
+                <span className={styles.zoomStepper}>
+                  <button
+                    type="button"
+                    onClick={() => setZoomTo(zoom / 2)}
+                    disabled={zoom <= 1}
+                    title="zoom out — show more of the figure (−)"
+                    aria-label="zoom out"
+                  >
+                    −
+                  </button>
+                  <button
+                    type="button"
+                    className={styles.zoomNow}
+                    onClick={() => setZoomTo(1)}
+                    disabled={zoom === 1}
+                    title="fit the whole figure (0)"
+                    // ROUNDED FOR DISPLAY ONLY. The stepper's own factors are
+                    // powers of two and print exactly; a drill-in lands on
+                    // whatever makes the focused cells fill the frame, and
+                    // "3.4641016151377544×" is a number nobody asked to read.
+                    // The state itself is left alone — see `setZoomTo`.
+                    aria-label={`zoom ${
+                      Math.round(zoom * 10) / 10
+                    } times — click to fit the whole figure`}
+                  >
+                    {Math.round(zoom * 10) / 10}×
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setZoomTo(zoom * 2)}
+                    disabled={zoom >= ZOOM_MAX}
+                    title="zoom in — hold Space and drag to pan (+)"
+                    aria-label="zoom in"
+                  >
+                    +
+                  </button>
+                </span>
+              </div>
+
               {/* Commit rides ON the plate, opposite the tool flag.
                   It used to sit in the tool strip, and from there it was a
                   control that ARRIVED: a standing candidate pushed the strip to
@@ -7466,81 +8991,139 @@ export default function DrawPage() {
               )}
             </div>
 
-            {/* THE BASELINE: what is true of the drawing, and what is true of
-                its symmetry, side by side under the artwork.
+            {/* THE BAND UNDER THE PLATE — the timeline at the top of it, then
+                the two readings.
 
-                The status used to be the top row of the plate rule and the
-                legend the strip under the canvas, and the reviewer's note was
-                simply that they are the same kind of sentence and were being
-                read in two different places. They are one band now — one row on
-                a desktop, two on a phone.
+                WHAT THE OWNER CALLED THE BOTTOM TOOLBAR. Measured rather than
+                assumed: the only band under the canvas is `.baseline`, and it
+                holds no control at all — it is what is true of the DRAWING on
+                the left and what is true of its SYMMETRY on the right, two
+                readings and a hairline. So "toolbar" names where it is rather
+                than what is in it, and the timeline is now the first thing in
+                that band that can be pressed. Everything below it on the page —
+                the key lines, the footnote — is prose about the program rather
+                than furniture of it, so there was no other candidate.
 
-                One ROW is not one LINE, and the difference is measured: at
-                1512 the plate is 766px wide and these two readings come to
-                about 1330px of small caps between them. The legend alone
-                already wrapped to two lines there. So the band is two COLUMNS
-                that each wrap inside their own, divided by a hairline —
-                genuinely beside each other, which is what was asked, without
-                ellipsising a fact to prove it. */}
-            <div className={styles.baseline}>
-              <div className={styles.readout}>
-                <span>
-                  {viewMode === "sector" ? `sector ${sector}` : "hexagon"} · d
-                  {depth} · <b>{total} cells</b>
-                  {viewMode === "sector" && <> of {modelTotal}</>}
-                </span>
-                <span>
-                  brush <b>{mode}-fold</b>
-                  {band !== null && (
-                    <>
-                      {" "}
-                      · band <b>{band}</b>
-                    </>
-                  )}{" "}
-                  ·{" "}
-                  {reach === null ? (
-                    <b>
-                      {dragMode === "propose"
-                        ? "drag to gather"
-                        : "hover to preview"}
-                    </b>
-                  ) : (
-                    <b>reach {reach}</b>
-                  )}
-                </span>
-                <span>
-                  {schemeName} · <b>{paint.size} painted</b>
-                </span>
-              </div>
+                THE TOP OF IT is the seam, not the strip, because the seam is the
+                edge the strip comes out of and the seam is what must not move
+                when it is pressed. `Timeline`'s header argues that and
+                `.timelineSeam` measures it.
 
-              <div className={styles.legend}>
-              {legend.length === 0 ? (
-                <span className={styles.legendItem}>
-                  trivial subgroup · no axis, no rotation
-                </span>
-              ) : (
-                legend.map((l) => (
-                  <span key={l.key} className={styles.legendItem}>
-                    {l.dot ? (
-                      <span
-                        className={styles.legendDot}
-                        style={{ borderColor: l.colour }}
-                        aria-hidden="true"
-                      />
-                    ) : (
-                      <span
-                        className={styles.legendSwatch}
-                        style={{
-                          borderTopColor: l.colour,
-                          borderTopStyle: l.dashed ? "dashed" : "solid",
-                        }}
-                        aria-hidden="true"
-                      />
-                    )}
-                    {l.label}
+                THE READINGS ARE UNTOUCHED but they are not where they were.
+                `.baseline` is the same two columns at the same widths with the
+                same wrapping, and the hairline that used to be its own
+                `border-top` is now drawn by the seam row above it — but that row
+                is 24px where the border was 1px, so MEASURED at 1512 with the
+                strip folded away the readings sit 23px lower than before. That
+                is the price of the seam and it is paid whether the strip is open
+                or shut; `.baseBar` records it. */}
+            <div className={styles.baseBar}>
+              <Timeline
+                view={{
+                  steps: playFresh ? playSteps : null,
+                  at: playAt,
+                  // THE RESOLVED span, not the stored one. The strip draws
+                  // positions on a rail and `spanSaid` counts steps, so both want
+                  // the index space; the NAMES are the page's storage and never
+                  // leave it. `playCut` is the one place they are resolved.
+                  span: playCut.span,
+                  lost: lostSaid(playCut.lost),
+                  acts: steps,
+                  frame: playFresh && playAt !== null ? rewind?.beats[playAt] ?? null : null,
+                  colour: effectiveBase.hex,
+                  mergeFrames:
+                    rewind === null
+                      ? null
+                      : rangeOfSpan(rewind.beats, playCut.span)?.count ?? null,
+                  undoNext,
+                  onOpen: standPlayhead,
+                  onSeek: seekPlayhead,
+                  onMarkIn: () => setMark("in"),
+                  onMarkOut: () => setMark("out"),
+                  onClearMarks: clearMarks,
+                  onRewrite: rewriteFrame,
+                  onMerge: mergeMarked,
+                }}
+                open={timelineOpen}
+                onToggle={toggleTimeline}
+              />
+
+              {/* THE BASELINE: what is true of the drawing, and what is true of
+                  its symmetry, side by side under the artwork.
+
+                  The status used to be the top row of the plate rule and the
+                  legend the strip under the canvas, and the reviewer's note was
+                  simply that they are the same kind of sentence and were being
+                  read in two different places. They are one band now — one row
+                  on a desktop, two on a phone.
+
+                  One ROW is not one LINE, and the difference is measured: at
+                  1512 the plate is 766px wide and these two readings come to
+                  about 1330px of small caps between them. The legend alone
+                  already wrapped to two lines there. So the band is two COLUMNS
+                  that each wrap inside their own, divided by a hairline —
+                  genuinely beside each other, which is what was asked, without
+                  ellipsising a fact to prove it. */}
+              <div className={styles.baseline}>
+                <div className={styles.readout}>
+                  <span>
+                    {viewMode === "sector" ? `sector ${sector}` : "hexagon"} · d
+                    {depth} · <b>{total} cells</b>
+                    {viewMode === "sector" && <> of {modelTotal}</>}
                   </span>
-                ))
-              )}
+                  <span>
+                    brush <b>{mode}-fold</b>
+                    {band !== null && (
+                      <>
+                        {" "}
+                        · band <b>{band}</b>
+                      </>
+                    )}{" "}
+                    ·{" "}
+                    {reach === null ? (
+                      <b>
+                        {dragMode === "propose"
+                          ? "drag to gather"
+                          : "hover to preview"}
+                      </b>
+                    ) : (
+                      <b>reach {reach}</b>
+                    )}
+                  </span>
+                  <span>
+                    {schemeName} · <b>{paint.size} painted</b>
+                  </span>
+                </div>
+
+                <div className={styles.legend}>
+                {legend.length === 0 ? (
+                  <span className={styles.legendItem}>
+                    trivial subgroup · no axis, no rotation
+                  </span>
+                ) : (
+                  legend.map((l) => (
+                    <span key={l.key} className={styles.legendItem}>
+                      {l.dot ? (
+                        <span
+                          className={styles.legendDot}
+                          style={{ borderColor: l.colour }}
+                          aria-hidden="true"
+                        />
+                      ) : (
+                        <span
+                          className={styles.legendSwatch}
+                          style={{
+                            borderTopColor: l.colour,
+                            borderTopStyle: l.dashed ? "dashed" : "solid",
+                          }}
+                          aria-hidden="true"
+                        />
+                      )}
+                      {l.label}
+                    </span>
+                  ))
+                )}
+                </div>
               </div>
             </div>
           </div>

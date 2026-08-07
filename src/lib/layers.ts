@@ -48,13 +48,118 @@
  * situation: you paste something ONTO a layer, and what you dropped is on top of
  * what was there.
  *
- * NO BLENDING, and no per-layer opacity. Every colour in this program is
- * `#rrggbb` — `artfile.ts` will not accept anything else, `stampColours` never
- * produces anything else, and the adjustment brush works by reading the colour a
- * cell is DISPLAYING and transforming it. An alpha would make the flattened
- * board hold colours no scheme ever named, so the adjust tool would start
- * inventing hues, the exporter would have to write a fourth channel, and the
- * round trip promise would break. The stack occludes; it does not mix.
+ * NO BLENDING IN THE BOARD. ALPHA IS A DISPLAY PROPERTY AND NEVER A MODEL ONE.
+ *
+ * This paragraph used to refuse per-layer opacity outright. It was right about
+ * what it was defending and wrong about how far the defence reaches, so it is
+ * restated with the line drawn where the argument actually falls. Every clause
+ * of the old refusal was about `flatten` — the board — and none of it was about
+ * the RENDER, which had been compositing group opacity in the exported file
+ * since before the refusal was written (`emit.EmitLayer.opacity`).
+ *
+ * STILL FORBIDDEN, and the original words hold verbatim:
+ *
+ *   A COLOUR MAY NOT CARRY ALPHA. Every colour in this program is `#rrggbb` —
+ *   `artfile.ts` will not accept anything else (`HEX6`, at three separate
+ *   validation sites), `stampColours` never produces anything else, and
+ *   `schemes.swatchFromHex` reads exactly six digits. A fourth channel in the
+ *   plate is the "traditional way" and it was costed rather than waved away;
+ *   see the note below.
+ *
+ *   `flatten` MAY NOT MIX, and it does not read an alpha at all. The board it
+ *   returns is what the adjustment brush reads, and that brush transforms the
+ *   colour it finds. If flatten ever averaged two layers the brush would be
+ *   handed a colour no scheme ever named and would hand back another one — the
+ *   exact failure the old refusal existed to prevent. So the composite stays an
+ *   OCCLUSION: every value it returns is a value some layer's plate holds,
+ *   verbatim. `test/layers.test.ts` asserts that closure over a faded stack
+ *   rather than trusting this sentence.
+ *
+ * NOW ALLOWED: a layer has an OWN ALPHA, in `Switches.opacity`, and it changes
+ * what the drawing LOOKS LIKE without changing what any layer HOLDS. `flatten`
+ * ignores it — including `opacity: 0`, which is deliberately NOT a second
+ * spelling of hidden — so the board is bit-for-bit the board it was before this
+ * existed and the adjust tool is untouched.
+ *
+ * THIS USED TO CLAIM "Both renderers show it the same way, because it is the same
+ * mechanism", AND THEY DID NOT. The mechanism was the same and what sat UNDER it
+ * was not: `DrawBoard`'s `TileLayer` draws a background tile for every shown cell
+ * unconditionally, while `emit.serialise` wrote one only for cells the stack did
+ * not cover — and it asked `flatten`, which by the paragraph above cannot see an
+ * alpha. So a faded cell composited onto the tile on screen and onto the page
+ * behind it in the file. Measured on a depth-1 hexagon, one painted cell: 23
+ * tiles written where the board draws 24, ≈`#702a22` on screen against ≈`#652119`
+ * in the exported file. `emit.opaquelyCovered` is the fix and carries the
+ * argument; both renderers now genuinely agree, and there is a check on it rather
+ * than a sentence.
+ *
+ * A SECOND CLAIM ON THE SAME LINE WAS ALSO WRONG and is fixed rather than
+ * restated: "an SVG group opacity" is what `emit.emitLayers` wrote, as a
+ * presentation attribute, on the very element the animation stylesheet targets
+ * with `opacity` — so on any animated document the alpha was overridden to the
+ * keyframe's value and lost. It is `fill-opacity` now, for the reason
+ * `DrawBoard`'s dim scrim already gives.
+ *
+ * AND A THIRD THING TO KNOW BEFORE BELIEVING ANY OF IT: nothing in this program
+ * WRITES a layer alpha. `setOpacity` and `opacityOf` below have no caller in
+ * `src/`, and the panel renders lock and eye and no alpha control, so the only
+ * way one enters a `Composition` is `composer.stackFromEmit` — an import. See
+ * `setOpacity`.
+ *
+ * WHAT "THE COLOUR A CELL IS DISPLAYING" NOW MEANS, since the old sentence
+ * above said exactly that and alpha makes it false: the brush reads the MODEL
+ * BOARD — the colour the topmost SHOWN layer HOLDS — which under a fade is no
+ * longer literally the colour on the screen. That is the correct half to keep.
+ * Reading the screen instead would mean reading a mixed colour, which is the
+ * refusal above; and the drawing's colour relationships, which is what an
+ * adjustment exists to preserve, are relationships between the colours the
+ * layers hold and not between their faded appearances. A fade is a viewing
+ * condition, and no drawing program repaints when you dim the lights.
+ *
+ * THE ONE THING TO KNOW BEFORE MOVING ALPHA ANYWHERE ELSE, measured in Chromium
+ * rather than reasoned about, because the cheap implementation is wrong and
+ * looks right: a group's opacity applies to the group's COMPOSITED result, not
+ * to each element in it. Parent gold and child red on the same cell inside one
+ * `opacity="0.5"` group sample (255,128,128) — red at a half over white, the
+ * gold entirely hidden. The same two layers written FLAT with their alphas
+ * multiplied out sample (255,115,64) — red over gold over white. Disjoint
+ * cells do multiply exactly (0.5 × 0.5 read back as red at 0.25). So a faded
+ * stack may only be drawn as the NESTED tree it is; flattening it to a list of
+ * pre-multiplied strata silently changes the picture wherever a layer and its
+ * own child touch the same cell. `strata` returns the tree for that reason.
+ *
+ * WHAT A COLOUR ALPHA WOULD HAVE COST — item 2 of the brief, priced and
+ * SHELVED rather than attempted. `#rrggbbaa` in a plate reaches: `artfile.HEX6`
+ * ×3 and its `#rgb` widening; `plate.resolvePlate`, whose conflict rule
+ * compares colour strings; `schemes.swatchFromHex` and every `Swatch` in
+ * `adjust.ts`, which has no alpha channel to carry; `brush.stampColours`;
+ * `gif.ts`, which must quantise to a 256-entry palette with one transparent
+ * index; `emit.colourSafe` and the per-colour CSS class table. And it lands
+ * alpha in `flatten`, which is the one place this file forbids it — the adjust
+ * brush would read a translucent colour and either drop the channel or invent
+ * one. Per-LAYER alpha buys most of what a person asks for here and costs a
+ * field; per-COLOUR alpha costs the round trip promise. Not done.
+ *
+ * AND WHAT AN ALPHA MASK WOULD HAVE COST — item 3, also SHELVED, and shelved
+ * for a different reason worth writing down because the cheap half of it is
+ * genuinely cheap. SVG's `<mask>` takes its alpha from LUMINANCE, so a mask
+ * layer is an ordinary layer painted in GREYS: `#808080` is a perfectly legal
+ * `#rrggbb`, no new colour type is needed anywhere, and the renderer does the
+ * multiply. That part falls out.
+ *
+ * WHAT DOES NOT is the model. "A layer whose alpha modulates another" is a
+ * REFERENCE FROM ONE LAYER TO ANOTHER, and this document is a TREE — that is
+ * the invariant every function in this file is written against. One edge
+ * between siblings makes it a graph, and every structural operation then has to
+ * answer a question it does not have today: `reid` must re-key the reference,
+ * and a subtree pasted away from its mask source has NO correct answer; a
+ * delete leaves it dangling; undo must put it back; `artfile.ts` must validate
+ * that it names a layer that exists and is not a cycle, exactly as
+ * `emit.revealBreak` has to for reveal order; `emit.ts` must write a `<mask>`
+ * into `<defs>` and decide whether the mask layer also draws itself; `parse`
+ * must read it back. Per-layer alpha is one optional field on a map that four
+ * functions already carry. A mask is a second addressing system. It is the
+ * right feature to want and the wrong one to bolt on.
  *
  * LOCKED LAYERS STILL COMPOSITE. Lock is an EDIT guard and has nothing to do
  * with display — `flatten` does not read it. Hiding is the display switch, and
@@ -399,16 +504,59 @@ export interface LayerGesture {
  * carry and the claim is true by construction rather than by a restore step.
  *
  * The inherited answers are `Effective`, and they are never stored anywhere.
+ *
+ * ── WHY THE ALPHA IS HERE AND NOT ON THE `Layer` ────────────────────────
+ *
+ * DEVIATION, flagged rather than quietly taken: the brief for this work said
+ * "`Layer` gains `opacity`". It does not, and the reason is the rule this file
+ * already states two sections down —
+ *
+ *   A FIELD MAY SIT ON `Layer` IFF IT IS NEVER MUTATED, OR IS MUTATED ONLY BY A
+ *   JOURNALLED `Move`.
+ *
+ * An alpha is a dial a person drags, and it is NOT journalled, on the identical
+ * argument `visible` and `locked` win: dragging it destroys nothing, its inverse
+ * is the same control, and the control is on screen showing its own state.
+ * Mutable and unjournalled is precisely the pair that made the switches a bug —
+ * a `place` rung freezes `node: Layer`, so undoing an unrelated reorder writes
+ * the frozen alpha back over the one the person just set. On the `Layer` that
+ * failure is reachable in four keystrokes: reorder, fade, undo, and the fade is
+ * gone with no rung of its own to blame. `test/layers.test.ts` runs exactly
+ * that sequence.
+ *
+ * It rides in the map the switches already use rather than a second map beside
+ * it, because that map is already re-keyed by `reid`, collected by
+ * `switchesIn`, taken by `pasteInto` as `from` and returned by
+ * `composer.stackFromEmit` — four doors that are already open, against four
+ * more to forget. The type is still named `Switches` after its first two
+ * fields; a dial is not a switch, and renaming it would touch two files this
+ * work does not own.
  */
 export interface Switches {
   readonly visible: boolean;
   readonly locked: boolean;
+  /**
+   * OWN alpha in `0…1`. ABSENT MEANS 1, and 1 is never stored.
+   *
+   * DISPLAY ONLY: `flatten` never reads it, so the board keeps exactly the
+   * colours a scheme named. `emit.EmitLayer.opacity` is the same number and the
+   * same rule — the layer's own, never the inherited product — and SVG does the
+   * multiplying down the tree. See the header.
+   *
+   * Optional rather than required so that `{ visible, locked }` written before
+   * this existed still states a whole `Switches`, in this file's tests and in
+   * two files it does not own.
+   */
+  readonly opacity?: number;
 }
 
-/** Shown and unlocked: what a layer with no entry in `switches` is. */
+/** Shown, unlocked and fully opaque: what a layer with no entry in `switches` is. */
 export const OPEN: Switches = { visible: true, locked: false };
 
-const isOpen = (s: Switches): boolean => s.visible && !s.locked;
+/** The alpha of a `Switches`, with absent read as the 1 it means. */
+export const alphaOf = (s: Switches): number => s.opacity ?? 1;
+
+const isOpen = (s: Switches): boolean => s.visible && !s.locked && alphaOf(s) === 1;
 
 /**
  * An ordered list of layers, BOTTOM FIRST.
@@ -823,6 +971,20 @@ const FLAT = new WeakMap<
  * skipped; locked ones are not, because lock is an edit guard (see the header).
  * The returned map is the CACHED one and must not be mutated.
  *
+ * ALPHA IS NOT READ HERE, AT ALL. This is the MODEL board — what the layers
+ * hold — and it is what the adjustment brush transforms, what the legacy
+ * payload plate is written from and what the canvas draws whenever nothing is
+ * faded. A fade changes the picture and not the paint, so a document that is
+ * faded from end to end returns exactly the board it returned before anybody
+ * touched a slider. `opacity: 0` is included in that and is deliberately not a
+ * second spelling of `visible: false`: two representations of one state is the
+ * bug this file spends four sections avoiding. `strata` is where the fades are.
+ *
+ * The FADED picture is therefore NOT a function of this map — see `strata` —
+ * and that is a property rather than a gap: `flatten` returning only colours
+ * that some layer holds verbatim is what keeps the adjust brush from inventing
+ * hues, and it is asserted in `test/layers.test.ts` over a faded stack.
+ *
  * ── What it costs, MEASURED ─────────────────────────────────────────────
  *
  * `test/layers.test.ts` measures this at depth 5 — 6144 cells — for stacks that
@@ -947,6 +1109,117 @@ export function flattenAddresses(
   for (const [i, hex] of flatten(comp, book)) out.set(book.addr[i], hex);
   return out;
 }
+
+/**
+ * ONE LAYER AS THE CANVAS HAS TO DRAW IT when something in the stack is faded:
+ * its own alpha, its own paint, and its children over the top.
+ *
+ * A TREE AND NOT A LIST, and that is the whole reason this type exists rather
+ * than a `{ opacity, paint }[]` with the alphas multiplied out. Measured in
+ * Chromium: a group's opacity applies to the group's COMPOSITED contents, so a
+ * parent painting a cell gold and its child painting the same cell red inside
+ * one `opacity="0.5"` group sample (255,128,128) — the gold is entirely hidden
+ * — while the pre-multiplied flat form of the same two layers samples
+ * (255,115,64). The flat form is not an optimisation of the nested one; it is a
+ * different picture. Disjoint cells DO multiply exactly, which is what makes
+ * the nested form safe: `emit.ts` writes this same nesting and the browser does
+ * the arithmetic. See the header.
+ *
+ * `paint` is this layer's OWN paint at the book's depth — never the composite —
+ * on the same rule every other per-layer statement in this program follows.
+ */
+export interface Stratum {
+  readonly id: LayerId;
+  /** OWN alpha in `0…1`. `1` for a layer nobody faded. Never the product. */
+  readonly opacity: number;
+  /** This layer's own resolved paint. Empty when it holds none of its own. */
+  readonly paint: ReadonlyMap<number, string>;
+  /** Sub-layers, in paint order: later children sit over earlier ones. */
+  readonly children: readonly Stratum[];
+}
+
+/**
+ * The STRATA cache, keyed exactly as `FLAT` is. See that map for the argument.
+ *
+ * The inner value can legitimately be `null`, so this asks `has` rather than
+ * testing the value — a document with nothing faded is a cache HIT that answers
+ * "use the flat board", and re-deciding it on every pointer move is the cost
+ * the whole board component is arranged to avoid.
+ */
+const STRATA = new WeakMap<
+  Stack,
+  WeakMap<ReadonlyMap<LayerId, Switches>, Map<string, readonly Stratum[] | null>>
+>();
+
+/**
+ * The shown stack as the nested groups a faded document has to be drawn as, or
+ * `null` when nothing in it is faded.
+ *
+ * `null` IS THE ORDINARY ANSWER and it is load bearing: a document with no
+ * alpha anywhere returns it, the caller keeps drawing the flat `flatten` board
+ * it always drew, and the render is element-for-element the render it was
+ * before this existed. Byte-identity for opaque documents is therefore
+ * structural rather than a thing to keep checking — there is one code path and
+ * it is the old one.
+ *
+ * Hidden layers and their subtrees are dropped, on `composite`'s rule. A node
+ * that ends up with neither paint nor children is dropped too, because an empty
+ * `<g>` is a fact about the model and not about the picture.
+ *
+ * ── What the faded path costs, and why it is only paid when faded ───────
+ *
+ * NO OCCLUSION CULLING IS POSSIBLE HERE, which is the real price. `composite`
+ * stops the moment every cell is decided — a full wash near the top of the
+ * stack cuts off everything under it, worth a measured factor of 15 — and a
+ * fade is precisely the statement that the layers underneath still show. So
+ * this resolves and draws every shown layer's plate: one element per painted
+ * cell per layer instead of one per decided cell. `test/layers.test.ts`
+ * measures it beside `flatten` at depth 5.
+ *
+ * That is the honest cost of the feature and it is confined to documents that
+ * asked for it, which is the entire reason `null` is a possible answer.
+ */
+export function strata(
+  comp: Composition,
+  book: AddressBook
+): readonly Stratum[] | null {
+  let perSwitches = STRATA.get(comp.layers);
+  if (perSwitches === undefined) {
+    perSwitches = new WeakMap();
+    STRATA.set(comp.layers, perSwitches);
+  }
+  let perBook = perSwitches.get(comp.switches);
+  if (perBook === undefined) {
+    perBook = new Map();
+    perSwitches.set(comp.switches, perBook);
+  }
+  if (perBook.has(book.id)) return perBook.get(book.id) as readonly Stratum[] | null;
+  let faded = false;
+  const of = (stack: Stack): readonly Stratum[] => {
+    const out: Stratum[] = [];
+    for (const layer of stack) {
+      const own = comp.switches.get(layer.id) ?? OPEN;
+      if (!own.visible) continue;
+      const opacity = alphaOf(own);
+      const children = of(layer.children);
+      const paint =
+        layer.plate.size === 0 ? EMPTY_PAINT : resolvePlate(layer.plate, book);
+      // Dropped BEFORE the fade is counted, not after: a fade on a layer that
+      // draws nothing is not a fade the picture can show, and counting it would
+      // send the board down the expensive path to render the identical image.
+      if (paint.size === 0 && children.length === 0) continue;
+      if (opacity !== 1) faded = true;
+      out.push({ id: layer.id, opacity, paint, children });
+    }
+    return out;
+  };
+  const built = of(comp.layers);
+  const answer = faded ? built : null;
+  perBook.set(book.id, answer);
+  return answer;
+}
+
+const EMPTY_PAINT: ReadonlyMap<number, string> = new Map();
 
 /**
  * The one layer this document is, or `null` when it is more than one.
@@ -1362,7 +1635,24 @@ export type Refusal =
   | "into-itself"
   | "unknown-layer"
   | "blank-name"
-  | "too-deep";
+  | "too-deep"
+  /**
+   * A FAULT IN THIS PROGRAM, not a fact about the drawing — and it is a member of
+   * this union precisely so it cannot be reported as one of the others.
+   *
+   * Every entry above says something about what the person did or about the state
+   * they did it in, and a caller may aggregate them, phrase them, or act on them
+   * on that basis. `frames.rewriteFrames` used to catch EVERY throw out of a
+   * replay and label it `"unknown-layer"`, so a `TypeError` from a defect in
+   * `applyMove` reached the person as a claim about their journal. Same value,
+   * two utterly different facts, and no way to tell them apart afterwards.
+   *
+   * A refusal and not a rethrow, because the alternative at the one site that
+   * produces it is a dead click in the middle of an edit. The drawing is untouched
+   * either way — `rewriteFrames` is atomic by construction — so what is left to
+   * choose is only what the person is told, and "this is ours" is the true answer.
+   */
+  | "defect";
 
 export interface Refused {
   readonly ok: false;
@@ -1796,7 +2086,76 @@ export function setLocked(
 }
 
 /**
- * Both switches at once. THE ONLY WRITER of `Composition.switches`.
+ * The file's own quantum for an alpha: three decimals.
+ *
+ * `emit.fmtAlpha` rounds to exactly this before writing `opacity="…"`, so a
+ * model that held more digits than this would state one number in the payload
+ * and a different one in the markup of the same file. Canonicalising HERE, at
+ * the one writer, means the model, the markup and the payload agree by
+ * construction — and that a slider's `0.1 + 0.2` cannot put nineteen digits of
+ * float noise into a file. 1/1000 of alpha is a quarter of one 8-bit level; no
+ * screen can show the difference this discards.
+ */
+export const ALPHA_STEP = 1000;
+
+/**
+ * An alpha as the model will hold it: clamped to `0…1` and rounded to the
+ * file's quantum. Anything not a number reads as fully opaque.
+ *
+ * TOTAL RATHER THAN REFUSING, unlike the outcome-returning controls in this
+ * file, because there is no gesture a person can make that means "an alpha of
+ * 4" — a slider cannot produce one, and a clipboard that carries one is a file
+ * `artfile.ts` has already refused. The one caller that can hand this something
+ * arbitrary is `composer.stackFromEmit` reading a foreign `EmitLayer`, and a
+ * clamp there is the difference between a strange fade and an SVG attribute
+ * that reads `opacity="42"`.
+ */
+export function canonicalAlpha(a: number): number {
+  if (!Number.isFinite(a)) return 1;
+  const clamped = a < 0 ? 0 : a > 1 ? 1 : a;
+  return Math.round(clamped * ALPHA_STEP) / ALPHA_STEP;
+}
+
+/**
+ * Set a layer's OWN alpha. Not journalled; see `Switches` for why it is here
+ * and not on the `Layer`, and the header for why `flatten` never reads it.
+ *
+ * `1` clears the entry rather than storing it, which is `setSwitches`'s
+ * canonical rule and is what keeps a document that was faded and un-faded
+ * byte-identical to one that never was.
+ *
+ * ── IT HAS NO CALLER, AND THAT IS RECORDED RATHER THAN LEFT TO BE FOUND ──
+ *
+ * Nothing in `src/` calls this or `opacityOf`. `LayersPanel` renders an eye and a
+ * padlock and no alpha control, so the one path that puts an alpha into a
+ * `Composition` is `composer.stackFromEmit` — an import. The consequence for a
+ * person: a fade that arrives in a file is permanent and cannot be cleared.
+ *
+ * The model half is finished and correct — the switch, the canonicalisation, the
+ * inheritance, the export, the round trip — and it is the CONTROL that is
+ * missing. That is a deliberate stop rather than an oversight to fix in passing:
+ * a per-row slider is a decision about the densest surface in this program (see
+ * `Timeline`'s header on what fits at 390px), and guessing at it here would be
+ * the kind of unasked-for design this codebase declines elsewhere.
+ *
+ * Kept rather than deleted for the same reason `nested.ts`'s functions were kept
+ * before `page.tsx` reached them: the model is the part that is hard to get
+ * right, it is tested, and deleting it would mean writing it again.
+ */
+export function setOpacity(
+  comp: Composition,
+  id: LayerId,
+  opacity: number
+): Composition {
+  return setSwitches(comp, id, { ...switchesOf(comp, id), opacity });
+}
+
+/** A layer's OWN alpha, with no entry and no key both reading as 1. */
+export const opacityOf = (comp: Composition, id: LayerId): number =>
+  alphaOf(switchesOf(comp, id));
+
+/**
+ * Every switch and the dial at once. THE ONLY WRITER of `Composition.switches`.
  *
  * Refuses an id the document does not hold, so the map cannot grow entries for
  * layers that were never here — the leak it is allowed is the one described on
@@ -1808,6 +2167,13 @@ export function setLocked(
  * therefore have equal maps, and a file written from either matches byte for
  * byte. Returns the same object when nothing moved, which is what keeps the
  * flatten cache warm through a no-op toggle.
+ *
+ * THE ALPHA IS CANONICALISED BEFORE IT IS COMPARED, not after, which is what
+ * makes the no-op test above still exact: a slider that hands over 0.4999996
+ * and one that hands over 0.5 are asking for the same document, so the second
+ * of them must return the same object and not a new one that re-renders the
+ * board. And a stored entry writes the key only when the alpha is not 1, so
+ * "faded" is a shape a reader can test for rather than a number to compare.
  */
 export function setSwitches(
   comp: Composition,
@@ -1816,10 +2182,22 @@ export function setSwitches(
 ): Composition {
   if (find(comp, id) === null) return comp;
   const now = switchesOf(comp, id);
-  if (now.visible === want.visible && now.locked === want.locked) return comp;
+  const alpha = canonicalAlpha(alphaOf(want));
+  if (
+    now.visible === want.visible &&
+    now.locked === want.locked &&
+    alphaOf(now) === alpha
+  ) {
+    return comp;
+  }
   const switches = new Map(comp.switches);
-  if (isOpen(want)) switches.delete(id);
-  else switches.set(id, { visible: want.visible, locked: want.locked });
+  const next: Switches = {
+    visible: want.visible,
+    locked: want.locked,
+    ...(alpha === 1 ? {} : { opacity: alpha }),
+  };
+  if (isOpen(next)) switches.delete(id);
+  else switches.set(id, next);
   return { ...comp, switches };
 }
 

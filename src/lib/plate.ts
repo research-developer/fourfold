@@ -18,6 +18,33 @@
  * word, an ancestor is a prefix, and both are exact. There is no tolerance here
  * to get wrong.
  *
+ * ── TWO RADICES, ONE ALPHABET, AND WHY NOTHING ABOVE CHANGES ─────────────
+ *
+ * The word above is no longer over `{A,B,C,X}` alone: `A B C X` are the four
+ * rep-4 cuts and `a b c u v w x y z` are the nine rep-9 cuts, and the two sets
+ * are DISJOINT. That single fact is what keeps every sentence in this header
+ * true under mixed radix, and it is worth spelling out which sentence rests on
+ * which part of it:
+ *
+ *   ONE CHARACTER PER CUT, in both alphabets. `ancestorAt` truncates by
+ *   character count, so "the ancestor k cuts down" is `slice(0, stem + k)`. A
+ *   two-character rep-9 letter would land that slice mid-letter and prefix-
+ *   equals-ancestry would fail on the first mixed address.
+ *
+ *   THE LETTER STATES ITS OWN RADIX, so `scale.scaleOfWord` reads a scale off a
+ *   word with no tree in hand and `buildView`'s resolution comparison keeps
+ *   meaning what it meant. `docs/rep-tile-findings.md` Q2 names this as the
+ *   condition the plate rests on; the alphabet is how it is met, and no radix
+ *   field is carried anywhere.
+ *
+ *   `s` AND `:` ARE STILL OUTSIDE IT. The rep-9 letters are `a`–`c` and `u`–`z`,
+ *   so the sector tag argument below survives thirteen letters unchanged.
+ *
+ * WHAT IS GENUINELY NEW is in the WRITE path, not the read path: a node's
+ * siblings are the letters of the cut that made it, and under two radices there
+ * are two answers. `splitEdits` says where that is read from and why it cannot
+ * be read from the parent.
+ *
  * ── The address of a cell ────────────────────────────────────────────────
  *
  * On the TRIANGLE it is the cell's own `addr` — `"ABX"` — and nothing else.
@@ -87,11 +114,12 @@
 
 import type { Figure } from "./figure";
 import type { Hexagon } from "./hexagon";
-import type { ArtPayload } from "./artfile";
+import { REP4_LETTERS, lettersAt, type ArtPayload } from "./artfile";
 import type { CanvasKind } from "./orbit";
 import { type CellEdit, type EditDirection, applyEdits, mergeEdits } from "./strokes";
+import { radixAt, refines, scaleOfWord } from "./scale";
 
-/** A word over `{A,B,C,X}`, with a sector tag on the hexagon. */
+/** A word over the cut alphabet, with a sector tag on the hexagon. */
 export type Address = string;
 
 /** Address → `#rrggbb`. Absent means "nothing said here", NOT "unpainted". */
@@ -101,13 +129,21 @@ export type AddressPlate = ReadonlyMap<Address, string>;
 export type PlateEdit = CellEdit<Address>;
 
 /**
- * The four cuts, in the order `buildFigure` takes them.
+ * The four rep-4 cuts, in the order `buildFigure` takes them.
  *
- * Written out rather than derived from `DIGIT_CHARGE`'s keys: the split in
- * `erasePlan` needs the digits as a LIST with a stable order, and key order of
- * a record is a fact about how it was written rather than a promise it makes.
+ * A LIST with a stable order, because the split in `erasePlan` enumerates
+ * siblings and the edits it emits have to come out the same way twice. That is
+ * why it is not derived from `DIGIT_CHARGE`'s keys: key order of a record is a
+ * fact about how it was written rather than a promise it makes. A STRING does
+ * promise its order, so it is now read from `artfile.REP4_LETTERS` — the file
+ * format's own statement of the four characters — rather than restated here,
+ * which is the rule `artfile`'s `CANVASES` and `MODES_FOR` already follow.
+ *
+ * NO LONGER THE ONLY ANSWER to "what are this node's siblings". See
+ * `splitEdits`: under two radices that question is about a particular cut, and
+ * this is the answer for one of them.
  */
-export const DIGITS: readonly string[] = ["A", "B", "C", "X"] as const;
+export const DIGITS: readonly string[] = [...REP4_LETTERS];
 
 /** `s0:` … `s5:`. Fixed width, so the stem below is a constant. */
 export const sectorTag = (s: number): string => `s${s}:`;
@@ -132,6 +168,14 @@ export const STEM: Readonly<Record<CanvasKind, number>> = {
 export interface AddressBook {
   kind: CanvasKind;
   depth: number;
+  /**
+   * The canvas's resolution. `depth` is still the address LENGTH this book
+   * indexes, which is what `ancestorAt` truncates to; `scale` is what the
+   * resolution comparisons in `buildView` and in `provenance.ts` are asked
+   * against. Under one radix they determine each other; the two fields are
+   * separate because under two radices they would not.
+   */
+  scale: number;
   /** Cell index → address. */
   addr: readonly Address[];
   /** Address → cell index. */
@@ -160,7 +204,18 @@ export function addressBook(canvas: Figure | Hexagon): AddressBook {
     // cannot recover from.
     throw new Error(`plate: ${kind} depth ${canvas.depth} has duplicate addresses`);
   }
-  return { kind, depth: canvas.depth, addr, index, stem, id: `${kind}:${canvas.depth}` };
+  return {
+    kind,
+    depth: canvas.depth,
+    scale: canvas.scale,
+    addr,
+    index,
+    stem,
+    // The cache key stays (kind, depth) because it identifies the ADDRESS LIST,
+    // and the list is fixed by how many cuts were taken, not by how far they
+    // refined. Adding the scale would be a second name for the same book.
+    id: `${kind}:${canvas.depth}`,
+  };
 }
 
 /** The word part — the cuts, without the sector tag. */
@@ -189,6 +244,13 @@ export const covers = (a: Address, b: Address): boolean => b.startsWith(a);
 interface PlateView {
   resolved: Map<number, string>;
   below: Map<Address, Address[]>;
+  /**
+   * Painted addresses this book has no cell for, at any resolution.
+   *
+   * Built in the same sweep because it is a by-product of the bucketing rather
+   * than a second walk. See `buildView` and `strandedCount`.
+   */
+  stranded: number;
 }
 
 /**
@@ -227,12 +289,68 @@ function viewOf(plate: AddressPlate, book: AddressBook): PlateView {
 const CONFLICT = Symbol("conflict");
 
 function buildView(plate: AddressPlate, book: AddressBook): PlateView {
-  const { stem, depth, addr } = book;
+  const { stem, depth, scale, addr } = book;
 
   const below = new Map<Address, Address[]>();
   const agreed = new Map<Address, string | typeof CONFLICT>();
   for (const [a, hex] of plate) {
-    if (addressDepth(a, stem) <= depth) continue;
+    /**
+     * IS THIS ADDRESS COARSER THAN, OR AT, THE RENDER RESOLUTION?
+     *
+     * Asked as DIVISIBILITY of scale and no longer as `≤` on depth. At radix 4
+     * both scales are powers of two, so `scale(a) | scale(book)` and `depth(a) ≤
+     * depth(book)` are the same predicate on every pair this program can build —
+     * which is why the change is a no-op today and why it had to be written
+     * today. `docs/rep-tile-findings.md` MIX-C has leaves at scales 12, 18 and
+     * 27, all at depth 3: there `18 ≤ 27` is true and `18 | 27` is false, and
+     * `≤` would start quietly claiming one region contained another.
+     *
+     * THE THIRD ANSWER NOW ARRIVES, AND IT IS INERT — MEASURED, not designed.
+     * Divisibility is partial, so two scales can be INCOMPARABLE (12 and 27,
+     * neither refining the other), and with a second radix in the alphabet that
+     * is now reachable rather than hypothetical. This comment used to say the
+     * case could not arise and marked where a third branch would go. What
+     * measurement found is that the `else` already handles it correctly, for a
+     * reason worth writing down rather than a coincidence:
+     *
+     *   `ancestorAt` truncates by LEVEL COUNT, so the bucket key is the address's
+     *   own first `depth` letters. An address that genuinely refines a cell of
+     *   this book begins with that cell's word — one letter per cut, in either
+     *   alphabet — so it buckets under it exactly, whatever radices it used
+     *   further down. `s0:ABa` is scale 12 against a scale-4 book and lands under
+     *   `s0:AB`, which is right and is the whole point of mixed radix.
+     *
+     *   An address that DIVERGES — `s0:ab`, a rep-9 first cut where this canvas
+     *   cut rep-4 — buckets under a key no cell of this book has, so it
+     *   contributes to no cell's consensus and resolves nowhere. It is carried,
+     *   it is re-exported, and it is not drawn. That is the honest answer: there
+     *   is no cell of this canvas it is the paint of.
+     *
+     * The cost of inertness is stated where it bites: such an address is also
+     * not in any target's `below`, so a stroke that covers the region does not
+     * clear it. That is the "detail resurrects" case this module's header names,
+     * surviving across radices only.
+     *
+     * ── AND IT IS NOW ACTUALLY COUNTED, which is what this said before ─────
+     *
+     * This paragraph used to end "`test/rep9format.test.ts` pins the behaviour so
+     * it is a counted precondition and not a surprise", and that was two claims
+     * of which only the first was true. A vitest assertion pins a behaviour; it
+     * is not a count and it does not reach words. Every other decline in this
+     * program reaches `setAnnounce`; this one reached nothing — and it is
+     * reachable from a FILE, because `validatePlate` deliberately does not
+     * cross-check an address against the payload depth. So `s0:ab` is admitted
+     * into a rep-4 book, buckets under a key no cell has, resolves nowhere,
+     * survives a full-sector wash, and is re-exported forever, while
+     * `layers.census.addresses` counts it beside drawable paint and inflates the
+     * export sentence with phantoms.
+     *
+     * `stranded` below is the count, `strandedCount` is how a caller reads it,
+     * and `page.tsx` names it in the export and load sentences. Nothing about
+     * what is DRAWN changed — the inertness is still the honest answer — only
+     * that the drawing now says how much of itself it cannot draw.
+     */
+    if (refines(scaleOfWord(wordOf(a, stem)), scale)) continue;
     const parent = ancestorAt(a, stem, depth);
     const list = below.get(parent);
     if (list === undefined) below.set(parent, [a]);
@@ -265,7 +383,39 @@ function buildView(plate: AddressPlate, book: AddressBook): PlateView {
     if (consensus !== undefined && consensus !== CONFLICT) resolved.set(i, consensus);
   }
 
-  return { resolved, below };
+  /**
+   * THE PHANTOMS, counted off the buckets rather than by a second sweep.
+   *
+   * `below` is keyed by `ancestorAt(a, stem, depth)` — the address's own first
+   * `depth` letters — so a bucket whose key is a cell of this book holds paint
+   * that reaches that cell, and a bucket whose key is NOT is paint that reaches
+   * nothing. One pass over the buckets, and there are at most as many as there
+   * are painted addresses.
+   *
+   * ── Why the `continue`d addresses need no check, for THIS program ──────
+   *
+   * The branch above skips an address whose scale DIVIDES the book's, and those
+   * resolve through the ancestor walk rather than through a bucket — so they are
+   * not in `below` and are not counted here. That is complete for every book this
+   * program can build, and the reason is arithmetic rather than luck: a book is
+   * homogeneous (`buildHexagon` cuts rep-4 throughout, `buildRep9Figure` rep-9),
+   * so its scale is r^d, and a word whose scale divides r^d can only be a word of
+   * that same radix and no longer than d — which is a prefix of some cell of the
+   * book, because the words of length ≤ d in one alphabet enumerate exactly the
+   * book's cells and their ancestors.
+   *
+   * A MIXED-RADIX BOOK WOULD BREAK THAT and would need the check widened — a
+   * scale-12 book cut `a`,`A`,`B` admits the coarse address `s0:A`, whose scale 2
+   * divides 12 and which is a prefix of nothing. `docs/rep-tile-findings.md` is
+   * where such a book is described and nothing here can build one yet, so this is
+   * recorded as the follow-on rather than guessed at: an under-count in a case
+   * that cannot arise is better than a check whose behaviour nobody has measured.
+   */
+  const cells = new Set<Address>(addr);
+  let stranded = 0;
+  for (const [key, list] of below) if (!cells.has(key)) stranded += list.length;
+
+  return { resolved, below, stranded };
 }
 
 /**
@@ -280,6 +430,24 @@ export function resolvePlate(
   book: AddressBook
 ): ReadonlyMap<number, string> {
   return viewOf(plate, book).resolved;
+}
+
+/**
+ * How many painted addresses THIS BOOK CANNOT DRAW, at any resolution.
+ *
+ * Not an error and not a repair — see `buildView`, which argues at length that
+ * carrying such an address unchanged is the honest answer. This is the number
+ * that makes the honesty legible: an export sentence reporting "878 addresses"
+ * where three of them are phantoms is a sentence that overstates the drawing, and
+ * the person who painted at a resolution this canvas does not cut has no other
+ * way to find out.
+ *
+ * Free on the ordinary drawing: it is memoised with `resolvePlate` on the same
+ * (plate identity, book id) pair, and every plate a caller asks about has already
+ * been resolved for the board.
+ */
+export function strandedCount(plate: AddressPlate, book: AddressBook): number {
+  return viewOf(plate, book).stranded;
 }
 
 /** The painted addresses strictly below `a`, or an empty list. */
@@ -405,6 +573,34 @@ export function planPlateEdits(
  * A child that already carries paint of its own is SKIPPED: it was overriding
  * the ancestor before and must go on overriding it. That is the case where a
  * fine detail sits inside a coarse wash and the user erases beside it.
+ *
+ * ── THE ONE PLACE A SECOND RADIX CHANGES THE CODE AND NOT THE COMMENT ────
+ *
+ * "Every child hanging off that trie" was `DIGITS`, the four rep-4 cuts, and
+ * that is now a question with two answers. It is also the question a mixed
+ * alphabet makes genuinely hard, and it is worth being exact about why, because
+ * the obvious repair is wrong:
+ *
+ *   THE PARENT CANNOT ANSWER IT. A letter states the radix of its OWN cut, so an
+ *   address determines its own scale — that is the property everything here
+ *   rests on — but it says nothing about the cut BELOW it. `p + "A"` and
+ *   `p + "a"` are both admissible addresses, and they are not siblings: they are
+ *   the same corner of `p` divided two different ways, overlapping regions in two
+ *   different trees. Enumerating all thirteen letters would paint both, and the
+ *   rep-4 sibling would cover the hole the rep-9 path was cut to make.
+ *
+ *   THE HOLES ANSWER IT. A hole is an address in the tree that is actually on
+ *   screen, and the path from `anc` down to it names, one letter per level, the
+ *   cut that tree took at every level in between. So the radix of each on-path
+ *   node's cut is read off its own on-path child, and the siblings enumerated
+ *   are that cut's letters and no others. No book is needed, no figure, and no
+ *   new argument to this function.
+ *
+ * Two holes disagreeing at a level would be a node cut two ways at once. It is
+ * unreachable — the targets of a stroke come from one book, hence one tree — and
+ * it throws rather than picking one, on the same grounds as `addressBook`'s
+ * duplicate check: guessing would silently repaint overlapping regions, which is
+ * paint the user did not make on top of paint they did.
  */
 function splitEdits(
   plate: AddressPlate,
@@ -415,8 +611,19 @@ function splitEdits(
   const out: PlateEdit[] = [{ cell: anc, from: colour, to: null }];
 
   const onPath = new Set<Address>();
+  /** On-path node → the edge division of the cut immediately below it. */
+  const cutBelow = new Map<Address, number>();
   for (const h of holes) {
-    for (let n = anc.length + 1; n <= h.length; n++) onPath.add(h.slice(0, n));
+    for (let n = anc.length + 1; n <= h.length; n++) {
+      onPath.add(h.slice(0, n));
+      const parent = h.slice(0, n - 1);
+      const k = radixAt(h, n - 1);
+      const seen = cutBelow.get(parent);
+      if (seen === undefined) cutBelow.set(parent, k);
+      else if (seen !== k) {
+        throw new Error(`plate: ${parent} is cut ${seen} and ${k} in one stroke`);
+      }
+    }
   }
   // The holes are all at one depth, so a path node shorter than a hole is a
   // node whose children still have to be dealt with; a node as long as a hole IS
@@ -426,7 +633,28 @@ function splitEdits(
   for (const p of onPath) if (p.length < holeLength) parents.push(p);
 
   for (const p of parents) {
-    for (const g of DIGITS) {
+    /**
+     * Every parent here has an on-path child by construction — `anc` from the
+     * first level of the walk above, and the rest by the length test — so the cut
+     * below it is known.
+     *
+     * AND IF IT WERE NOT, THIS GOES QUIET, two lines below a deliberate throw.
+     * `cutBelow.get(p)` would be `undefined`, `lettersAt` answers the empty list
+     * for an edge division the alphabet does not spell — it says so at its own
+     * definition — and this parent would contribute NO repaint. The ancestor is
+     * deleted either way, so the outcome is paint silently lost from a region
+     * nobody erased. The conflicting-cut case a few lines up throws for a
+     * strictly smaller problem.
+     *
+     * Not converted to a throw here, and the reason is the precondition rather
+     * than the severity: `parents` is built in this function, from `onPath`, in
+     * this function, so the two cannot disagree without the loop above being
+     * wrong — and a throw guarding a local invariant against itself is a check
+     * that cannot fail, which this codebase counts as worse than none. What was
+     * missing was the sentence, and this is it: if `splitEdits` is ever handed
+     * its path set from outside, this is the line that needs the guard.
+     */
+    for (const g of lettersAt(cutBelow.get(p) as number)) {
       const child = p + g;
       if (onPath.has(child) || plate.has(child)) continue;
       out.push({ cell: child, from: null, to: colour });
@@ -515,9 +743,19 @@ export function plateEntries(
   plate: AddressPlate,
   book: AddressBook
 ): [Address, string][] | undefined {
+  // "At the exported resolution" is an equality of SCALE, not of depth. The two
+  // agree at radix 4 and this decides whether the `plate` field is written at
+  // all, so `test/byteidentity.test.ts`'s pins are the check that they agreed.
+  //
+  // They stop agreeing the moment an address uses a rep-9 letter — `s0:ABa` is
+  // three cuts and scale 12, where three rep-4 cuts are scale 8 — and the SCALE
+  // reading is the one that is right: an address at a different scale from the
+  // book is exactly an address `cells` cannot state, which is what this field
+  // exists to carry. A length comparison would have called those equal and
+  // dropped the field, losing the paint.
   let offDepth = false;
   for (const a of plate.keys()) {
-    if (addressDepth(a, book.stem) !== book.depth) {
+    if (scaleOfWord(wordOf(a, book.stem)) !== book.scale) {
       offDepth = true;
       break;
     }
@@ -535,6 +773,20 @@ export function plateEntries(
  * here; a plate that has been zoomed and detailed has several, and the erase
  * split adds shallow entries the user never explicitly made. Both are correct
  * and neither is worth an invariant.
+ *
+ * STILL KEYED BY DEPTH, deliberately, and it is the one buffer left that way.
+ * `docs/rep-tile-findings.md` names a depth-keyed buffer as the thing that goes
+ * wrong under mixed radix — MIX-C's 354 leaves would all land in one bucket — so
+ * this map's KEYS are what would have to become scales. Rekeying it is a visible
+ * change to what the function returns, which the depth→scale refactor was not
+ * allowed to make.
+ *
+ * THE HAZARD IS NO LONGER HYPOTHETICAL. With a second radix in the alphabet a
+ * plate really can hold `s0:ABC` and `s0:abc` — three cuts each, scale 8 and
+ * scale 27 — and this function reports them as one bucket of two at depth 3.
+ * That is a true statement about the number of CUTS, which is what the name
+ * says, and a useless one about resolution. Nothing here reads it for a
+ * resolution today. Recorded as the follow-on, and now with a witness.
  */
 export function depthCensus(
   plate: AddressPlate,

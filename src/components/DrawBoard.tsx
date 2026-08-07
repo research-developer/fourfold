@@ -435,6 +435,28 @@ interface Props {
   /** `null` when the relief is off, which is also the exported-file default. */
   relief: ReliefView | null;
   paint: PaintMap;
+  /**
+   * The stack as nested groups, when a layer in it is faded. `null` — and
+   * absent, which is what every caller that has no layer alpha passes — draws
+   * `paint` exactly as this board always drew it.
+   *
+   * TWO PATHS AND NOT ONE, deliberately. `paint` is the flattened board: one
+   * element per decided cell, which is what makes a depth-5 drawing 6144
+   * polygons instead of 6144 × N. A fade means the layers underneath show
+   * through, so there is no flat map that states it, and the faded path costs
+   * one element per painted cell per layer. `layers.strata` answers `null`
+   * whenever nothing is faded, so a document that has never touched an alpha
+   * renders through the identical code it did before per-layer alpha existed —
+   * and the two paths cannot disagree about an opaque document because only one
+   * of them ever runs for it.
+   *
+   * When it is non-null the flat `paint` is NOT drawn as well; that would be
+   * the same cells twice, with the fades on top of an opaque copy of
+   * themselves. The board still needs `paint` — the ghost, the cursor and the
+   * hit layer are all indexed by it — which is why this is a second prop and
+   * not a replacement.
+   */
+  strata?: readonly PaintNode[] | null;
   preview: PreviewSpec | null;
   /**
    * The standing proposal in `propose` mode, ONE ENTRY PER APPLICATION the drag
@@ -664,6 +686,120 @@ const PaintLayer = memo(function PaintLayer({
       pointerEvents="none"
     >
       {out}
+    </g>
+  );
+});
+
+/**
+ * ONE LAYER, WITH ITS OWN ALPHA, for a document where something is faded.
+ *
+ * Structurally what `layers.Stratum` is, stated HERE as its own interface so
+ * that the board still knows nothing about the layer model — the same
+ * discipline `BoardGeometry` and `ReliefView` follow, and the reason this
+ * component can be handed a drawing by anything that can produce these fields.
+ */
+export interface PaintNode {
+  /** Only ever a React key and a `data-layer`. Never looked up. */
+  readonly id: string;
+  /** This layer's OWN alpha in `0…1`. Never the product with its ancestors. */
+  readonly opacity: number;
+  /** This layer's OWN paint. Not the composite: lower layers show through. */
+  readonly paint: PaintMap;
+  readonly children: readonly PaintNode[];
+}
+
+/**
+ * The paint as the NESTED groups a faded stack has to be drawn as.
+ *
+ * ── Why this is not `PaintLayer` with an extra attribute ────────────────
+ *
+ * `PaintLayer` draws the FLATTENED board: one element per decided cell, topmost
+ * colour only, everything underneath thrown away because nothing could see it.
+ * A fade is exactly the statement that the layers underneath ARE seen, so there
+ * is no flat map that can express it — the lower paint has to still be in the
+ * document. Hence one element per painted cell per layer, and hence this path
+ * being taken only when the model says something is faded (`layers.strata`
+ * answers `null` otherwise, and the board keeps the flat path it always had).
+ *
+ * ── Why the groups NEST rather than being multiplied out ────────────────
+ *
+ * MEASURED IN CHROMIUM rather than assumed, because the flat form is cheaper,
+ * obvious, and wrong. A group's opacity applies to what the group composites
+ * to, not to each element inside it: a parent painting a cell gold with a child
+ * painting the same cell red, inside one `opacity="0.5"`, samples
+ * (255,128,128) — red at a half over white, with the gold entirely hidden. The
+ * same two layers written flat with their alphas multiplied out sample
+ * (255,115,64), which is red over gold over white. Disjoint cells multiply
+ * exactly (0.5 × 0.5 read back as red at 0.25), which is what makes the nested
+ * form correct rather than merely different. `emit.ts` writes the identical
+ * nesting into the exported file, so the canvas and the file composite through
+ * the same mechanism.
+ *
+ * "AND CANNOT DRIFT" USED TO END THAT SENTENCE, AND IT DRIFTED. For one revision
+ * of the timeline branch `emit.emitLayers` wrote the alpha as `fill-opacity`
+ * rather than `opacity`, to escape the reveal stylesheet overriding it — and
+ * `fill-opacity` is an INHERITED property, so a child's declaration REPLACES the
+ * parent's instead of compositing with it. Re-measured in Chromium at the fix:
+ * the nested pair above samples (255,191,191) as `opacity` and (255,127,127) as
+ * `fill-opacity`, and the same-cell pair samples (255,126,126) against
+ * (255,114,63) — which is this paragraph's own "cheaper, obvious, and wrong"
+ * arriving through a door nobody was watching. `emit.ts` states the alpha in the
+ * reveal keyframes now, so the property never had to move; see `animationRules`.
+ *
+ * The claim is true again and it is no longer only a claim:
+ * `test/importlayer.test.ts` compares the tree `strata` hands this component
+ * against the `<g>` nesting `serialise` writes, own-alpha for own-alpha, and
+ * asserts the attribute is the compositing one.
+ *
+ * `opacity` is written only when it is not 1. A group opacity forces the
+ * browser to allocate an offscreen buffer to composite through (the note on
+ * `DimLayer` is about the same cost), so an unfaded layer inside a faded
+ * document must not pay for one.
+ */
+const StackLayer = memo(function StackLayer({
+  geom,
+  pts,
+  strata,
+  visible,
+  weld,
+}: {
+  geom: BoardGeometry;
+  pts: readonly string[];
+  strata: readonly PaintNode[];
+  visible: ReadonlySet<number> | null;
+  weld: boolean;
+}) {
+  const cells = (paint: PaintMap): ReactElement[] => {
+    const out: ReactElement[] = [];
+    for (const [i, colour] of paint) {
+      const p = pts[i];
+      if (p === undefined) continue;
+      if (visible !== null && !visible.has(i)) continue;
+      out.push(
+        <polygon
+          key={i}
+          points={p}
+          fill={colour}
+          stroke={weld ? colour : undefined}
+        />
+      );
+    }
+    return out;
+  };
+  const group = (n: PaintNode): ReactElement => (
+    <g key={n.id} opacity={n.opacity === 1 ? undefined : n.opacity}>
+      {cells(n.paint)}
+      {n.children.map(group)}
+    </g>
+  );
+  return (
+    <g
+      data-layer="paint"
+      stroke={weld ? undefined : PAINT_SEAM}
+      strokeWidth={weld ? geom.seamWidth * WELD_WIDTH : geom.seamWidth}
+      pointerEvents="none"
+    >
+      {strata.map(group)}
     </g>
   );
 });
@@ -1034,6 +1170,7 @@ export default function DrawBoard({
   geom,
   relief,
   paint,
+  strata = null,
   preview,
   candidate,
   cursor,
@@ -1447,13 +1584,23 @@ export default function DrawBoard({
       <rect width={geom.width} height={geom.height} fill="url(#draw-vignette)" />
 
       <TileLayer geom={geom} pts={pts} order={order} show={showTiling} />
-      <PaintLayer
-        geom={geom}
-        pts={pts}
-        paint={paint}
-        visible={visible}
-        weld={weld}
-      />
+      {strata === null ? (
+        <PaintLayer
+          geom={geom}
+          pts={pts}
+          paint={paint}
+          visible={visible}
+          weld={weld}
+        />
+      ) : (
+        <StackLayer
+          geom={geom}
+          pts={pts}
+          strata={strata}
+          visible={visible}
+          weld={weld}
+        />
+      )}
       {relief && (
         <WashLayer pts={pts} wash={relief.wash} visible={visible} />
       )}

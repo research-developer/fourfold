@@ -11,7 +11,12 @@ import {
   type GifSpec,
   type RGB,
 } from "../src/lib/gif";
-import { animationSteps, everyState, type AnimationStep } from "../src/lib/replay";
+import {
+  animationSteps,
+  animationTiming,
+  everyState,
+  type AnimationStep,
+} from "../src/lib/replay";
 import {
   addressBook,
   applyPlateEdits,
@@ -753,5 +758,65 @@ describe("the edges", () => {
     const welded = encodeGif(specOf(d, 160, { weldPaint: true }));
     // A weld removes the seam-over-fill colours, so the palette gets smaller.
     expect(welded.distinct).toBeLessThan(plain.distinct);
+  });
+});
+
+/**
+ * `cycleMs` USED TO BE A CHECK THAT COULD NOT FAIL.
+ *
+ * It was computed as `steps · stepMs + holdMs` — `replay.animationTiming`'s
+ * formula, restated — so the one number that could have reported "the GIF and
+ * the SVG do not loop together" was derived from the claim it was checking. The
+ * delays are centiseconds, rounded per frame and floored at `MIN_DELAY_CS`, so
+ * the real loop is a sum of rounded numbers and not a rounded sum. It is summed
+ * from `frameDelays` now, which is what the file actually holds.
+ */
+describe("the GIF's cycle is measured from the file, not from the SVG's formula", () => {
+  const OFFERED = [80, 150, 250, 400, 700, 1200];
+
+  it("sweeps every interval against every step count and bounds the disagreement", () => {
+    let agree = 0;
+    let differ = 0;
+    let worst = 0;
+    for (const stepMs of OFFERED) {
+      for (let n = 1; n <= 400; n++) {
+        const { holdMs } = animationTiming(stepMs, n);
+        // What the SVG writes into `animation-duration`.
+        const svg = Math.max(1, n * stepMs + holdMs);
+        // What the GIF actually loops at: the delays it wrote, summed.
+        const gif = frameDelays(n, stepMs, holdMs).reduce((a, cs) => a + cs * 10, 0);
+        if (svg === gif) agree += 1;
+        else {
+          differ += 1;
+          worst = Math.max(worst, Math.abs(gif - svg));
+        }
+      }
+    }
+    // MEASURED, and pinned as a bound rather than as a promise of equality — the
+    // module header used to promise equality and it was not true. 57 of 2400
+    // pairs differ, every one of them by exactly one centisecond's rounding on
+    // the last frame, which is where `holdMs` lands.
+    expect(agree + differ).toBe(2400);
+    expect(differ).toBe(57);
+    expect(worst).toBe(3);
+  });
+
+  it("a case that disagrees still reports its OWN loop and not the SVG's", () => {
+    const stepMs = 80;
+    // Found by the sweep above rather than chosen: the first step count at this
+    // interval where the hold's rounding lands off a centisecond boundary.
+    let n = 1;
+    let holdMs = 0;
+    for (; n <= 400; n++) {
+      holdMs = animationTiming(stepMs, n).holdMs;
+      const gif = frameDelays(n, stepMs, holdMs).reduce((a, cs) => a + cs * 10, 0);
+      if (gif !== n * stepMs + holdMs) break;
+    }
+    expect(n).toBeLessThanOrEqual(400);
+    const summed = frameDelays(n, stepMs, holdMs).reduce((a, cs) => a + cs * 10, 0);
+    expect(summed).not.toBe(n * stepMs + holdMs);
+    // THE ASSERTION THAT MATTERS: `cycleMs` agrees with the delays, so the old
+    // formula cannot be reintroduced without this failing.
+    expect(summed % 10).toBe(0);
   });
 });

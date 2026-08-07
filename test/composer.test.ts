@@ -648,6 +648,218 @@ describe("gesture provenance, through the file", () => {
   });
 });
 
+/**
+ * PER-LAYER ALPHA, THROUGH THE FILE — the drop that used to be silent.
+ *
+ * `emit.EmitLayer.opacity` predates this work: `serialise` has always written
+ * the group opacity, `toArtLayer` has always put it in the payload and
+ * `artfile.ts` has always validated the range. What was missing was a model
+ * that could state it, so `stackFromEmit` read `hidden` and `locked` off a
+ * layer and let `opacity` fall on the floor — open a faded file, save it, and
+ * every fade was gone with no error and nothing to see.
+ *
+ * The claims here are the two the round trip turns on: a faded document
+ * survives both directions at every nesting depth, and an OPAQUE one is byte
+ * for byte the file it was before any of this existed.
+ */
+describe("layer alpha, through the file", () => {
+  const opaqueFile = (): readonly EmitLayer[] => [
+    { id: "ground", name: "Ground", paint: new Map([[0, "#111111"]]) },
+    {
+      id: "over",
+      name: "Over",
+      locked: true,
+      paint: new Map([[1, "#222222"]]),
+      children: [{ id: "kid", name: "Kid", hidden: true, paint: new Map([[2, "#333333"]]) }],
+    },
+  ];
+
+  const fadedFile = (): readonly EmitLayer[] => [
+    { id: "ground", name: "Ground", paint: new Map([[0, "#111111"]]) },
+    {
+      id: "wash",
+      name: "Wash",
+      opacity: 0.42,
+      paint: new Map([[1, "#222222"]]),
+      // A layer INSIDE a faded one, stating its own alpha. SVG multiplies the
+      // two down the tree; neither statement is the product.
+      children: [{ id: "kid", name: "Kid", opacity: 0.5, paint: new Map([[2, "#333333"]]) }],
+    },
+  ];
+
+  const compFrom = (list: readonly EmitLayer[], from = 1): Composition => {
+    const built = stackFromEmitAt(list, from);
+    return {
+      layers: built.stack,
+      selected: null,
+      nextId: built.nextId,
+      switches: built.switches,
+    };
+  };
+
+  it("carries an alpha out and back, at every nesting depth", () => {
+    const out = emitLayersOf(compFrom(fadedFile()), BOOK);
+    expect(out[1].opacity).toBe(0.42);
+    expect(out[1].children?.[0].opacity).toBe(0.5);
+    // Absent, not 1, for the layer nobody faded.
+    expect(Object.hasOwn(out[0], "opacity")).toBe(false);
+  });
+
+  it("survives a SECOND trip through the file, which is where the drop showed", () => {
+    // One trip was never enough to see this: the loss landed on IMPORT and
+    // appeared on the next export. Measured before the fix, `stackFromEmit` of
+    // an `{ opacity: 0.42 }` layer and `emitLayersOf` straight back out gave
+    // `undefined`.
+    const once = emitLayersOf(compFrom(fadedFile()), BOOK);
+    const twice = emitLayersOf(compFrom(once, 500), BOOK);
+    const alphas = (list: readonly EmitLayer[]): unknown =>
+      list.map((l) => ({
+        opacity: l.opacity,
+        children: l.children === undefined ? undefined : alphas(l.children),
+      }));
+    expect(alphas(twice)).toEqual(alphas(once));
+    expect(alphas(once)).toEqual([
+      { opacity: undefined, children: undefined },
+      { opacity: 0.42, children: [{ opacity: 0.5, children: undefined }] },
+    ]);
+  });
+
+  it("lands on the COMPOSITION and never on the layer", () => {
+    // The placement, asserted rather than described. An alpha on the `Layer` is
+    // a fact a `place` rung freezes and undo writes back — the switches bug —
+    // so the import must put it exactly where the two switches go.
+    const built = stackFromEmitAt(fadedFile(), 1);
+    const wash = built.stack[1];
+    expect(Object.hasOwn(wash, "opacity")).toBe(false);
+    expect(built.switches.get(wash.id)).toEqual({
+      visible: true,
+      locked: false,
+      opacity: 0.42,
+    });
+    // A file that fades nothing yields entries shaped exactly as before — the
+    // locked layer still has one, and it has no alpha KEY, not an alpha of 1.
+    const plain = stackFromEmitAt(opaqueFile(), 1);
+    const entry = plain.switches.get(plain.stack[1].id);
+    expect(entry).toEqual({ visible: true, locked: true });
+    expect(Object.hasOwn(entry ?? {}, "opacity")).toBe(false);
+  });
+
+  it("does not resolve an alpha under an ancestor", () => {
+    // The rule `hidden` and `locked` already follow. Writing the inherited
+    // answer would burn the PRODUCT of a chain into each link of it, so a
+    // reader that also multiplies — which is every SVG renderer — squares it.
+    const out = emitLayersOf(
+      compFrom([
+        { id: "p", opacity: 0.5, children: [{ id: "c", name: "plain", paint: new Map([[0, "#111111"]]) }] },
+      ]),
+      BOOK
+    );
+    expect(out[0].opacity).toBe(0.5);
+    expect(Object.hasOwn(out[0].children?.[0] ?? {}, "opacity")).toBe(false);
+  });
+
+  it("clamps and quantises what arrives, rather than trusting it", () => {
+    // A file has passed `artfile`'s 0…1 check by the time it reaches here, but
+    // a CLIPBOARD `EmitLayer` is an ordinary object from anywhere in the
+    // program. The alternative to clamping is `opacity="42"` in the next file
+    // this document writes.
+    const built = stackFromEmitAt(
+      [
+        { id: "a", opacity: 42 },
+        { id: "b", opacity: -1 },
+        { id: "c", opacity: 1 / 3 },
+        { id: "d", opacity: Number.NaN },
+      ],
+      1
+    );
+    const alpha = (k: number) => built.switches.get(built.stack[k].id)?.opacity;
+    // 1 is not an entry at all — canonical, so two identical documents match.
+    expect(built.switches.get(built.stack[0].id)).toBeUndefined();
+    expect(alpha(1)).toBe(0);
+    expect(alpha(2)).toBe(0.333);
+    expect(built.switches.get(built.stack[3].id)).toBeUndefined();
+  });
+
+  it("writes the alpha into the markup as a group opacity", () => {
+    // The mechanism, measured on the real serialiser: SVG composites a group's
+    // opacity multiplicatively down the tree, so the file needs no fourth
+    // channel and no colour in it changes.
+    const svg = serialise(svgDoc(emitLayersOf(compFrom(fadedFile()), BOOK)));
+    expect(svg).toContain('opacity="0.42"');
+    expect(svg).toContain('opacity="0.5"');
+    // NO FOURTH CHANNEL ANYWHERE: every colour the file states is still
+    // `#rrggbb`, which is the half of the old refusal that still stands.
+    // Matched on the fill declarations rather than on every `#` in the
+    // document, because the root id is itself an `#ffxxxxxx` selector.
+    const fills = [...svg.matchAll(/fill(?:="|: )(#[0-9a-f]+)/g)].map((m) => m[1]);
+    expect(fills.length).toBeGreaterThan(0);
+    for (const f of fills) expect(f).toMatch(/^#[0-9a-f]{6}$/);
+  });
+
+  it("writes an opaque document byte for byte as it always did", () => {
+    // The strongest form of "absent by default": not a key check but the file.
+    // The reference is what the emitter was handed BEFORE any alpha existed;
+    // the other is what the round trip produces now.
+    const reference = opaqueFile();
+    const roundTripped = emitLayersOf(compFrom(reference), BOOK);
+    const relabel = (
+      list: readonly EmitLayer[],
+      like: readonly EmitLayer[]
+    ): readonly EmitLayer[] =>
+      list.map((l, k) => ({
+        ...l,
+        id: like[k].id,
+        children:
+          l.children === undefined
+            ? undefined
+            : relabel(l.children, like[k].children ?? []),
+      }));
+    expect(serialise(svgDoc(relabel(roundTripped, reference)))).toBe(
+      serialise(svgDoc(reference))
+    );
+    expect(serialise(svgDoc(reference))).not.toContain("opacity");
+  });
+
+  it("closes the whole loop: composition → SVG → composition", () => {
+    // The two halves are covered apart — this file for composition↔`EmitLayer`
+    // and `test/importlayer.test.ts` for `EmitLayer`↔file — and the promise a
+    // person actually holds is the two joined. `parse` reads the alpha from the
+    // PAYLOAD and never from the `opacity=` attribute; the markup is how the
+    // file draws and the payload is what it means.
+    const svg = serialise(svgDoc(emitLayersOf(compFrom(fadedFile()), BOOK)));
+    const back = parse(svg);
+    expect(back).not.toBeNull();
+    if (back === null) return;
+    const reimported = compFrom(back.layers, 900);
+    const out = emitLayersOf(reimported, BOOK);
+    expect(out[1].opacity).toBe(0.42);
+    expect(out[1].children?.[0].opacity).toBe(0.5);
+    expect(Object.hasOwn(out[0], "opacity")).toBe(false);
+    // And the board is untouched by all of it: alpha never reached `flatten`,
+    // so the colours that come back are the colours that went out.
+    expect([...flatten(reimported, BOOK).values()].sort()).toEqual(
+      ["#111111", "#222222", "#333333"]
+    );
+  });
+
+  it("returns to the identical document when a fade is taken back off", () => {
+    // Canonical in the round trip as well as in the model: fading a layer and
+    // clearing the fade must not leave `opacity: 1` in the payload, or a file
+    // saved after an idle drag of the dial differs from the one before it.
+    const plain = emitLayersOf(compFrom(opaqueFile()), BOOK);
+    const faded = emitLayersOf(
+      compFrom(opaqueFile().map((l, k) => (k === 0 ? { ...l, opacity: 0.5 } : l))),
+      BOOK
+    );
+    const cleared = emitLayersOf(
+      compFrom(opaqueFile().map((l, k) => (k === 0 ? { ...l, opacity: 1 } : l))),
+      BOOK
+    );
+    expect(serialise(svgDoc(faded))).not.toBe(serialise(svgDoc(plain)));
+    expect(serialise(svgDoc(cleared))).toBe(serialise(svgDoc(plain)));
+  });
+});
+
 describe("counting a subtree", () => {
   it("counts a layer's own cells at the book's depth", () => {
     const l: Layer = {
@@ -896,7 +1108,7 @@ describe("the event log is the journal", () => {
 // ── helpers that keep the tests readable ─────────────────────────────────
 
 import { stackFromEmit } from "../src/lib/composer";
-import { serialise, type EmitDoc, type EmitLayer } from "../src/lib/emit";
+import { parse, serialise, type EmitDoc, type EmitLayer } from "../src/lib/emit";
 import { plateFrame } from "../src/lib/view";
 import type { ArtCell } from "../src/lib/strokes";
 

@@ -9,11 +9,14 @@ import {
   parse,
   rekey,
   resolvedShapes,
+  revealBreak,
   serialise,
   type EmitDoc,
   type EmitLayer,
 } from "../src/lib/emit";
-import { artworkSvg, type ArtCell } from "../src/lib/strokes";
+import { gestureLayers } from "../src/lib/provenance";
+import { addressBook, type Address } from "../src/lib/plate";
+import { artworkSvg, type ArtCell, type Stroke } from "../src/lib/strokes";
 import {
   extractArt,
   formatRanges,
@@ -1030,6 +1033,192 @@ describe("a gesture survives export, import and re-export", () => {
       expect(gz(svg) / gz(bare), `${what} gzipped`).toBeGreaterThan(1);
       expect(gz(svg) / gz(bare), `${what} gzipped`).toBeLessThan(1.01);
     }
+  });
+});
+
+// ── the reveal order a nested document has to keep ───────────────────────
+
+/**
+ * SVG composites group opacity MULTIPLICATIVELY, so a nested element is visible
+ * only when every ancestor is, and the threshold of a product is the LATEST of
+ * the thresholds. A child asking to come up at step 2 inside a group that comes
+ * up at step 5 therefore comes up at 5 — measured in a browser at 801 ms against
+ * the 400 ms it asked for, the numbers are in `emit.revealBreak` — and NOTHING
+ * REPORTED IT. The file animated differently from the document that wrote it,
+ * with the number it disagreed with sitting in its own markup.
+ *
+ * The house rule is that a decline is a counted precondition and never a
+ * fallback, so both ends now say no: `serialise` throws rather than writing a
+ * document that lies about its own timing, and `parse` refuses such a file
+ * whole. This block measures both, and measures that nothing this repo produces
+ * can trip either.
+ */
+describe("a child cannot reveal before the group that gates it", () => {
+  /** One gesture inside another, with the two reveals under the test's control. */
+  const nested = (outer: number, inner: number): EmitDoc => {
+    const { pf } = frameOf(3);
+    const shown = pf.shown;
+    const cells = (from: number, n: number): Map<number, string> =>
+      new Map(shown.slice(from, from + n).map((i, j) => [i, PALETTE[j % PALETTE.length]]));
+    const layers: EmitLayer[] = [
+      { id: "ground", name: "ground", paint: paintOf(shown, 20, 0) },
+      {
+        id: "outer",
+        name: "the group",
+        reveal: outer,
+        mode: 6,
+        orbit: 6,
+        paint: cells(0, 6),
+        children: [
+          {
+            id: "inner",
+            name: "the gesture inside it",
+            reveal: inner,
+            mode: 3,
+            orbit: 3,
+            paint: cells(12, 3),
+          },
+        ],
+      },
+    ];
+    return {
+      ...docOf(3, layers),
+      animation: {
+        stepMs: 250,
+        holdMs: 1800,
+        fadeMs: 90,
+        steps: Math.max(outer, inner) + 1,
+      },
+    };
+  };
+
+  it("names the two layers that disagree, and only when they do", () => {
+    expect(revealBreak(nested(2, 5).layers)).toBeNull();
+    // CO-TIMED IS LEGAL. A group and its child revealing at the same step is
+    // the ordinary case — `nested.Comp` says a composition reveals with its
+    // first step — and the browser measured it as a slightly softer landing
+    // rather than a clamp: 34 ms late against a 60 ms fade, because each is at
+    // 0.707 when the other is.
+    expect(revealBreak(nested(4, 4).layers)).toBeNull();
+    expect(revealBreak(nested(5, 2).layers)).toEqual({
+      layer: "inner",
+      reveal: 2,
+      ancestor: "outer",
+      at: 5,
+    });
+  });
+
+  it("the floor is the running MAX, not the nearest ancestor", () => {
+    // 5 inside 7 inside 5: the grandchild clears its GRANDPARENT and is still
+    // clamped, by the layer between them. A check that only compared a layer
+    // with its immediate parent would call this document well ordered.
+    const layers: EmitLayer[] = [
+      {
+        id: "top",
+        reveal: 5,
+        children: [{ id: "mid", reveal: 7, children: [{ id: "low", reveal: 6 }] }],
+      },
+    ];
+    expect(revealBreak(layers)).toEqual({
+      layer: "low",
+      reveal: 6,
+      ancestor: "mid",
+      at: 7,
+    });
+  });
+
+  it("a layer with no reveal neither raises the floor nor breaks it", () => {
+    // An ungated ancestor runs no opacity animation at all, so it clamps
+    // nothing — the two gestures under it are ordered against each other and
+    // not against it.
+    expect(
+      revealBreak([{ id: "plain", children: [{ id: "a", reveal: 3 }] }])
+    ).toBeNull();
+    // And a child with no time of its own states nothing to disagree with.
+    expect(
+      revealBreak([{ id: "gesture", reveal: 9, children: [{ id: "orbit", mode: 6 }] }])
+    ).toBeNull();
+    // The pair that DOES disagree is still found through the ungated layer.
+    expect(
+      revealBreak([
+        { id: "gate", reveal: 9, children: [{ id: "plain", children: [{ id: "early", reveal: 1 }] }] },
+      ])
+    ).toEqual({ layer: "early", reveal: 1, ancestor: "gate", at: 9 });
+  });
+
+  it("REFUSES TO WRITE IT: serialise throws and says which two layers", () => {
+    expect(() => serialise(nested(5, 2))).toThrow(
+      "emit: layer inner reveals at step 2 but outer, which contains it, " +
+        "reveals at 5 — a child cannot come up before the group that gates it"
+    );
+    // The control: the same document with the two in order is written as it
+    // always was, so the refusal is about the order and not about the shape.
+    const fine = serialise(nested(2, 5));
+    expect(fine).toContain(`data-reveal="2"`);
+    expect(fine).toContain(`data-reveal="5"`);
+  });
+
+  it("refuses a STILL export too, because the order is stated either way", () => {
+    // `data-reveal` is written whether or not anything is playing — see the
+    // header — so a still export states the same impossible order.
+    expect(() => serialise({ ...nested(5, 2), animation: null })).toThrow(
+      /cannot come up before the group that gates it/
+    );
+  });
+
+  it("scoping to the child is the escape hatch: the gate goes with the ancestor", () => {
+    // A scoped export is a STANDALONE COMPOSITION holding that subtree, so the
+    // group that was clamping the child is not in the file and there is nothing
+    // left to lie about. The check runs on the SCOPED document for exactly this
+    // reason.
+    const one = serialise(nested(5, 2), { layer: "inner" });
+    expect(one).toContain(`data-reveal="2"`);
+    expect(one).not.toContain(`id="outer"`);
+  });
+
+  it("REFUSES TO READ IT: a file whose payload says so comes back null", () => {
+    const good = serialise(nested(2, 5));
+    expect(parse(good)).not.toBeNull();
+
+    // The payload is the authority for `reveal`, so the tamper goes there. The
+    // markup keeps `data-reveal="5"`, which is the sharp form of the hazard: the
+    // two halves of the file disagree and the payload is the one that is read.
+    const broken = good.replace(`"reveal":5`, `"reveal":1`);
+    expect(broken).not.toBe(good);
+    expect(parse(broken)).toBeNull();
+
+    // THE CONTROL, and it is the one that makes the assertion above mean
+    // something: the same edit to a value that keeps the order still parses, so
+    // what was refused is the relation and not the act of editing the payload.
+    const later = good.replace(`"reveal":5`, `"reveal":9`);
+    expect(later).not.toBe(good);
+    expect(parse(later)).not.toBeNull();
+  });
+
+  it("NO EMITTER PATH IN THIS REPO PRODUCES ONE — measured, not assumed", () => {
+    // `provenance.gestureLayers` is the only producer of NESTED layers carrying
+    // reveals, and it puts the reveal on the GESTURE and gives the orbits under
+    // it `mode` and `orbit` and no time at all. So every document this program
+    // has ever written is well ordered by construction, and the two refusals
+    // above cannot reach a file anyone already has.
+    const pbook = addressBook(buildHexagon(2));
+    const strokes: Stroke<Address>[] = [0, 1, 2].map((k) => ({
+      edits: [
+        { cell: "s0:AA" as Address, from: null, to: PALETTE[k] },
+        { cell: "s0:AB" as Address, from: null, to: PALETTE[k] },
+      ],
+      mark: { mode: 6, groups: [["s0:AA" as Address], ["s0:AB" as Address]] },
+    }));
+    const layers = gestureLayers(strokes, pbook, { nest: "always" });
+    expect(layers).toHaveLength(3);
+    // The shape the claim rests on: a reveal on every gesture, none on any
+    // child, and the reveals ascending with the history.
+    expect(layers.map((l) => l.reveal)).toEqual([0, 1, 2]);
+    for (const l of layers) {
+      expect(l.children?.length).toBeGreaterThan(1);
+      for (const c of l.children ?? []) expect(c.reveal).toBeUndefined();
+    }
+    expect(revealBreak(layers)).toBeNull();
   });
 });
 

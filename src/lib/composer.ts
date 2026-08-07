@@ -43,7 +43,9 @@
  */
 
 import {
+  alphaOf,
   applyMove,
+  canonicalAlpha,
   layerId,
   OPEN,
   switchesOf,
@@ -256,10 +258,20 @@ export function actStrokes(past: readonly Act[]): Stroke<Address>[] {
 /**
  * The composition as the layer tree a file is written from.
  *
- * `hidden` and `locked` are the layer's OWN switches and never the inherited
- * ones — `emit.ts` says so in its own header, and writing the resolved answer
- * here would permanently mark every child of a hidden parent hidden. Absent
- * rather than `false` for both, so an ordinary layer costs no attributes.
+ * `hidden`, `locked` and `opacity` are the layer's OWN switches and never the
+ * inherited ones — `emit.ts` says so in its own header, and writing the
+ * resolved answer here would permanently mark every child of a hidden parent
+ * hidden, and would burn the PRODUCT of a chain of alphas into each link of it.
+ * Absent rather than `false`/`1` for all three, so an ordinary layer costs no
+ * attributes.
+ *
+ * THE ALPHA IS A DISPLAY FACT AND THE FILE HAS ALWAYS HAD SOMEWHERE TO PUT IT:
+ * `emit.EmitLayer.opacity` predates this, `serialise` writes it as an SVG group
+ * opacity, `toArtLayer` puts it in the payload and `artfile.ts` validates the
+ * range. The one thing missing was a model that could state it, which is
+ * `layers.Switches.opacity` — so this line is the whole of the export side.
+ * `layers.ts`'s header carries the argument for why an alpha may be a display
+ * property and may not be a colour.
  *
  * A layer that holds no paint of its own still gets a `<g>`: it may be a group,
  * and a group with children and no paint is exactly what a pasted composition
@@ -298,6 +310,10 @@ export function emitLayersOf(
     const own = switchesOf(comp, l.id);
     if (!own.visible) out.hidden = true;
     if (own.locked) out.locked = true;
+    // Key order matches `emit.toArtLayer`, which is the order the payload is
+    // re-encoded in and therefore the order the byte-for-byte round trip needs.
+    const alpha = alphaOf(own);
+    if (alpha !== 1) out.opacity = alpha;
     // The gesture, read off the LAYER — it is on the node and the switches are
     // not, and `layers.LayerGesture` argues that split.
     if (l.reveal !== undefined) out.reveal = l.reveal;
@@ -368,8 +384,29 @@ export function stackFromEmit(
         if (addr !== undefined) plate.set(addr, hex);
       }
     }
-    if (l.hidden === true || l.locked === true) {
-      switches.set(id, { visible: l.hidden !== true, locked: l.locked === true });
+    // THE ALPHA COMES IN, and it used to be dropped here — the same silent,
+    // total loss the gesture suffered, and flagged as a decision rather than an
+    // oversight while `Layer` had nowhere to put it. `emit.ts` has always
+    // written `opacity`, `artfile.ts` has always validated it in `0…1` and
+    // `fromArtLayers` has always read it back, so a faded file round-tripped
+    // through this function came out fully opaque with no error and no warning.
+    // Measured before the fix: `stackFromEmit` of an `{ opacity: 0.42 }` layer
+    // and `emitLayersOf` straight back gave `undefined`.
+    //
+    // CANONICALISED THROUGH `layers.canonicalAlpha` rather than trusted. A file
+    // reaching here has passed `artfile`'s range check, but a clipboard
+    // `EmitLayer` is an ordinary object from anywhere in the program and this is
+    // the model's edge: the alternative to clamping is an `opacity="42"` in the
+    // next file this document writes.
+    const alpha = l.opacity === undefined ? 1 : canonicalAlpha(l.opacity);
+    if (l.hidden === true || l.locked === true || alpha !== 1) {
+      switches.set(id, {
+        visible: l.hidden !== true,
+        locked: l.locked === true,
+        // Absent stays absent, so a file that fades nothing yields entries
+        // shaped exactly as they were before this existed.
+        ...(alpha === 1 ? {} : { opacity: alpha }),
+      });
     }
     // The children are read AFTER this layer's own id is minted, so the ids
     // ascend in paint order and a file reads the way the panel does.
@@ -434,12 +471,31 @@ export interface PanelRow {
   /** 0 for a top-level layer. How far the row is indented. */
   readonly depth: number;
   /**
-   * This layer's OWN two switches — what the row's buttons show and toggle.
+   * This layer's OWN switches and its own alpha.
+   *
+   * `own.visible` and `own.locked` ARE what the row's controls show and set — the
+   * eye and the padlock. `own.opacity` IS NOT, and this used to say it was: there
+   * is no alpha control in `LayersPanel`, and `layers.setOpacity` has no caller
+   * anywhere in `src/`. The only way an alpha enters a `Composition` is
+   * `stackFromEmit` below, reading one out of a file. So a fade that arrives in an
+   * imported drawing is, today, PERMANENT AND UNCLEARABLE from the panel.
+   *
+   * It is carried here anyway and that is right rather than aspirational: the row
+   * is what the panel READS, the value is real, it must survive a round trip, and
+   * a row that dropped it would make the panel a second opinion about the
+   * document. What was wrong was the sentence promising a control.
+   *
+   * `own.opacity` is absent for a layer nobody faded and means 1; `layers.alphaOf`
+   * is the reader that says so once.
    *
    * Different from `effective`, which is the inherited answer: a visible layer
    * inside a hidden parent has `own.visible` true and `effective.shown` false,
-   * and the row says both things. Read off the composition because a `Layer`
-   * does not carry them; see `layers.Switches`.
+   * and the row says both things. THERE IS DELIBERATELY NO INHERITED ALPHA
+   * beside `effective.shown` — a nested fade multiplies, and the product is a
+   * fact about the RENDER that SVG and `layers.strata` each work out for
+   * themselves. Storing it on a row would be a third place for it to be wrong.
+   * Read off the composition because a `Layer` does not carry any of them; see
+   * `layers.Switches`.
    */
   readonly own: Switches;
   readonly effective: Effective;

@@ -53,10 +53,14 @@
 
 import {
   buildFigure,
+  buildRep9Figure,
+  type Axis,
   type Charge,
   type Convention,
   type Figure,
+  type Grade,
   type IVec,
+  type Rep9Figure,
 } from "./figure";
 
 /** A point of the triangular lattice, as integer coefficients of (e1, e2). */
@@ -160,6 +164,12 @@ export interface HexCell {
 
 export interface Hexagon {
   depth: number;
+  /**
+   * The base figure's scale, carried up so the four modules that draw the
+   * hexagon read a resolution instead of deriving one. Always `base.scale`; the
+   * hexagon is six copies of the triangle and copying does not refine.
+   */
+  scale: number;
   convention: Convention;
   base: Figure;
   cells: HexCell[];
@@ -193,7 +203,11 @@ export function buildHexagon(
   convention: Convention = "apex"
 ): Hexagon {
   const base = buildFigure(depth, convention);
-  const scale = 2 ** depth;
+  // READ, not recomputed. The base figure already resolved the depth it was
+  // built at; deriving it a second time here is the drift `scale.ts` exists to
+  // remove — and under mixed radix the second derivation would be wrong, since
+  // a depth would no longer determine the scale the base actually cut to.
+  const scale = base.scale;
   const unit = RADIUS / scale;
   const width = 2 * RADIUS + 2 * PADDING;
   const height = SQRT3 * RADIUS + 2 * PADDING;
@@ -246,6 +260,7 @@ export function buildHexagon(
 
   return {
     depth,
+    scale,
     convention,
     base,
     cells,
@@ -258,14 +273,164 @@ export function buildHexagon(
   };
 }
 
+// ── six rep-9 sectors ────────────────────────────────────────────────────
+//
+// The hexagon construction depends on the 60° apex angle and on the cells being
+// lattice triangles. It does NOT depend on the radix: rep-9's children are
+// triangles of the same Eisenstein lattice at a finer scale, so six copies of a
+// rep-9 sector close the circle exactly as six copies of a rep-4 sector do.
+//
+// The load-bearing check is the same one and it is the constructor's own: two
+// cells sharing an exact integer lattice key would mean the six sectors overlap,
+// and the build throws rather than returning a hexagon that quietly double-books
+// a triangle. `docs/rep-tile-findings.md` Q1 measured 6 × 9^d distinct keys with
+// zero collisions at d = 1, 2, 3 on a bare rep-9 subdivision;
+// `test/rep9figure.test.ts` re-measures it through THIS constructor, which is
+// the thing that would actually ship.
+//
+// NOT FACTORED with `buildHexagon`, deliberately. The loop bodies differ only in
+// the cell payload — a V4 charge against a ℤ/3 grade and an arm — and folding
+// them together would put a type parameter through a module that four others
+// import, to save twenty lines. The rep-4 path had to come out of this change
+// byte-identical, and the cheapest way to guarantee that is not to edit it.
+
+export interface Rep9HexCell {
+  i: number;
+  /** 0..5, counter-clockwise from the wedge between e1 and e2. */
+  sector: number;
+  /** Index of the corresponding cell in the base rep-9 triangle. */
+  base: number;
+  addr: string;
+  /** ℤ/3. See `figure.rep9PrefixCharge`. */
+  charge: Grade;
+  /** Orientation AS DRAWN — the base ε flipped on odd sectors, as at rep-4. */
+  eps: 0 | 1;
+  baseEps: 0 | 1;
+  /** The arm of the base cell. `null` only on a depth-0 figure. */
+  arm: Axis | null;
+  /** Exact integer lattice key: the three vertices summed. */
+  key: Lat;
+  verts: [number, number][];
+  centroid: [number, number];
+}
+
+export interface Rep9Hexagon {
+  depth: number;
+  /** The base figure's scale: 3^depth. Copying does not refine. */
+  scale: number;
+  base: Rep9Figure;
+  cells: Rep9HexCell[];
+  byKey: Map<string, number>;
+  width: number;
+  height: number;
+  centre: [number, number];
+  radius: number;
+  corners: [number, number][];
+}
+
+export function buildRep9Hexagon(depth: number): Rep9Hexagon {
+  const base = buildRep9Figure(depth);
+  const scale = base.scale;
+  const unit = RADIUS / scale;
+  const width = 2 * RADIUS + 2 * PADDING;
+  const height = SQRT3 * RADIUS + 2 * PADDING;
+  const cx = width / 2;
+  const cy = height / 2;
+
+  const cells: Rep9HexCell[] = [];
+  const byKey = new Map<string, number>();
+
+  for (let s = 0; s < 6; s++) {
+    for (const c of base.cells) {
+      const lat = c.bary.map((b) => rotK(baryToLat(b), s)) as [Lat, Lat, Lat];
+      const key: Lat = [
+        lat[0][0] + lat[1][0] + lat[2][0],
+        lat[0][1] + lat[1][1] + lat[2][1],
+      ];
+      const kk = latKey(key);
+      if (byKey.has(kk)) {
+        throw new Error(
+          `rep9 hexagon: two cells share the lattice key ${kk} (sector ${s}, ${c.addr})`
+        );
+      }
+      const i = cells.length;
+      byKey.set(kk, i);
+      const verts = lat.map((p) => latticeToPixel(p, unit, cx, cy)) as [
+        number,
+        number
+      ][];
+      cells.push({
+        i,
+        sector: s,
+        base: c.i,
+        addr: c.addr,
+        charge: c.charge,
+        eps: ((c.eps ^ (s & 1)) as 0 | 1),
+        baseEps: c.eps,
+        arm: c.arm,
+        key,
+        verts,
+        centroid: [
+          (verts[0][0] + verts[1][0] + verts[2][0]) / 3,
+          (verts[0][1] + verts[1][1] + verts[2][1]) / 3,
+        ],
+      });
+    }
+  }
+
+  const corners = ([0, 1, 2, 3, 4, 5] as const).map((k) =>
+    latticeToPixel(rotK([scale, 0], k), unit, cx, cy)
+  ) as [number, number][];
+
+  return {
+    depth,
+    scale,
+    base,
+    cells,
+    byKey,
+    width,
+    height,
+    centre: [cx, cy],
+    radius: RADIUS,
+    corners,
+  };
+}
+
 // ── index maps ───────────────────────────────────────────────────────────
+//
+// WIDENED, not changed. These three took a `Hexagon`; they now take the
+// STRUCTURE they always actually read — exact keys and a key index for
+// `indexMap`, plus the (sector, base) factorisation and the base figure's median
+// mirrors for the closed form. `Hexagon` satisfies both, so every existing
+// caller is unaffected and the rep-4 answers are the same permutations they
+// always were; `Rep9Hexagon` satisfies them too, which is how the D₆ index law
+// gets checked at the second radix without a second copy of the derivation.
+
+/** What deriving a permutation from the lattice needs: keys, and an index. */
+export interface KeyedCanvas {
+  readonly cells: readonly { readonly i: number; readonly key: Lat }[];
+  readonly byKey: ReadonlyMap<string, number>;
+}
+
+/** What the closed form additionally needs: the sector factorisation. */
+export interface SectoredCanvas extends KeyedCanvas {
+  readonly cells: readonly {
+    readonly i: number;
+    readonly key: Lat;
+    readonly sector: number;
+    readonly base: number;
+  }[];
+  readonly base: {
+    readonly cells: readonly { readonly mirror: Record<Axis, number> }[];
+  };
+}
 
 /**
  * The permutation of cell indices induced by an isometry, derived from the
  * exact lattice action and a key lookup. Throws if the isometry fails to
  * permute the cell set, which would mean the hexagon is not what we think.
  */
-export function indexMap(hex: Hexagon, g: HexIsometry): number[] {
+export function indexMap(hex: KeyedCanvas, g: HexIsometry): number[] {
   const out = new Array<number>(hex.cells.length);
   for (const c of hex.cells) {
     const j = hex.byKey.get(latKey(g.apply(c.key)));
@@ -287,7 +452,7 @@ export function indexMap(hex: Hexagon, g: HexIsometry): number[] {
  * Returned so a test can check the closed form against the lattice-derived
  * map rather than either one being taken on trust.
  */
-export function closedFormMap(hex: Hexagon, g: HexIsometry): number[] {
+export function closedFormMap(hex: SectoredCanvas, g: HexIsometry): number[] {
   const n = hex.base.cells.length;
   const at = (s: number, c: number) => (((s % 6) + 6) % 6) * n + c;
   const out = new Array<number>(hex.cells.length);
@@ -304,7 +469,7 @@ export function closedFormMap(hex: Hexagon, g: HexIsometry): number[] {
  * Exported ONLY so `test/hexagon.test.ts` can plant it and show it caught.
  * Never used by the model or the UI.
  */
-export function mutantRotMap(hex: Hexagon, g: HexIsometry): number[] {
+export function mutantRotMap(hex: SectoredCanvas, g: HexIsometry): number[] {
   const n = hex.base.cells.length;
   const at = (s: number, c: number) => (((s % 6) + 6) % 6) * n + c;
   const out = new Array<number>(hex.cells.length);

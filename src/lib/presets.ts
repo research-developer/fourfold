@@ -55,6 +55,7 @@ import {
 } from "./figure";
 import { buildHexagon, type Hexagon } from "./hexagon";
 import { STEM, wordOf, type Address } from "./plate";
+import { gasketAtDepth } from "./scale";
 import type { CanvasKind } from "./orbit";
 
 export type PresetName =
@@ -176,7 +177,13 @@ export function gasketCells(canvas: Figure | Hexagon): number[] {
   for (let i = 0; i < addr.length; i++) {
     if (!wordOf(addr[i], stem).includes("X")) out.push(i);
   }
-  const want = (kind === "hexagon" ? 6 : 1) * 3 ** canvas.depth;
+  // NOT A SCALE, and the one count in this refactor that could not become one.
+  // The gasket is the product of the UPRIGHT child counts, k(k+1)/2 per cut, and
+  // that is not recoverable from the edge divisions alone once k varies — see
+  // `scale.gasketAtDepth`. So this legitimately still takes a depth: depth
+  // remains the NUMBER OF CUTS, which is a real quantity; what it stopped being
+  // is a resolution.
+  const want = (kind === "hexagon" ? 6 : 1) * gasketAtDepth(canvas.depth);
   if (out.length !== want) {
     throw new Error(
       `presets: the gasket on this ${kind} at depth ${canvas.depth} holds ` +

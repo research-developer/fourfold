@@ -43,6 +43,13 @@ import { CONVENTIONS, type Convention, type Figure } from "./figure";
 import type { Hexagon } from "./hexagon";
 import { HEXAGON_MODES, TRIANGLE_MODES, type CanvasKind } from "./orbit";
 import { READINGS, type Reading } from "./relief";
+import {
+  cellsAtScale,
+  radixAt,
+  REP9_LETTERS,
+  scaleOfDepth,
+  scaleOfWord,
+} from "./scale";
 import { swatchFromHex, type Swatch } from "./schemes";
 
 export const ART_MARKER = "fourfold:art";
@@ -87,8 +94,17 @@ export interface ArtPayload {
    * everything a file needed to say while a depth change cleared the plate. It
    * no longer does: a plate may carry paint above and below the depth it was
    * exported at, and an index list cannot name any of it. See `plate.ts` for the
-   * address scheme — a word over `{A,B,C,X}`, with an `s0:`…`s5:` sector tag on
-   * the hexagon.
+   * address scheme — a word over the cut alphabet, with an `s0:`…`s5:` sector tag
+   * on the hexagon.
+   *
+   * THE ALPHABET IS THIRTEEN LETTERS AND NOT FOUR, and this field is the only
+   * place the second radix reaches the file. `[ABCX]` is rep-4, `[a-cu-z]` is
+   * rep-9, the two are disjoint, and a mixed word is therefore self-describing —
+   * see `ADDRESS_LETTERS`. No version bump and no new field: every address this
+   * program has ever written is still admitted, spelled identically, and a reader
+   * that predates rep-9 sees the same bytes for the same drawing. What a reader
+   * that predates it CANNOT do is draw a rep-9 address, and that is the same
+   * position it was already in for an address deeper than its own ceiling.
    *
    * Optional, and NOT versioned, on exactly the argument the relief field makes:
    * a reader that predates it treats its absence as "the plate is entirely at
@@ -193,6 +209,54 @@ export interface ArtLayer {
    * stating `mode: 6, orbit: 3` is the ordinary case and not a contradiction.
    */
   orbit?: number;
+  /**
+   * THE COMPOSITION BOUNDARY: which nested timeline compositions this layer's
+   * reveal step sits INSIDE, outermost first, space separated — `"t9"`, or
+   * `"t9 t14"` for a step two deep. Absent means the step is at the root, which
+   * is every step of every drawing nobody has grouped.
+   *
+   * ── What it is for, and why ONE field is enough ─────────────────────────
+   *
+   * `nested.ts` builds a timeline as a TREE — a `Comp` is a run of consecutive
+   * steps under a minted name — and the whole reason it exists is that a name
+   * survives an insertion where an index does not: `test/nested.test.ts` runs one
+   * probe against five insertion sites and only the minted name survives all
+   * five. `reveal` above is the DERIVED flat index, computed by flattening that
+   * tree, so a file carrying only `reveal` states the answer and throws away the
+   * question — load it and the tree is gone, every group with it, and the next
+   * hold inserted anywhere renumbers the lot.
+   *
+   * This states the nesting and nothing else. The ORDER of the steps is already
+   * in `reveal`, and the CONTENTS of a composition are exactly the maximal run of
+   * layers whose trail begins the same way, so a run needs no start marker and no
+   * length. `timeline.compTrails` writes these and `timeline.treeFromTrails`
+   * rebuilds the tree from them; the round trip is asserted in
+   * `test/timeline.test.ts`.
+   *
+   * A TRAIL AND NOT A BRACKET PAIR, on this module's own standards: an unmatched
+   * bracket is a file that cannot be read at all, while a trail is true of each
+   * layer BY ITSELF and so survives a file whose layers were filtered — which is
+   * exactly what a per-layer copy and a scoped `emit.serialise` already produce.
+   * `timeline.ts` carries the full argument and the two rejected alternatives.
+   *
+   * ── Optional, and NOT versioned ─────────────────────────────────────────
+   *
+   * On exactly the argument `relief`, `plate`, `view`, `comp` and the in/out
+   * marks already make: a reader that predates this treats its absence as "the
+   * timeline is flat", which is what every file written before it existed meant
+   * and what `reveal` alone still says. Bumping would have made every one of
+   * those files unreadable to gain nothing.
+   *
+   * OMITTED whenever a layer's step is at the root, so a drawing that has never
+   * been grouped exports byte for byte the file it always did —
+   * `test/artfile.test.ts` asserts that on the bytes rather than describing it.
+   *
+   * WRITTEN AFTER `orbit` AND BEFORE `cells`. The validator rebuilds the object
+   * in that position and the round trip here is on BYTES, so an emitter that
+   * wrote it anywhere else would re-encode to a different file. That is the same
+   * constraint `validateComposition` already records for `anim`'s key order.
+   */
+  nest?: string;
 }
 
 export interface ArtAnimation {
@@ -202,8 +266,38 @@ export interface ArtAnimation {
   holdMs: number;
   /** How long a layer takes to come up. */
   fadeMs: number;
-  /** How many reveal steps the cycle has. */
+  /**
+   * How many reveal steps the DRAWING has.
+   *
+   * The cycle's length only when there are no in and out points below; with
+   * them it is `out - in + 1` steps that play and this is still the whole
+   * drawing, because the marks have to be stated against something that does
+   * not move when they do.
+   */
   steps: number;
+  /**
+   * The in point: the first reveal step that plays. Everything before it is
+   * already on the plate when the loop starts — the ground, not something that
+   * gets revealed.
+   *
+   * This and `out` are a CLOSED pair, so `{in: 3, out: 7}` is five steps and
+   * both ends play; `replay.InOut` is the same pair in the model, and its
+   * header carries the argument for closed over half-open.
+   *
+   * Optional and NOT versioned, on exactly the argument `relief`, `plate`,
+   * `view` and `comp` already make: a reader that predates them treats their
+   * absence as "the whole drawing plays", which is what every file written
+   * before they existed meant and what `steps` alone still says. Omitted
+   * entirely when unset, so a drawing with no marks exports byte for byte the
+   * file it always did — `test/inout.test.ts` asserts that on the bytes.
+   *
+   * BOTH OR NEITHER, enforced below. One without the other would need a second
+   * spelling of "to the end", and two ways to write one thing is two ways for a
+   * round trip to pick the other one.
+   */
+  in?: number;
+  /** The out point: the last reveal step that plays. Closed with `in`. */
+  out?: number;
 }
 
 export interface ArtComposition {
@@ -263,6 +357,16 @@ export const MAX_LAYER_DEPTH = 32;
 export const MAX_LAYERS = 8192;
 
 /**
+ * THE FORMAT'S OWN RESOLUTION FOR AN ALPHA: three decimals.
+ *
+ * Stated HERE, in the file format, because that is what it is a property of.
+ * `layers.ALPHA_STEP` is the model's copy of the same number and `emit.fmtAlpha`
+ * is the markup's; all three have to agree or one file says two things, and this
+ * is the one a payload is validated against on the way in. See `validateLayer`.
+ */
+export const ALPHA_QUANTUM = 1000;
+
+/**
  * The depths a plate may declare.
  *
  * Not a limit of the format — `buildFigure` will happily cut deeper — but a
@@ -290,9 +394,46 @@ export const MIN_DEPTH = 1;
  */
 export const MAX_DEPTH: Record<CanvasKind, number> = { triangle: 5, hexagon: 5 };
 
-/** Cells in a canvas: one wedge of 4^d, six of them on the hexagon. */
+/**
+ * Cells in a canvas: one wedge of scale², six of them on the hexagon.
+ *
+ * THE BOUNDARY, second of two — and the one that justifies there being two.
+ * `figure.ts` converts a depth the UI stated; this converts a depth THE FILE
+ * stated, and it has no figure to read a scale off because it is called while
+ * deciding whether the file is loadable at all.
+ *
+ * That is exactly where the depth→scale boundary belongs. `ArtPayload.depth`
+ * stays a depth and stays written as one — the format does not change here, and
+ * `test/byteidentity.test.ts` pins the bytes that say so — while everything past
+ * this line holds a scale. At radix 4 the file may state one and the model hold
+ * the other because `scale = 2^depth` is a bijection.
+ *
+ * ── THE ONE PLACE A SCHEDULE FIELD IS STILL OWED ─────────────────────────
+ *
+ * This comment used to end: *"What a second radix would need is a radix SCHEDULE
+ * in the payload, and that is a format change and a different piece of work."*
+ * Half of that is now discharged and half of it is sharpened, and the split is
+ * worth stating precisely because it is the whole answer to "is the alphabet
+ * enough".
+ *
+ * The PLATE needs no schedule: its addresses are words over a disjoint alphabet,
+ * so each one states its own scale (see `ADDRESS_LETTERS`). The `cells` LIST
+ * still does, and this line is why — `cells` is keyed by INDEX, an index means
+ * nothing without the canvas that issued it, and the only thing the file says
+ * about that canvas is `depth`. `scaleOfDepth` reads that as 2^depth, so a
+ * document whose canvas was cut rep-9 would have its cell indices validated
+ * against the wrong canvas and a quarter of them silently refused.
+ *
+ * So a rep-9 CANVAS — not a rep-9 address — is what still needs a field, and the
+ * minimal one is a `scale`: optional, unversioned on the argument `relief`,
+ * `plate`, `view` and `comp` already make, absent meaning `scaleOfDepth(depth)`,
+ * which is what every file written to date means. It is not added here because
+ * nothing can yet write one: `MAX_SCALE` admits a rep-9 address, and a rep-9
+ * canvas is the figure lane's to build. `test/rep9format.test.ts` measures the
+ * gap rather than describing it.
+ */
 export const cellCount = (canvas: CanvasKind, depth: number): number =>
-  (canvas === "hexagon" ? 6 : 1) * 4 ** depth;
+  (canvas === "hexagon" ? 6 : 1) * cellsAtScale(scaleOfDepth(depth));
 
 /**
  * The largest file this program will read.
@@ -600,7 +741,31 @@ function validateComposition(
       return REJECT;
     }
     if (steps > MAX_LAYERS) return REJECT;
-    anim = { stepMs, holdMs, fadeMs, steps };
+
+    // The in and out points. REFUSED rather than clamped, which is the
+    // opposite of what `replay.clampSpan` does with the same two numbers, and
+    // the split is on purpose: a slider being dragged off the end of its track
+    // is an ordinary event, a FILE that names a step its own `steps` says does
+    // not exist is a declaration disagreeing with itself. This module's rule
+    // for that has never been to guess which half was meant.
+    //
+    // Both or neither, and `0 ≤ in ≤ out < steps`. Note that `steps: 0` admits
+    // no span at all — `out < 0` is unsatisfiable — which is right: a drawing
+    // with nothing to play cannot have marked where to stop playing it.
+    const from: unknown = a.in;
+    const to: unknown = a.out;
+    if ((from === undefined) !== (to === undefined)) return REJECT;
+    let span: { in: number; out: number } | undefined;
+    if (from !== undefined) {
+      if (typeof from !== "number" || !Number.isInteger(from)) return REJECT;
+      if (typeof to !== "number" || !Number.isInteger(to)) return REJECT;
+      if (from < 0 || to < from || to >= steps) return REJECT;
+      span = { in: from, out: to };
+    }
+
+    // Key order matches `emit.compositionOf`, because a payload is re-encoded
+    // from what this returns and the round trip is on BYTES.
+    anim = { stepMs, holdMs, fadeMs, steps, ...(span ?? {}) };
   }
 
   if (!Array.isArray(c.layers)) return REJECT;
@@ -654,11 +819,40 @@ function validateLayers(
       // carrying it round trips to the same bytes either way.
       if (v) layer[flag] = true;
     }
+    /**
+     * RANGE-CHECKED AND THEN QUANTISED, and the second half was missing.
+     *
+     * This format has a quantum for an alpha — three decimals — and three places
+     * agree on it: `emit.fmtAlpha` rounds to it before writing the markup
+     * attribute, `layers.ALPHA_STEP` rounds to it before the model holds one, and
+     * `layers.canonicalAlpha` is the one writer. The validator did not, so a
+     * payload could state `0.1234567` while the markup of the SAME FILE said
+     * `0.123` — one file, two alphas, and no reader with a rule for choosing.
+     *
+     * The consequence was not the two digits, it was the ROUND TRIP: on load
+     * `composer.stackFromEmit` canonicalises, so `0.1234567` became `0.123` and
+     * the re-saved file was a different file from the one that was opened. Worse
+     * at the top of the range, where `0.9995` canonicalises to exactly 1 — and 1
+     * is the absent case, so the field disappeared and the re-saved file stated no
+     * alpha at all. Accepted, then changed, and nothing counted the change.
+     *
+     * QUANTISED HERE rather than refused, which is the one place in this file
+     * that goes that way, so the reason is written down: everything else this
+     * validator refuses is a statement the format cannot express — a mode that is
+     * not a symmetry, an orbit larger than its plate, a half-stated in/out pair.
+     * An alpha of `0.1234567` is not that; it is the same alpha this format
+     * already writes, spelled with digits below its own resolution. 1/1000 of
+     * alpha is a quarter of one 8-bit level and no screen shows it. Refusing the
+     * file over it would decline a drawing for a difference nobody can see.
+     *
+     * What it buys is that load → save is now a FIXED POINT for this field: the
+     * value the model canonicalises to is the value the payload already held.
+     */
     if (l.opacity !== undefined) {
       if (typeof l.opacity !== "number" || !(l.opacity >= 0 && l.opacity <= 1)) {
         return REJECT;
       }
-      layer.opacity = l.opacity;
+      layer.opacity = Math.round(l.opacity * ALPHA_QUANTUM) / ALPHA_QUANTUM;
     }
     // THREE FIELDS, THREE BOUNDS, and they were one. All three used to be
     // checked against `MAX_LAYERS`, which is the layer-NODE budget: the right
@@ -710,6 +904,17 @@ function validateLayers(
       }
       layer.orbit = v;
     }
+    if (l.nest !== undefined) {
+      const trail = nestTrail(l.nest);
+      if (trail === null) return REJECT;
+      // RE-JOINED FROM WHAT WAS CHECKED, which on accepted input is the string
+      // that arrived: the split is the check and not a normalisation, because
+      // any spacing other than one space between two names produces an empty
+      // part and an empty part is not a name. Written this way so that the value
+      // stored is provably the value validated, rather than a second reading of
+      // the same field.
+      layer.nest = trail.join(" ");
+    }
 
     if (l.cells !== undefined) {
       if (!Array.isArray(l.cells)) return REJECT;
@@ -757,6 +962,48 @@ function validateLayers(
 }
 
 /**
+ * A stated composition trail → its names, or `null` for one this program will
+ * not walk.
+ *
+ * ── What is checked, and what each bound is a bound OF ──────────────────
+ *
+ * The same discipline the three animation fields above were given when they were
+ * found sharing one meaningless bound: each limit here is a limit of the thing it
+ * is a limit ON, rather than whatever constant was nearest.
+ *
+ *   THE NAME'S SHAPE is `LAYER_ID`'s, reused rather than restated. A composition
+ *   name and a layer id are the same kind of token — an XML-safe name minted from
+ *   a counter — and `nested.stepId` mints `t0`, `t1`, … which that pattern already
+ *   admits. A second pattern here would be a second thing to keep in step, and it
+ *   would fall behind silently.
+ *
+ *   THE DEPTH is `MAX_LAYER_DEPTH`, because a trail IS a nesting depth and the
+ *   walker that rebuilds the tree recurses exactly as `validateLayers` does. The
+ *   same argument, the same number.
+ *
+ *   NO DUPLICATE NAME, because a composition inside itself is not a tree. A file
+ *   claiming it is a file whose timeline cannot be built, and this module refuses
+ *   a payload that disagrees with itself rather than guessing which half was
+ *   meant — the rule it already applies to a sector on a triangle.
+ *
+ * AN EMPTY STRING IS REFUSED and not read as "no nesting". Absent is the spelling
+ * for that, and a second spelling of one thing is two ways for a round trip to
+ * pick the other one — `ArtAnimation`'s in/out pair makes the identical argument.
+ */
+function nestTrail(raw: unknown): string[] | null {
+  if (typeof raw !== "string") return null;
+  const parts = raw.split(" ");
+  if (parts.length === 0 || parts.length > MAX_LAYER_DEPTH) return null;
+  const seen = new Set<string>();
+  for (const p of parts) {
+    if (!LAYER_ID.test(p)) return null;
+    if (seen.has(p)) return null;
+    seen.add(p);
+  }
+  return parts;
+}
+
+/**
  * `"0-5,12,40-63"` → the indices it names, ascending, or `null`.
  *
  * Strict: ascending, non-overlapping, inside `[0, limit)`, no empty parts, no
@@ -798,32 +1045,194 @@ export function formatRanges(indices: readonly number[]): string {
   return parts.join(",");
 }
 
+// ── the address alphabet ─────────────────────────────────────────────────
+
 /**
- * The address a plate entry may name, per canvas.
+ * The four rep-4 letters.
  *
- * Anchored at both ends and bounded by the depth this build can DRAW, on the
- * same principle as the depth check above: an address of length 9 names a cell
- * no control here can select, so accepting it would mean loading paint nobody
- * can see or edit. The hexagon's tag is one digit because there are six
- * sectors, and `s` and `:` are outside `{A,B,C,X}` so the tag can never be
- * mistaken for a cut. See `plate.ts`.
+ * Written here rather than imported from `scale.ts` beside `REP9_LETTERS`
+ * because the asymmetry is real and not an oversight: `radixAt` dispatches on
+ * membership of the REP-9 set and answers `EDGE_DIVISION` for everything else,
+ * so rep-4 has a default there and not a letter set. The place rep-4's four
+ * characters are actually a closed list is the FILE — they are the alphabet
+ * every document written to date is spelled in — so this module is where the
+ * list belongs, and `plate.DIGITS` now reads it from here rather than restating
+ * it, on the rule `CANVASES` and `MODES_FOR` already follow.
+ */
+export const REP4_LETTERS = "ABCX";
+
+/**
+ * THE ALPHABET IS THE RADIX SCHEDULE. This is the whole format change.
+ *
+ * ── What was expected to be needed, and is not ───────────────────────────
+ *
+ * `docs/rep-tile-findings.md` Q2 left the format with one open item: *"a rep-9
+ * address needs nine letters; a mixed address needs the radix schedule to be
+ * recoverable"*, and `scale.ts`'s header priced the recovery as *"a radix
+ * SCHEDULE in the file — which is a format change"*. No such field exists below,
+ * and none is needed, for one reason: **the two letter sets are disjoint**, so
+ * every character of an address states the edge division of its own cut and a
+ * word is a self-describing mixed-radix numeral. `radixAt(word, level)` reads
+ * `word.charAt(level)` and answers; `scaleOfWord` multiplies. There is nothing
+ * left for a schedule field to say that the address does not already say.
+ *
+ * Measured, not assumed — `test/rep9format.test.ts` decides three things:
+ * the two sets are disjoint; every admissible word's scale is the product of its
+ * letters' own radices with no word context read; and under the OVERLAPPING
+ * spelling `docs/rep9-charge.md` offered (`A B C` corner, `a b c` edge, `X Y Z`
+ * inverted) there are words with two admissible scales, i.e. the schedule is
+ * unrecoverable and the file would have to carry one. That document's *naming*
+ * — by (vertex, grade) rather than by index order — is honoured in
+ * `scale.REP9_LETTERS`; only its characters are refused, and this is why.
+ *
+ * ── ONE CHARACTER PER CUT, and that is load-bearing ──────────────────────
+ *
+ * `plate.ancestorAt` truncates an address by LEVEL COUNT — `a.slice(0, stem +
+ * k)` — so "the ancestor k cuts down" is a character count. Any spelling that
+ * used two characters for a rep-9 letter would make that slice land mid-letter
+ * and prefix-equals-ancestry would fail on the first mixed address. Nine single
+ * characters is not a tidiness preference; it is what keeps `plate.ts` working.
+ *
+ * ── What the tag argument now covers ─────────────────────────────────────
+ *
+ * `plate.ts` gets prefix-equals-ancestry across sectors from `s` and `:` being
+ * outside the cut alphabet. That argument now has to hold against thirteen
+ * letters rather than four, and it does: the rep-9 letters are `a`–`c` and
+ * `u`–`z`, so neither `s` nor `:` nor any decimal digit is one. Asserted rather
+ * than believed, in the same file.
+ */
+export const ADDRESS_LETTERS = REP4_LETTERS + REP9_LETTERS;
+
+/**
+ * The letters of one radix, for a caller that needs a node's siblings.
+ *
+ * Sieved out of the alphabet through `radixAt` rather than written as two lists,
+ * so the letters a cut offers and the radix a letter states cannot disagree.
+ * MEMOISED because `plate.splitEdits` asks once per node on the path down to
+ * every hole of a stroke — a band brush at depth 4 is 1536 targets — and
+ * `plate.ts`'s own header is explicit that the split must not become quadratic
+ * in the size of a stroke. An unknown edge division answers with the empty list;
+ * nothing here invents letters for a radix the alphabet does not spell.
+ */
+const LETTERS_AT = new Map<number, readonly string[]>();
+
+export const lettersAt = (edgeDivision: number): readonly string[] => {
+  const hit = LETTERS_AT.get(edgeDivision);
+  if (hit !== undefined) return hit;
+  const out = [...ADDRESS_LETTERS].filter((ch) => radixAt(ch, 0) === edgeDivision);
+  LETTERS_AT.set(edgeDivision, out);
+  return out;
+};
+
+/**
+ * THE RESOLUTION CEILING, and it is a SCALE and no longer a depth.
+ *
+ * `MAX_DEPTH` bounds what this program can show, and at one radix a depth said
+ * that exactly: depth 5 is 32² = 1024 cells per sector, and there is a button
+ * for it. A nine-letter alphabet breaks the equivalence — a rep-9 address of
+ * length 5 is 243² = 59,049 cells per sector, fifty-seven times what the ceiling
+ * was ever asked to admit — so the quantity that has to be bounded is the scale
+ * the address states, not the number of characters it took to state it.
+ *
+ * Equal to the old bound where the old bound applied: over `[ABCX]` an address
+ * has scale 2^length, so `scale ≤ 32` and `length ≤ 5` are the same predicate on
+ * every address this program has ever written. `test/rep9format.test.ts` runs
+ * both over all 1,364 of them.
+ */
+export const MAX_SCALE: Readonly<Record<CanvasKind, number>> = {
+  triangle: scaleOfDepth(MAX_DEPTH.triangle),
+  hexagon: scaleOfDepth(MAX_DEPTH.hexagon),
+};
+
+/**
+ * The address a plate entry may name, per canvas — SHAPE only; see
+ * `addressWord` for the gate.
+ *
+ * Anchored at both ends, and the character class is the alphabet itself rather
+ * than a second spelling of it, so a change to either radix's letters cannot
+ * leave this behind. Every letter is ASCII alphanumeric, which is what lets them
+ * go into a character class unescaped; a future spelling that reached for a
+ * regex metacharacter would have to escape here, and the disjointness test is
+ * where that would be noticed.
+ *
+ * THE LENGTH BOUND IS THE SCALE BOUND'S SHADOW, not an independent limit. The
+ * coarsest cut divides the edge by two, so an address of length L has scale at
+ * least 2^L, so `scale ≤ 2^MAX_DEPTH` forces `L ≤ MAX_DEPTH`. Keeping it here
+ * means a hostile file is rejected on its length before anything walks it,
+ * without the bound ever being the thing that decides a legitimate address.
  */
 const ADDRESS = (canvas: CanvasKind): RegExp =>
   canvas === "hexagon"
-    ? new RegExp(`^s[0-5]:[ABCX]{1,${MAX_DEPTH[canvas]}}$`)
-    : new RegExp(`^[ABCX]{1,${MAX_DEPTH[canvas]}}$`);
+    ? new RegExp(`^s[0-5]:([${ADDRESS_LETTERS}]{1,${MAX_DEPTH[canvas]}})$`)
+    : new RegExp(`^([${ADDRESS_LETTERS}]{1,${MAX_DEPTH[canvas]}})$`);
 
 /**
- * How many addresses a canvas has, over every depth it can be drawn at.
+ * THE GATE. An address a canvas may hold → its word (the cuts, without the
+ * sector tag); `null` for one it may not.
+ *
+ * One function rather than a regex at each site, because there are two sites —
+ * the reader and the writer — and they must agree exactly or a file this program
+ * writes could be a file it refuses to read. Both call this.
+ *
+ * A DECLINE HERE IS A COUNTED PRECONDITION. `validatePlate` turns it into a
+ * whole-payload rejection, which is this module's standing rule for a field that
+ * disagrees with itself; `payloadFromPaint` drops the entry, which is the
+ * export-side rule stated at its own call site. Neither guesses a radix: with a
+ * disjoint alphabet there is no address whose schedule is ambiguous, so there is
+ * nothing to guess and the only refusals are letters that are not letters and
+ * scales this build cannot draw.
+ */
+export function addressWord(addr: string, canvas: CanvasKind): string | null {
+  const m = ADDRESS(canvas).exec(addr);
+  if (m === null) return null;
+  const word = m[1];
+  if (scaleOfWord(word) > MAX_SCALE[canvas]) return null;
+  return word;
+}
+
+/**
+ * How many addresses a canvas has — every word the gate above admits, times the
+ * six sectors on the hexagon.
  *
  * The ceiling on the plate field, for the same reason `cells.length > n` is a
- * rejection: a file that names more cells than exist at any depth is not a
- * plate to clamp, it is a declaration that disagrees with itself.
+ * rejection: a file that names more addresses than exist is not a plate to
+ * clamp, it is a declaration that disagrees with itself.
+ *
+ * WAS `Σ cellCount(canvas, d)` over the drawable depths, which counted the words
+ * of length 1…5 over four letters and is exactly right while four letters is
+ * what an address may use. It is no longer, and the direction of the error is
+ * the dangerous one: the old count is a floor, so a legitimate mixed plate
+ * larger than 8,184 entries would have been refused as self-contradictory. The
+ * walk below counts what the gate admits, one cut at a time, and terminates
+ * because every cut at least doubles the scale and the cap is finite.
+ *
+ * It is deliberately NOT `13 + 13² + … + 13^5`. Most of those words are refused
+ * on scale — `aaaa` is four cuts and 81² cells — so counting them would put the
+ * ceiling six times higher than the address space actually is.
+ *
+ * EXPORTED so the ceiling can be measured rather than described:
+ * `test/rep9format.test.ts` decides it against a brute-force enumeration of
+ * every word the gate admits, which is an oracle that shares no line with this.
  */
-const addressCount = (canvas: CanvasKind): number => {
-  let n = 0;
-  for (let d = MIN_DEPTH; d <= MAX_DEPTH[canvas]; d++) n += cellCount(canvas, d);
-  return n;
+export const addressCount = (canvas: CanvasKind): number => {
+  const cap = MAX_SCALE[canvas];
+  let words = 0;
+  // Words that reach each scale, by number of cuts. The empty word is the
+  // sector itself, at scale 1, and is not an address.
+  let level = new Map<number, number>([[1, 1]]);
+  while (level.size > 0) {
+    const next = new Map<number, number>();
+    for (const [scale, n] of level) {
+      for (const ch of ADDRESS_LETTERS) {
+        const finer = scale * radixAt(ch, 0);
+        if (finer > cap) continue;
+        next.set(finer, (next.get(finer) ?? 0) + n);
+      }
+    }
+    for (const n of next.values()) words += n;
+    level = next;
+  }
+  return (canvas === "hexagon" ? 6 : 1) * words;
 };
 
 /**
@@ -832,6 +1241,19 @@ const addressCount = (canvas: CanvasKind): number => {
  * left the depth it was started at.
  *
  * Present and malformed is rejected outright, like every other field here.
+ *
+ * ── What a mixed-radix address does NOT get ─────────────────────────────
+ *
+ * Special treatment. A rep-9 or mixed address is admitted on exactly the terms a
+ * rep-4 one is — the alphabet, the tag, and a scale this build can draw — because
+ * with a disjoint alphabet there is no third thing to check. In particular there
+ * is no cross-check against the payload's `depth`: `depth` says what the
+ * index-keyed `cells` list is indexed by, and the plate is held over addresses
+ * ABOVE and BELOW the exported resolution by design. Refusing an address that
+ * does not lie in the declared canvas's own tree would refuse exactly the plates
+ * mixed radix exists to carry. What such an address does when resolved against a
+ * canvas that cannot contain it is stated in `plate.buildView`: nothing. It is
+ * carried, it is re-exported, and it is not drawn.
  */
 function validatePlate(
   raw: unknown,
@@ -841,14 +1263,13 @@ function validatePlate(
   if (!Array.isArray(raw)) return REJECT;
   if (raw.length > addressCount(canvas)) return REJECT;
 
-  const form = ADDRESS(canvas);
   const out: [string, string][] = [];
   const seen = new Set<string>();
   for (const entry of raw) {
     if (!Array.isArray(entry) || entry.length !== 2) return REJECT;
     const addr: unknown = entry[0];
     const hex: unknown = entry[1];
-    if (typeof addr !== "string" || !form.test(addr)) return REJECT;
+    if (typeof addr !== "string" || addressWord(addr, canvas) === null) return REJECT;
     if (typeof hex !== "string" || !HEX6.test(hex)) return REJECT;
     if (seen.has(addr)) return REJECT;
     seen.add(addr);
@@ -924,14 +1345,19 @@ export function payloadFromPaint(
 
   let addressed: [string, string][] | undefined;
   if (plate !== undefined) {
-    const form = ADDRESS(canvas);
     addressed = [];
     // Dropped rather than thrown, on the rule the cell list already follows:
     // an export is the one moment where refusing to write is worse than
     // writing less. Neither drop is reachable from this program.
+    //
+    // THE SAME GATE THE READER USES, and that is the point of there being a
+    // function: a file this program writes has to be a file it will read back,
+    // and two spellings of "which addresses are allowed" is how that stops being
+    // true. An over-scale address dropped here is one `validatePlate` would have
+    // rejected the whole payload for.
     for (const [addr, colour] of plate) {
       const hex = normalizeHex(colour);
-      if (hex === null || !form.test(addr)) continue;
+      if (hex === null || addressWord(addr, canvas) === null) continue;
       addressed.push([addr, hex]);
     }
   }

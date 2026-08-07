@@ -240,7 +240,10 @@ const mapCell = (
  * drawing them.
  */
 export function plateFrame(hex: Hexagon, view: PlateView): PlateFrame {
-  const scale = 2 ** hex.depth;
+  // The canvas's own resolution, read off it. `edge` below is the pixel size of
+  // one cell — `radius / scale` — which is a length per unit of SCALE and never
+  // per level of depth, and reads that way now.
+  const scale = hex.scale;
   if (view.mode === "hexagon") {
     return {
       view,

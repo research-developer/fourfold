@@ -25,20 +25,35 @@ import {
   findLayer,
   flatten,
   idsOf,
+  opaquelyCovered,
   parse,
+  parseWhy,
+  refusalSaid,
   rekey,
   serialise,
   type EmitDoc,
   type EmitLayer,
+  type EmitRefusal,
 } from "../src/lib/emit";
 import { buildHexagon } from "../src/lib/hexagon";
 import { plateFrame } from "../src/lib/view";
+import { addressBook } from "../src/lib/plate";
+import { emitLayersOf } from "../src/lib/composer";
+import {
+  layerId,
+  setOpacity,
+  strata,
+  type Composition,
+  type Stratum,
+} from "../src/lib/layers";
+import { artworkSvg } from "../src/lib/strokes";
 
 // ── fixtures ─────────────────────────────────────────────────────────────
 
 const DEPTH = 2;
 const hex = buildHexagon(DEPTH);
 const frame = plateFrame(hex, { mode: "hexagon", sector: 0 });
+const BOOK = addressBook(hex);
 const GEOMETRY = new Map(frame.cells.map((c, i) => [i, { verts: c.verts }]));
 
 const PALETTE = ["#d4a017", "#c0392b", "#2e86c1", "#7d3c98", "#1e8449"];
@@ -504,5 +519,317 @@ describe("a malformed or hostile file is refused rather than half-read", () => {
       expect(() => parse(r as string)).not.toThrow();
       expect(parse(r as string)).toBeNull();
     }
+  });
+});
+
+// ── the review findings ──────────────────────────────────────────────────
+
+/**
+ * A REFUSED COMPOSITION MUST BE TOLD APART FROM AN OLD DRAWING.
+ *
+ * `parse` had fifteen ways to answer `null` and its caller treated all fifteen as
+ * the one that means "no layer tree" — so a file that DID carry a history and was
+ * refused arrived as a single flat layer holding the finished plate, announced as
+ * a successful paste. `parseWhy` is the split, and `"no-composition"` is the only
+ * member a caller may fall back on.
+ */
+describe("a refusal names its reason", () => {
+  it("a file with a composition the reader will not vouch for is not `no-composition`", () => {
+    // The Inkscape round trip in miniature: the markup's tiling no longer agrees
+    // with what the payload leaves unpainted, which is one of the count checks a
+    // foreign editor trips by rewriting the <defs>/<use> structure.
+    const text = serialise(docOf(nested()));
+    const broken = text.replace(/<g id="tiling"[\s\S]*?<\/g>/, '<g id="tiling"></g>');
+    const got = parseWhy(broken);
+    expect(got.ok).toBe(false);
+    if (got.ok) return;
+    // THE WHOLE POINT: not the one reason the legacy fallback is allowed for.
+    expect(got.why).not.toBe("no-composition");
+    expect(got.why).toBe("tiling-count");
+    // And it is a sentence a person can act on rather than a field name.
+    expect(refusalSaid(got.why)).toMatch(/tiles/);
+  });
+
+  it("a payload with no composition IS `no-composition`, and that one may fall back", () => {
+    // What every drawing written before layers existed looks like: one flat
+    // polygon document with a payload that states cells and no `comp`.
+    const n = Math.max(...frame.shown) + 1;
+    const flat = Array.from({ length: n }, (_, i) => GEOMETRY.get(i) ?? { verts: [] });
+    const text = artworkSvg({
+      width: frame.width,
+      height: frame.height,
+      cells: flat,
+      shown: frame.shown,
+      paint: new Map([[frame.shown[0], "#c0392b"]]),
+      background: "#0a0908",
+      unpainted: "#141110",
+      tileSeam: "rgba(236,230,220,.16)",
+      paintSeam: "rgba(0,0,0,.3)",
+      weldPaint: false,
+      seamWidth: 0.7,
+      title: "FOURFOLD",
+      payload: {
+        version: 1,
+        canvas: "hexagon",
+        depth: DEPTH,
+        convention: "apex",
+        cells: [[frame.shown[0], "#c0392b"]],
+      },
+    });
+    const got = parseWhy(text);
+    expect(got.ok).toBe(false);
+    if (got.ok) return;
+    expect(got.why).toBe("no-composition");
+  });
+
+  it("`parse` still answers exactly what it always did", () => {
+    const text = serialise(docOf(nested()));
+    expect(parse(text)).not.toBeNull();
+    const broken = text.replace(/<g id="tiling"[\s\S]*?<\/g>/, '<g id="tiling"></g>');
+    expect(parse(broken)).toBeNull();
+    expect(parse("")).toBeNull();
+  });
+
+  it("every refusal has a sentence, and none of them names a field", () => {
+    const every: EmitRefusal[] = [
+      "not-text", "no-payload", "no-composition", "not-svg", "prototypes",
+      "style", "shown", "reveal-order", "markup", "tiling-count", "tile-rule",
+      "shape", "layer-shapes", "overlay", "threw",
+    ];
+    for (const why of every) {
+      const said = refusalSaid(why);
+      expect(said.length).toBeGreaterThan(10);
+      expect(said).not.toMatch(/undefined|null/);
+    }
+  });
+});
+
+/**
+ * A TILE GOES BEHIND A FADED CELL, because the board puts one there.
+ *
+ * `serialise` asked `flatten` which cells the stack covered, and `flatten` has
+ * never read `opacity`. So a cell under a half-transparent layer counted as
+ * covered, got no tile, and composited onto the page background in the file where
+ * it composites onto the tile on screen.
+ */
+describe("a faded layer does not eat the tile under it", () => {
+  const cell = 0;
+  const clear = (): EmitLayer[] => [{ id: "a", paint: new Map([[cell, "#c0392b"]]) }];
+  const faded = (): EmitLayer[] => [
+    { id: "a", opacity: 0.5, paint: new Map([[cell, "#c0392b"]]) },
+  ];
+
+  const tiles = (text: string): number =>
+    (/<g id="tiling"[^>]*>([\s\S]*?)<\/g>/.exec(text)?.[1].match(/<use|<polygon/g) ?? [])
+      .length;
+
+  it("an opaque layer covers its cell and a faded one does not", () => {
+    const opaque = tiles(serialise(docOf(clear())));
+    const dim = tiles(serialise(docOf(faded())));
+    // One more tile: the cell the faded layer paints now gets one too.
+    expect(dim).toBe(opaque + 1);
+    expect(dim).toBe(frame.shown.length);
+  });
+
+  it("the faded file still reads back, so writer and reader ask one question", () => {
+    const text = serialise(docOf(faded()));
+    const back = parse(text);
+    expect(back).not.toBeNull();
+    expect(serialise(back as EmitDoc)).toBe(text);
+  });
+
+  it("a fade on a PARENT reaches its children — alpha is inherited", () => {
+    const two = [
+      {
+        id: "p",
+        opacity: 0.5,
+        children: [{ id: "c", paint: new Map([[cell, "#c0392b"]]) }],
+      },
+    ];
+    // The child is opaque in itself and faded on the page, so it covers nothing.
+    expect(opaquelyCovered(two).size).toBe(0);
+    expect(tiles(serialise(docOf(two)))).toBe(frame.shown.length);
+  });
+
+  it("with no alpha anywhere it is `flatten`'s answer, key for key", () => {
+    const layers = nested().map((l) => strip(l));
+    expect([...opaquelyCovered(layers)].sort((a, b) => a - b)).toEqual(
+      [...flatten(layers).keys()].sort((a, b) => a - b)
+    );
+  });
+
+  /** The same tree with every alpha and every `hidden` taken off. */
+  function strip(l: EmitLayer): EmitLayer {
+    const out: EmitLayer = { ...l };
+    delete out.opacity;
+    delete out.hidden;
+    if (l.children !== undefined) out.children = l.children.map(strip);
+    return out;
+  }
+});
+
+/**
+ * A FADED LAYER'S ALPHA MUST NOT BE ON THE PROPERTY THE ANIMATION ANIMATES.
+ *
+ * `opacity="…"` is a presentation attribute and `#root [data-reveal] { opacity: 0
+ * }` is a CSS declaration on the same element, so the alpha was overridden for
+ * the whole animation and left there by `animation-fill-mode: both`.
+ */
+describe("a layer alpha survives an animated document", () => {
+  it("keeps compositing `opacity`, and the reveal rule states the alpha", () => {
+    const text = serialise(docOf(nested()));
+    // The alpha is a COMPOSITING operation, so it stays on `opacity` — see
+    // `emitLayers` for the Chromium measurement that sent `fill-opacity` back.
+    expect(/<g id="kid"[^>]*\sopacity="0\.42"/.test(text)).toBe(true);
+    expect(text).not.toMatch(/fill-opacity=/);
+    // The one element carrying the alpha also carries a reveal — the hazard.
+    expect(/<g id="kid"[^>]*data-reveal/.test(text)).toBe(true);
+    // The generic rule still animates to 1 …
+    expect(text).toMatch(/\[data-reveal="2"\] \{ animation-name: [\w-]+-r2 \}/);
+    // … and the faded layer is pointed at its OWN keyframe, which ends at 0.42.
+    expect(text).toMatch(/#kid \{ animation-name: [\w-]+-r2a420 \}/);
+    expect(text).toMatch(/@keyframes [\w-]+-r2a420 \{[^}]*\}[^{]*\{ opacity: 0\.42 \}/);
+    // Reduced motion must show the same picture minus the motion, not a flat one.
+    expect(text).toMatch(/#kid \{ opacity: 0\.42 \}/);
+  });
+
+  it("an unfaded animated document emits not one extra rule", () => {
+    const plain = nested().map(function drop(l): EmitLayer {
+      const out: EmitLayer = { ...l };
+      delete out.opacity;
+      if (l.children !== undefined) out.children = l.children.map(drop);
+      return out;
+    });
+    const text = serialise(docOf(plain));
+    expect(text).not.toMatch(/opacity="0\./);
+    // No alpha-suffixed keyframe, and nothing pointing at one — the suffix is
+    // the only thing either the rule or the block gains, so its absence is the
+    // whole claim. `test/byteidentity.test.ts` is the stronger check.
+    expect(text).not.toMatch(/-r\d+a\d+/);
+  });
+});
+
+/**
+ * LOAD → SAVE MUST NOT REWRITE A LEGAL ALPHA.
+ *
+ * The validator range-checked and never quantised, while the markup writer
+ * rounded to three decimals — one file, two alphas — and the model canonicalises
+ * on load, so the re-saved file differed from the one that was opened.
+ */
+describe("an alpha is quantised on the way in, not on the way back out", () => {
+  const withAlpha = (a: number): EmitLayer[] => [
+    { id: "a", opacity: a, paint: new Map([[0, "#c0392b"]]) },
+  ];
+
+  it("the payload and the markup state the same number", () => {
+    const text = serialise(docOf(withAlpha(0.1234567)));
+    expect(text).toMatch(/\sopacity="0\.123"/);
+    // The payload used to carry the unrounded value beside that attribute.
+    expect(text).not.toMatch(/0\.1234567/);
+  });
+
+  it("a file that survives the reader re-serialises to itself", () => {
+    const text = serialise(docOf(withAlpha(0.1234567)));
+    const back = parse(text) as EmitDoc;
+    expect(back).not.toBeNull();
+    expect(serialise(back)).toBe(text);
+    expect(findLayer(back.layers, "a")?.opacity).toBe(0.123);
+  });
+});
+
+/**
+ * THE BOARD AND THE FILE COMPOSITE A NESTED FADE THE SAME WAY.
+ *
+ * `DrawBoard` renders `strata` as nested `<g opacity>`, where a group's alpha is
+ * a COMPOSITING operation and nesting MULTIPLIES — its header carries the
+ * Chromium measurement and calls the flat alternative "cheaper, obvious, and
+ * wrong". `emit.serialise` must therefore write the identical nesting, and for
+ * one revision of this branch it did not: the alpha had been moved to
+ * `fill-opacity` to escape the reveal stylesheet, and `fill-opacity` is an
+ * INHERITED property — a child's declaration REPLACES the parent's.
+ *
+ * Re-measured in Chromium, red over white, at the moment of the fix:
+ *
+ *   two groups at 0.5, disjoint    nested `opacity` (255,191,191)
+ *                                  nested `fill-opacity` (255,127,127)
+ *   one cell, faded parent + child nested `opacity` (255,126,126)
+ *                                  nested `fill-opacity` (255,114,63)
+ *
+ * The second pair is `DrawBoard`'s own measurement, reproduced. A browser cannot
+ * run under `environment: "node"`, so what is asserted here is the STRUCTURE the
+ * measurement turns on: same tree, same own-alphas, on the compositing property.
+ * Get those right and the pixels follow; get them wrong and no assertion about
+ * the pixels would have been written in the first place.
+ */
+describe("a nested fade composites the same on the board and in the file", () => {
+  /** `<g id=… opacity=…>` nesting, as a tree of own-alphas. */
+  const markupTree = (text: string): unknown => {
+    const paint = /<g id="paint"[^>]*>([\s\S]*)<\/g>\s*<\/svg>/.exec(text);
+    const body = paint === null ? "" : paint[1];
+    const re = /<g id="([\w.-]+)"([^>]*)>|<\/g>/g;
+    const root: { id: string; opacity: number; children: unknown[] }[] = [];
+    const stack: { id: string; opacity: number; children: unknown[] }[] = [];
+    for (let m = re.exec(body); m !== null; m = re.exec(body)) {
+      if (m[1] === undefined) {
+        if (stack.length > 0) stack.pop();
+        continue;
+      }
+      const a = /\sopacity="([\d.]+)"/.exec(m[2]);
+      const node = { id: m[1], opacity: a === null ? 1 : Number(a[1]), children: [] };
+      if (stack.length === 0) root.push(node);
+      else stack[stack.length - 1].children.push(node);
+      stack.push(node);
+    }
+    return root;
+  };
+
+  /** The same tree off `layers.strata`, which is what the board renders. */
+  const strataTree = (list: readonly Stratum[]): unknown =>
+    list.map((s) => ({
+      id: String(s.id),
+      opacity: s.opacity,
+      children: strataTree(s.children),
+    }));
+
+  it("the two trees of own-alphas are the same tree", () => {
+    // A faded parent with a faded child — the shape `fill-opacity` got wrong,
+    // and the shape this suite's own `nested()` fixture already has.
+    //
+    // BOTH HOLD PAINT, and that is not incidental: `layers.strata` prunes a
+    // layer with no plate of its own, because an empty group draws nothing and a
+    // group opacity costs an offscreen buffer. A paintless child would have made
+    // the two trees differ for a reason that has nothing to do with compositing.
+    const parent = layerId(1);
+    const child = layerId(2);
+    let comp: Composition = {
+      layers: [
+        {
+          id: parent,
+          name: "parent",
+          plate: new Map([["s0:AA", "#c0392b"]]),
+          children: [
+            { id: child, name: "child", plate: new Map([["s0:BA", "#2e86c1"]]), children: [] },
+          ],
+        },
+      ],
+      selected: parent,
+      nextId: 3,
+      switches: new Map(),
+    };
+    comp = setOpacity(comp, parent, 0.5);
+    comp = setOpacity(comp, child, 0.5);
+
+    const board = strata(comp, BOOK);
+    expect(board).not.toBeNull();
+    const text = serialise(docOf(emitLayersOf(comp, BOOK) as EmitLayer[]));
+
+    expect(markupTree(text)).toEqual(strataTree(board as readonly Stratum[]));
+    // AND ON THE COMPOSITING PROPERTY. `fill-opacity` would satisfy the tree
+    // comparison above and still draw a different picture, so the property is
+    // asserted separately — it is the whole of what the measurement decided.
+    expect(text).not.toMatch(/fill-opacity=/);
+    expect(text).toMatch(/<g id="[\w.-]+"[^>]* opacity="0\.5">/);
+    // Nested, not flattened: the child's group sits INSIDE the parent's.
+    expect(text).toMatch(/<g id="L1"[^>]*opacity="0\.5">[\s\S]*<g id="L2"[^>]*opacity="0\.5">/);
   });
 });
